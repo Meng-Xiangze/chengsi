@@ -19,6 +19,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Tool calls and tool results are collapsed to one-line previews by default.
 - Successful image generation now ends the turn after displaying the image and report.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-23
 
 Initial public preview.
