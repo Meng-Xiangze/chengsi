@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-24
+
+### Added
+
+- Register `CHENGSI_HOME` and the installation directory in the user environment during Windows setup.
+- Add a `chengsi.bat` launcher for starting Chengsi from any directory.
+
+### Changed
+
+- Windows setup now supports repeatable launches after installation without changing to the project directory.
+
 ## [0.1.1] - 2026-07-24
 
 ### Added

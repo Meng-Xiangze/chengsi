@@ -44,7 +44,7 @@ cd Chengsi
 
 4. Double-click `setup_and_run.bat`.
 
-The script creates `.venv`, installs dependencies, copies `config.example.json` to the private `config.json` when needed, and starts Chengsi.
+The script creates `.venv`, installs dependencies, copies `config.example.json` to the private `config.json` when needed, registers the user-level `CHENGSI_HOME` environment variable, adds the installation folder to the user `PATH`, and starts Chengsi. Open a new terminal afterward and run `chengsi` from any directory to start it again.
 
 ### Manual Start
 
@@ -249,6 +249,7 @@ Chengsi stores local runtime data in these paths:
 | Path | Contents |
 | --- | --- |
 | `config.json` | Private provider configuration and API keys. |
+| `CHENGSI_HOME` | User-level environment variable pointing to the Chengsi installation folder. |
 | `sessions/` | Conversation messages, UI event history, and token statistics. |
 | `media/` | Generated images and session media. |
 | `knowledge/knowledge.db` | Local knowledge-base documents and search index. |
@@ -274,6 +275,7 @@ Chengsi/
 |-- config.example.json
 |-- requirements.txt
 |-- setup_and_run.bat
+|-- chengsi.bat
 |-- setup_and_run.sh
 |-- core/
 |   |-- index.html

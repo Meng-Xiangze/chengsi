@@ -1,12 +1,11 @@
 @echo off
-cd /d "%~dp0"
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" main.py
-) else (
-    python main.py
+setlocal
+set "CHENGSI_HOME=%CHENGSI_HOME%"
+if not defined CHENGSI_HOME set "CHENGSI_HOME=%~dp0"
+if not exist "%CHENGSI_HOME%\.venv\Scripts\python.exe" (
+    echo Chengsi is not installed at "%CHENGSI_HOME%".
+    echo Run setup_and_run.bat first.
+    exit /b 1
 )
-if errorlevel 1 (
-    echo.
-    echo Press any key to exit...
-    pause >nul
-)
+cd /d "%CHENGSI_HOME%"
+"%CHENGSI_HOME%\.venv\Scripts\python.exe" main.py %*

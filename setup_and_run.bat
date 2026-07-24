@@ -33,6 +33,12 @@ if not exist "config.json" (
     echo Created config.json from config.example.json.
 )
 
+rem Register a per-user installation location and launcher command.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root = (Get-Location).Path; [Environment]::SetEnvironmentVariable('CHENGSI_HOME', $root, 'User'); $path = [Environment]::GetEnvironmentVariable('Path', 'User'); $parts = @($path -split ';' | Where-Object { $_ -and ($_ -ne $root) }); if ($parts -notcontains $root) { $parts += $root }; [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User'); Write-Host ('Registered Chengsi at ' + $root)"
+if errorlevel 1 goto :error
+set "CHENGSI_HOME=%cd%"
+set "PATH=%CHENGSI_HOME%;%PATH%"
+
 echo Starting Chengsi...
 ".venv\Scripts\python.exe" main.py
 if errorlevel 1 goto :error
