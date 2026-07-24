@@ -40,8 +40,22 @@ class OpenAIProvider(BaseProvider):
         are forwarded to a vision-capable model.
         """
         prepared = []
+        pending_tool_call_ids: set[str] = set()
         for message in messages:
             item = dict(message)
+            role = item.get("role")
+            if role == "assistant" and item.get("tool_calls"):
+                pending_tool_call_ids = {
+                    call.get("id") for call in item["tool_calls"] if call.get("id")
+                }
+            elif role == "tool":
+                tool_call_id = item.get("tool_call_id")
+                if tool_call_id not in pending_tool_call_ids:
+                    continue
+                pending_tool_call_ids.discard(tool_call_id)
+            else:
+                pending_tool_call_ids.clear()
+
             content = item.get("content")
             if not isinstance(content, list):
                 prepared.append(item)

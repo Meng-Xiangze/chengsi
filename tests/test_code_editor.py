@@ -97,6 +97,56 @@ class CodeEditorHashlineTests(unittest.TestCase):
         self.assertIn(f"{anchor(2, 'two')}|two", result)
         self.assertIn("offset=3", result)
 
+    def test_prepend_and_append_to_file(self):
+        path = self.write_bytes("sample.py", b"middle\n")
+        result = self.editor.run({
+            "action": "edit",
+            "path": "sample.py",
+            "operations": [
+                {"op": "prepend", "content": "header"},
+                {"op": "append", "content": "footer"},
+            ],
+        })
+        self.assertTrue(result.startswith("OK:"), result)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"header\nmiddle\nfooter\n")
+
+    def test_multiple_inserts_at_same_anchor(self):
+        path = self.write_bytes("sample.py", b"line1\nline2\n")
+        result = self.editor.run({
+            "action": "edit",
+            "path": "sample.py",
+            "operations": [
+                {"op": "insert_after", "start": anchor(1, "line1"), "content": "added1"},
+                {"op": "insert_after", "start": anchor(1, "line1"), "content": "added2"},
+            ],
+        })
+        self.assertTrue(result.startswith("OK:"), result)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"line1\nadded1\nadded2\nline2\n")
+
+    def test_operation_aliases(self):
+        path = self.write_bytes("sample.py", b"old\nkeep\n")
+        result = self.editor.run({
+            "action": "edit",
+            "path": "sample.py",
+            "operations": [
+                {"op": "remove", "start": anchor(1, "old")},
+                {"op": "add_before", "start": anchor(2, "keep"), "content": "new"},
+            ],
+        })
+        self.assertTrue(result.startswith("OK:"), result)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"new\nkeep\n")
+
+    def test_prepend_rejects_start_anchor(self):
+        self.write_bytes("sample.py", b"content\n")
+        result = self.editor.run({
+            "action": "edit",
+            "path": "sample.py",
+            "operations": [{"op": "prepend", "start": anchor(1, "content"), "content": "x"}],
+        })
+        self.assertIn("does not use start anchor", result)
 
 if __name__ == "__main__":
     unittest.main()

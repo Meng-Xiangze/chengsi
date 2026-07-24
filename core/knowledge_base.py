@@ -18,8 +18,21 @@ class KnowledgeBase:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._initialize()
 
+    class _ManagedConnection(sqlite3.Connection):
+        """Commit or roll back like sqlite's context manager, then close."""
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            try:
+                return super().__exit__(exc_type, exc_value, traceback)
+            finally:
+                self.close()
+
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection = sqlite3.connect(
+            self.db_path,
+            timeout=30,
+            factory=self._ManagedConnection,
+        )
         connection.row_factory = sqlite3.Row
         return connection
 

@@ -32,11 +32,19 @@ class BaseTool(ABC):
     @abstractmethod
     def run(self, arguments: Dict[str, Any]) -> str:
         """
-        The actual logic of the tool. 
+        The actual logic of the tool.
                 Arguments are passed as a dictionary.
         Returns: The result of the execution as a string.
         """
         pass
+
+    def is_mutating(self, arguments: Dict[str, Any]) -> bool:
+        """Whether a successful call changes project or user files."""
+        return False
+
+    def is_verification(self, arguments: Dict[str, Any]) -> bool:
+        """Whether a successful call verifies the current project state."""
+        return False
 
     def __repr__(self):
         return f"<{self.__class__.__name__} (name={self.tool_name})>"

@@ -180,6 +180,17 @@
     .icon-button:hover { color: var(--text); background: var(--panel-2); border-color: var(--line); }
     .icon-button.danger:hover { color: var(--danger); }
     .icon-button:disabled { opacity: .4; cursor: default; }
+    .icon-button.is-busy { opacity: .75; cursor: wait; }
+    .busy-spinner {
+      width: 14px;
+      height: 14px;
+      display: inline-block;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: busy-spin .7s linear infinite;
+    }
+    @keyframes busy-spin { to { transform: rotate(360deg); } }
     .chat-scroll { min-height: 0; flex: 1 1 0; overflow-x: hidden; overflow-y: auto; scroll-behavior: smooth; }
     .chat { width: min(820px, 100%); margin: 0 auto; padding: 28px 24px 22px; }
     .empty {
@@ -334,6 +345,16 @@
     }
     .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .attachment-remove { border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+    .message-attachments { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+    .message-attachment { display: inline-flex; align-items: center; max-width: 100%; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel-2); font-size: 12px; }
+    .attachment-picker { position: fixed; z-index: 20; display: grid; gap: 3px; padding: 5px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow); }
+    .attachment-picker button { border: 0; padding: 7px 11px; background: transparent; text-align: left; border-radius: 5px; cursor: pointer; }
+    .attachment-picker button:hover { background: var(--panel-2); }
+    .prose table { width: 100%; margin: 10px 0; border-collapse: collapse; font-size: .95em; }
+    .prose th, .prose td { padding: 6px 9px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    .prose th { background: var(--panel-2); font-weight: 600; }
+    .prose .math { display: block; overflow-x: auto; margin: 9px 0; padding: 7px 10px; background: var(--panel-2); border-radius: 5px; font-family: Georgia, "Times New Roman", serif; font-style: italic; }
+    .prose .math-inline { font-family: Georgia, "Times New Roman", serif; font-style: italic; white-space: nowrap; }
     .input-box {
       min-height: 54px;
       display: grid;
@@ -487,6 +508,7 @@
       sessions: [],
       attachments: [],
       processing: false,
+      operationBusy: "",
       pollTimer: null,
       theme: "day",
       currentThinking: null,
@@ -502,31 +524,47 @@
     function renderMarkdown(source) {
       let text = escapeHtml(source || "");
       const blocks = [];
-      text = text.replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        const token = `@@CODE${blocks.length}@@`;
-        blocks.push(`<pre><code>${code.replace(/\n$/, "")}</code></pre>`);
-        return token;
-      });
+      const token = (prefix, html) => { const value = `@@${prefix}${blocks.length}@@`; blocks.push(html); return value; };
+      text = text.replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, lang, code) => token("CODE", `<pre><code>${code.replace(/\n$/, "")}</code></pre>`));
+      // Protect display math before inline formatting; this is deliberately dependency-free.
+      text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, formula) => token("MATH", `<div class="math">${formula.trim()}</div>`));
       text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>")
         .replace(/^## (.+)$/gm, "<h2>$1</h2>")
         .replace(/^# (.+)$/gm, "<h1>$1</h1>")
         .replace(/^&gt; (.+)$/gm, "<blockquote>$1</blockquote>")
         .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
         .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+        .replace(/\$([^$\n]+)\$/g, '<span class="math-inline">$1</span>')
         .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
       const lines = text.split("\n");
       let html = "", list = "";
       const closeList = () => { if (list) { html += list + "</ul>"; list = ""; } };
-      for (const line of lines) {
+      const isTableSeparator = (line) => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+      const cells = (line) => line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(cell => cell.trim());
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index];
         const bullet = line.match(/^\s*[-*] (.+)$/);
         if (bullet) { if (!list) list = "<ul>"; list += `<li>${bullet[1]}</li>`; continue; }
+        if (index + 1 < lines.length && line.includes("|") && isTableSeparator(lines[index + 1])) {
+          closeList();
+          const headers = cells(line), rows = [];
+          index += 2;
+          while (index < lines.length && lines[index].includes("|") && lines[index].trim()) { rows.push(cells(lines[index])); index++; }
+          index--;
+          html += `<table><thead><tr>${headers.map(cell => `<th>${cell}</th>`).join("")}</tr></thead><tbody>`;
+          rows.forEach(row => { html += `<tr>${headers.map((_, i) => `<td>${row[i] || ""}</td>`).join("")}</tr>`; });
+          html += "</tbody></table>";
+          continue;
+        }
         closeList();
         if (!line.trim()) continue;
-        if (/^<(h[1-3]|blockquote|pre)/.test(line) || /^@@CODE\d+@@$/.test(line)) html += line;
+        if (/^<(h[1-3]|blockquote|pre|div)/.test(line) || /^@@(CODE|MATH)\d+@@$/.test(line)) html += line;
         else html += `<p>${line}</p>`;
       }
       closeList();
-      blocks.forEach((block, index) => { html = html.replace(`@@CODE${index}@@`, block); });
+      blocks.forEach((block, index) => { html = html.replace(`@@${block.startsWith("<pre") ? "CODE" : "MATH"}${index}@@`, block); });
+      // Restore protected blocks by their actual token, including mixed code/math order.
+      text.match(/@@(?:CODE|MATH)\d+@@/g)?.forEach(marker => { const n = Number(marker.match(/\d+/)[0]); html = html.replace(marker, blocks[n]); });
       return html;
     }
 
@@ -562,8 +600,25 @@
       if (role !== "user") row.innerHTML = '<div class="avatar">C</div>';
       const body = document.createElement("div");
       body.className = role === "user" ? "message-body" : "message-body prose";
-      if (role === "user") body.textContent = String(content ?? "");
-      else body.innerHTML = renderMarkdown(String(content ?? ""));
+      if (role === "user") {
+        const value = String(content ?? "");
+        const marker = /\n\nAttached paths?:\n([\s\S]+)$/;
+        const match = value.match(marker);
+        if (!match) body.textContent = value;
+        else {
+          body.appendChild(document.createTextNode(value.slice(0, match.index).trim()));
+          const attachments = document.createElement("div");
+          attachments.className = "message-attachments";
+          match[1].split("\n").map(line => line.replace(/^[-*]\s*/, "").trim()).filter(Boolean).forEach(path => {
+            const chip = document.createElement("span");
+            chip.className = "message-attachment";
+            chip.textContent = `⌕ ${path.replace(/[\\/]$/, "").split(/[\\/]/).pop() || path}`;
+            chip.title = path;
+            attachments.appendChild(chip);
+          });
+          body.appendChild(attachments);
+        }
+      } else body.innerHTML = renderMarkdown(String(content ?? ""));
       row.appendChild(body);
       $("chat").appendChild(row);
       scrollToBottom();
@@ -688,8 +743,26 @@
       app.processing = Boolean(value);
       $("sendButton").textContent = app.processing ? "■" : "↑";
       $("sendButton").title = app.processing ? "Stop" : "Send";
-      $("statusText").textContent = app.processing ? "Generating" : "";
+      if (!app.operationBusy) $("statusText").textContent = app.processing ? "Generating" : "";
       if (app.processing) showTyping(); else hideTyping();
+    }
+
+    function setOperationBusy(label = "", value = true) {
+      app.operationBusy = value ? label : "";
+      const compact = $("compactButton");
+      const exportButton = $("exportButton");
+      const busy = Boolean(app.operationBusy);
+      compact.disabled = busy;
+      exportButton.disabled = busy;
+      compact.classList.toggle("is-busy", busy && app.operationBusy === "Compacting");
+      exportButton.classList.toggle("is-busy", busy && app.operationBusy === "Exporting");
+      compact.innerHTML = busy && app.operationBusy === "Compacting" ? '<span class="busy-spinner" aria-hidden="true"></span>' : "↧";
+      exportButton.innerHTML = busy && app.operationBusy === "Exporting" ? '<span class="busy-spinner" aria-hidden="true"></span>' : "⇩";
+      compact.title = busy && app.operationBusy === "Compacting" ? "Compacting context" : "Compact context";
+      exportButton.title = busy && app.operationBusy === "Exporting" ? "Exporting conversation" : "Export conversation";
+      compact.setAttribute("aria-label", compact.title);
+      exportButton.setAttribute("aria-label", exportButton.title);
+      $("statusText").textContent = busy ? app.operationBusy : (app.processing ? "Generating" : "");
     }
 
     async function processEvent(event) {
@@ -849,6 +922,12 @@
         const result = await app.api.chat(message);
         if (result?.status !== "ok") throw new Error(result?.msg || "Request failed");
         app.sessionId = result.session_id;
+        if (result.handled) {
+          setProcessing(false);
+          if (result.result) addMessage("agent", result.result);
+          await loadSessions();
+          return;
+        }
         await loadSessions();
       } catch (error) {
         setProcessing(false);
@@ -857,11 +936,25 @@
     }
 
     async function attachFiles() {
-      const result = await app.api.choose_attachments("files");
-      if (result?.status === "ok") {
-        app.attachments.push(...(result.paths || []).filter((path) => !app.attachments.includes(path)));
-        renderAttachments();
-      } else if (result?.msg) toast(result.msg);
+      document.querySelector(".attachment-picker")?.remove();
+      const picker = document.createElement("div");
+      picker.className = "attachment-picker";
+      picker.innerHTML = '<button type="button">Attach files</button><button type="button">Attach folder</button>';
+      const rect = $("attachButton").getBoundingClientRect();
+      picker.style.left = `${rect.left}px`;
+      picker.style.bottom = `${window.innerHeight - rect.top + 5}px`;
+      document.body.appendChild(picker);
+      const choose = async (kind) => {
+        picker.remove();
+        const result = await app.api.choose_attachments(kind);
+        if (result?.status === "ok") {
+          app.attachments.push(...(result.paths || []).filter((path) => !app.attachments.includes(path)));
+          renderAttachments();
+        } else if (result?.msg) toast(result.msg);
+      };
+      picker.children[0].onclick = () => choose("files");
+      picker.children[1].onclick = () => choose("folder");
+      setTimeout(() => document.addEventListener("click", () => picker.remove(), { once: true }), 0);
     }
 
     async function loadModels() {
@@ -940,15 +1033,33 @@
     $("sidebarScrim").onclick = closeSidebar;
     $("compactButton").onclick = async () => {
       if (!app.sessionId) return toast("No active conversation");
-      const result = await app.api.compact_context(app.sessionId);
-      if (result?.status === "ok") { updateStats({ctx: result.tokens_after}); toast(`Context reduced by ${result.reduction_percent}%`); }
-      else toast(result?.msg || "Could not compact context");
+      if (app.operationBusy) return;
+      setOperationBusy("Compacting");
+      try {
+        const result = await app.api.compact_context(app.sessionId);
+        if (result?.status === "ok") { updateStats({ctx: result.tokens_after}); toast(`Context reduced by ${result.reduction_percent}%`); }
+        else toast(result?.msg || "Could not compact context");
+      } catch (error) {
+        console.error(error);
+        toast("Could not compact context");
+      } finally {
+        setOperationBusy("", false);
+      }
     };
     $("exportButton").onclick = async () => {
       if (!app.sessionId) return toast("No active conversation");
-      const result = await app.api.export_session(app.sessionId);
-      if (result?.status === "ok") toast(`Exported to ${result.path}`);
-      else if (result?.status !== "cancelled") toast(result?.msg || "Could not export conversation");
+      if (app.operationBusy) return;
+      setOperationBusy("Exporting");
+      try {
+        const result = await app.api.export_session(app.sessionId);
+        if (result?.status === "ok") toast(`Exported to ${result.path}`);
+        else if (result?.status !== "cancelled") toast(result?.msg || "Could not export conversation");
+      } catch (error) {
+        console.error(error);
+        toast("Could not export conversation");
+      } finally {
+        setOperationBusy("", false);
+      }
     };
     $("messageInput").addEventListener("input", resizeInput);
     $("messageInput").addEventListener("keydown", (event) => {

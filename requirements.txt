@@ -3,3 +3,4 @@ PyYAML>=6.0,<7
 pywebview>=5.0,<7
 Pillow>=10.0,<12
 ddgs>=9.0,<10
+beautifulsoup4>=4.12,<5

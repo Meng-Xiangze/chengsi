@@ -277,6 +277,7 @@ Chengsi/
 |-- setup_and_run.bat
 |-- chengsi.bat
 |-- setup_and_run.sh
+|-- skills/              # optional SKILL.md capability packages
 |-- core/
 |   |-- index.html
 |   |-- provider.py
@@ -299,6 +300,7 @@ Chengsi/
 ```powershell
 python -m compileall -q .
 python -c "import main"
+python -m unittest discover -s tests -v
 ```
 
 For a release, also test setup from a clean clone, start the WebUI, send a normal chat message, run a harmless tool, search the knowledge base, generate an image, reload a session, and confirm that private runtime files remain untracked.

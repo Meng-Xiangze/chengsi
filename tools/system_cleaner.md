@@ -1,16 +1,16 @@
 ---
 name: system_cleaner
-description: Preview or clean temp files, caches, logs, Python caches, or an explicitly specified directory with precise filters.
+description: Preview or clean system temp files, application caches, Python caches, or the Windows recycle bin. Preview is the default.
 parameters:
   target_types:
     type: array
-    description: "Cleanup categories: temp, cache, python_cache, logs, recycle_bin, or custom."
+    description: "Cleanup categories: temp, cache, python_cache, or recycle_bin."
   target_type:
     type: string
     description: "Backward-compatible single category; prefer target_types for multiple categories."
   path:
     type: string
-    description: "Scan root; required for custom and defaults to the project root."
+    description: "Optional directory override for supported cleanup categories."
   extensions:
     type: array
     description: "Optional extensions such as ['.tmp', '.log']."
@@ -29,10 +29,9 @@ parameters:
     description: Continue after locked-item errors; default false.
     default: false
 usage_notes:
-  - Clear cleanup requests execute directly; use dry_run=true only for an explicit preview request.
-  - The core and knowledge directories are permanently protected.
+  - Preview is the default; set dry_run=false only for an explicit deletion request.
   - Use target_types to combine categories in one request.
   - Use python_cache for __pycache__, .pyc, and .pyo files.
   - Use extensions, older_than_days, and min_size_mb to narrow the selection.
-  - Custom paths should be used only when explicitly requested.
+  - Use file_deleter for one specific user-named file or directory.
 ---

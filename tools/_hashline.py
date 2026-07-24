@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 
 
-_REF_PATTERN = re.compile(r"^(\d+):([0-9a-fA-F]{4})$")
+_REF_PATTERN = re.compile(r"^(?:(\d+):)?([0-9a-fA-F]{4})$")
 
 
 @dataclass(frozen=True)
@@ -29,23 +29,39 @@ def anchor(line_number: int, content: str) -> str:
     return f"{line_number}:{line_hash(content)}"
 
 
-def parse_anchor(value: object) -> tuple[int, str]:
+def parse_anchor(value: object) -> tuple[int | None, str]:
+    """Parse anchor. Accepts 'LINE:HASH' or just 'HASH'."""
     match = _REF_PATTERN.fullmatch(str(value or "").strip())
     if not match:
-        raise ValueError(f"invalid anchor {value!r}; expected LINE:HASH, for example 12:a4f0")
-    return int(match.group(1)), match.group(2).lower()
+        raise ValueError(f"invalid anchor {value!r}; expected LINE:HASH or HASH, for example 12:a4f0 or a4f0")
+    line_str = match.group(1)
+    line_number = int(line_str) if line_str else None
+    return line_number, match.group(2).lower()
 
 
 def validate_anchor(lines: list[str], value: object) -> int:
+    """Validate anchor against file content. If no line number, search by hash."""
     line_number, expected_hash = parse_anchor(value)
-    if line_number < 1 or line_number > len(lines):
-        raise ValueError(f"anchor {value} is outside the current file")
-    actual_hash = line_hash(lines[line_number - 1])
-    if actual_hash != expected_hash:
-        raise ValueError(
-            f"stale anchor {value}; current anchor is {line_number}:{actual_hash}. Re-read the file."
-        )
-    return line_number - 1
+
+    # If line number provided, use it for fast lookup
+    if line_number is not None:
+        if line_number < 1 or line_number > len(lines):
+            raise ValueError(f"anchor {value} is outside the current file")
+        actual_hash = line_hash(lines[line_number - 1])
+        if actual_hash != expected_hash:
+            raise ValueError(
+                f"stale anchor {value}; current anchor is {line_number}:{actual_hash}. Re-read the file."
+            )
+        return line_number - 1
+
+    # No line number: search by hash
+    for idx, line in enumerate(lines):
+        if line_hash(line) == expected_hash:
+            return idx
+
+    raise ValueError(
+        f"hash {expected_hash} not found in file. Content may have changed. Re-read the file."
+    )
 
 
 def split_text(text: str) -> TextLayout:

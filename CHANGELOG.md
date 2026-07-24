@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-24
+
+### Added
+
+- Add durable agent runtime snapshots, tool budgets, duplicate-call protection, failure circuit breaking, and post-edit verification requirements.
+- Add Markdown skill discovery and direct `/tool` and `/knowledge` resource commands.
+- Add safe file deletion, project unittest execution, richer web tools, attachment folders, and multimodal image handling.
+- Add regression coverage for runtime recovery, provider tool-call chains, compaction, resource commands, and executable tool schemas.
+
+### Changed
+
+- Use Python tool schemas as the executable source of truth while keeping Markdown documentation descriptive.
+- Improve the chat UI with attachment chips, folder selection, operation spinners, Markdown tables, and math formatting.
+- Allow any model configured with `tools: false` to use a documented text tool-call protocol without model-specific handling.
+- Preserve native Ollama tool-call history and normalize arguments for consecutive calls.
+
+### Fixed
+
+- Close knowledge-base SQLite connections reliably on Windows.
+- Drop orphaned OpenAI tool results after context changes.
+- Make system cleanup safer and restore explicit tool capability metadata.
+
 ## [0.1.2] - 2026-07-24
 
 ### Added

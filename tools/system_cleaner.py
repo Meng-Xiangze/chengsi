@@ -22,26 +22,30 @@ class SystemCleanerTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Preview or clean temporary files, caches, logs, Python __pycache__, or an explicitly "
-            "specified directory. Supports precise type, age, extension, and size filters; preview is default."
+            "Clean system junk: temporary files, caches, Python __pycache__, recycle bin. "
+            "Supports filters for age, size, and extensions. Preview mode by default (dry_run=true). "
+            "This tool is for bulk cleanup of system-generated garbage, not for deleting specific project files."
         )
+
+    def is_mutating(self, arguments: Dict[str, Any]) -> bool:
+        return not bool((arguments or {}).get("dry_run", True))
 
     @property
     def parameters(self) -> Dict[str, Any]:
         return {
             "target_types": {
                 "type": "array",
-                "description": "Cleanup categories to combine: temp, cache, python_cache, logs, recycle_bin, or custom.",
-                "items": {"type": "string", "enum": ["temp", "cache", "python_cache", "logs", "recycle_bin", "custom"]},
+                "description": "Cleanup categories: temp (system temp), cache (browser/app cache), python_cache (__pycache__), recycle_bin (Windows recycle bin).",
+                "items": {"type": "string", "enum": ["temp", "cache", "python_cache", "recycle_bin"]},
             },
             "target_type": {
                 "type": "string",
-                "description": "Backward-compatible single category. Prefer target_types for multiple categories.",
-                "enum": ["temp", "cache", "python_cache", "logs", "recycle_bin", "custom"],
+                "description": "Single category (backward compatibility). Use target_types for multiple.",
+                "enum": ["temp", "cache", "python_cache", "recycle_bin"],
             },
             "path": {
                 "type": "string",
-                "description": "Scan root. Required for custom; defaults to the project root for python_cache and logs.",
+                "description": "Optional override: scan a specific directory instead of default system locations.",
             },
             "extensions": {
                 "type": "array",
@@ -60,8 +64,8 @@ class SystemCleanerTool(BaseTool):
             },
             "dry_run": {
                 "type": "boolean",
-                "description": "Preview only. Default false: explicit cleanup requests execute immediately. Set true only when the user asks for a preview.",
-                "default": False,
+                "description": "Preview mode (true, default) or actually delete (false).",
+                "default": True,
             },
             "force": {
                 "type": "boolean",
@@ -76,16 +80,16 @@ class SystemCleanerTool(BaseTool):
         if not isinstance(target_types, list):
             target_types = [args.get("target_type", "")]
         target_types = [str(value).strip().lower() for value in target_types if str(value).strip()]
-        valid = {"temp", "cache", "python_cache", "logs", "recycle_bin", "custom"}
+        valid = {"temp", "cache", "python_cache", "recycle_bin"}
         invalid = [value for value in target_types if value not in valid]
         if invalid:
-            return "Error: unsupported target type(s): {}. Use temp, cache, python_cache, logs, recycle_bin, or custom.".format(", ".join(invalid))
+            return "Error: unsupported target type(s): {}. Use temp, cache, python_cache, or recycle_bin.".format(", ".join(invalid))
         if not target_types:
             return "Error: specify target_type or target_types."
 
         raw_path = str(args.get("path") or "").strip()
-        if "custom" in target_types and not raw_path:
-            return "Error: path is required when target_types includes custom."
+        if "custom" in target_types:
+            return "Error: 'custom' category removed. Use file_deleter tool for specific file/directory deletions."
         raw_path = self._expand_path(raw_path)
         root = Path(raw_path).expanduser().resolve() if raw_path else PROJECT_ROOT
         if raw_path and not root.is_dir():
@@ -125,11 +129,19 @@ class SystemCleanerTool(BaseTool):
         ]
 
         if not self._is_dry_run(args):
-            deleted = errors = 0
+            deleted = errors = skipped_non_empty = 0
             for item in selected:
                 try:
                     if item.is_dir():
-                        shutil.rmtree(item)
+                        # Safety: recursive deletion is allowed only inside AppData\\Local\\Temp.
+                        # The Temp root itself is never deleted; all other non-empty directories are skipped.
+                        if self._is_temp_subdirectory(item):
+                            shutil.rmtree(item)
+                        elif any(item.iterdir()):
+                            skipped_non_empty += 1
+                            continue
+                        else:
+                            item.rmdir()
                     else:
                         item.unlink()
                     deleted += 1
@@ -138,9 +150,11 @@ class SystemCleanerTool(BaseTool):
                     if not bool(args.get("force", False)):
                         continue
             directory_result = (
-                "Deleted {} items for [{}]; errors: {}. Some items may not be removable because they "
-                "are currently in use or locked, including active chat/session files."
-            ).format(deleted, ", ".join(target_types), errors)
+                "Deleted {} items for [{}]; errors: {}; skipped {} non-empty directories. "
+                "Some items may not be removable because they are currently in use or locked, "
+                "including active chat/session files. Non-empty directories are never deleted outside "
+                "AppData\\Local\\Temp."
+            ).format(deleted, ", ".join(target_types), errors, skipped_non_empty)
             return f"{recycle_result}\n{directory_result}" if recycle_result else directory_result
 
         total_bytes = sum(self._size(item) for item in selected)
@@ -226,17 +240,19 @@ class SystemCleanerTool(BaseTool):
 
     def _find_target(self, target_type: str, root: Path) -> Iterable[Path]:
         if target_type == "temp":
-            return [Path(tempfile.gettempdir())]
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            try:
+                return list(temp_root.iterdir())
+            except OSError:
+                return []
         if target_type == "cache":
             candidates = [Path.home() / ".cache", Path(os.environ.get("LOCALAPPDATA", "")) / "Cache"]
             return [path for path in candidates if str(path) and path.is_dir()]
         if target_type == "logs":
-            return [path for path in (root / "logs", root / "log") if path.is_dir()]
+            return []  # logs cleanup disabled
         if target_type == "recycle_bin":
             return []
-        scan_root = root if target_type in {"python_cache", "custom"} else root
-        if target_type == "custom":
-            return [scan_root]
+        scan_root = root
         found = []
         for current, dir_names, file_names in os.walk(scan_root, topdown=True, followlinks=False):
             dir_names[:] = [name for name in dir_names if name not in _SKIP_DIRS]
@@ -247,6 +263,25 @@ class SystemCleanerTool(BaseTool):
             elif target_type == "python_cache":
                 found.extend(current_path / name for name in file_names if Path(name).suffix.lower() in {".pyc", ".pyo"})
         return found
+
+    @staticmethod
+    def _is_temp_root(item: Path) -> bool:
+        try:
+            return item.resolve() == Path(tempfile.gettempdir()).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+
+    @staticmethod
+    def _is_temp_subdirectory(item: Path) -> bool:
+        """Return true only for a directory below the system AppData Local Temp root."""
+        try:
+            temp_root = Path(tempfile.gettempdir()).resolve()
+            candidate = item.resolve()
+            return candidate != temp_root and temp_root in candidate.parents
+        except (OSError, RuntimeError, ValueError):
+            return False
+
 
     @staticmethod
     def _extensions(value: Any) -> set[str] | None:

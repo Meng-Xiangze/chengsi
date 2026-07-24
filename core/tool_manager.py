@@ -51,9 +51,11 @@ class _ToolRegistry:
                     pass
             tool = tools.get(name)
             if tool is not None:
-                metadata.setdefault("name", tool.tool_name)
-                metadata.setdefault("description", tool.description)
-                metadata.setdefault("parameters", tool.parameters)
+                # Python is the executable contract. Documentation may enrich the
+                # catalog, but stale parameter schemas must never reach the model.
+                metadata["name"] = tool.tool_name
+                metadata["description"] = metadata.get("description") or tool.description
+                metadata["parameters"] = tool.parameters
             if metadata:
                 catalog[name] = metadata
         self._catalog = catalog

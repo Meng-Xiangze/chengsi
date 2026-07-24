@@ -16,7 +16,8 @@ from tools.base import BaseTool
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules"}
-_VALID_OPS = {"replace", "delete", "insert_before", "insert_after"}
+_VALID_OPS = {"replace", "delete", "insert_before", "insert_after", "prepend", "append"}
+_OP_ALIASES = {"add_before": "insert_before", "add_after": "insert_after", "remove": "delete"}
 
 
 class CodeEditor(BaseTool):
@@ -29,9 +30,15 @@ class CodeEditor(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read and safely modify project files. Read returns LINE:HASH anchors. "
-            "Use edit operations with copied anchors; stale or overlapping edits are rejected atomically."
+            "Read and safely modify project files using hash-anchored line operations. "
+            "Supports replace, delete, insert_before, insert_after, prepend, append. "
+            "Aliases: remove=delete, add_before=insert_before, add_after=insert_after. "
+            "Multiple inserts at same anchor execute in order; all edits are atomic."
         )
+
+    def is_mutating(self, arguments: Dict[str, Any]) -> bool:
+        action = str((arguments or {}).get("action", "read")).strip().lower()
+        return action in {"write", "edit", "patch"}
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -49,8 +56,9 @@ class CodeEditor(BaseTool):
             "operations": {
                 "type": "array",
                 "description": (
-                    "Hash-anchored edits. Copy start/end anchors exactly from read or search. "
-                    "end is only for replace/delete ranges."
+                    "Hash-anchored edits. Copy start/end anchors from read or search. "
+                    "end is only for replace/delete ranges. prepend/append do not use start. "
+                    "Operations: replace, delete, insert_before, insert_after, prepend, append."
                 ),
                 "items": {
                     "type": "object",
@@ -60,7 +68,7 @@ class CodeEditor(BaseTool):
                         "end": {"type": "string", "description": "Optional ending LINE:HASH anchor."},
                         "content": {"type": "string", "description": "Replacement or inserted text."},
                     },
-                    "required": ["op", "start"],
+                    "required": ["op"],
                 },
             },
             "offset": {"type": "integer", "description": "First line for read; default 1."},
@@ -184,35 +192,101 @@ class CodeEditor(BaseTool):
                 if not isinstance(operation, dict):
                     return f"Error: operations[{index}] must be an object; file unchanged."
                 op = str(operation.get("op", "")).strip().lower()
+                op = _OP_ALIASES.get(op, op)
                 if op not in _VALID_OPS:
                     return f"Error: operations[{index}] has invalid op {op!r}; file unchanged."
-                start = validate_anchor(layout.lines, operation.get("start"))
-                end = start
+                start = None
+                end = None
+                if op in {"prepend", "append"}:
+                    if operation.get("start"):
+                        return f"Error: operations[{index}] {op!r} does not use start anchor; file unchanged."
+                    start = -1 if op == "prepend" else len(layout.lines)
+                    end = start
+                else:
+                    start = validate_anchor(layout.lines, operation.get("start"))
+                    end = start
                 if operation.get("end"):
                     if op not in {"replace", "delete"}:
                         return f"Error: operations[{index}] end is only valid for replace/delete; file unchanged."
                     end = validate_anchor(layout.lines, operation.get("end"))
                 if end < start:
                     return f"Error: operations[{index}] end precedes start; file unchanged."
-                target_start = start
-                target_end = end
-                for previous_start, previous_end in occupied_ranges:
-                    if not (target_end < previous_start or target_start > previous_end):
-                        return f"Error: operations[{index}] overlaps another edit; file unchanged."
-                occupied_ranges.append((target_start, target_end))
+                insert_point = None
+                if op == "insert_before":
+                    insert_point = (start, "before")
+                elif op == "insert_after":
+                    insert_point = (start, "after")
+                elif op in {"prepend", "append"}:
+                    insert_point = None
+                else:
+                    target_start = start
+                    target_end = end
+                    for previous_start, previous_end in occupied_ranges:
+                        if not (target_end < previous_start or target_start > previous_end):
+                            return f"Error: operations[{index}] overlaps another edit; file unchanged."
+                    occupied_ranges.append((target_start, target_end))
                 content = [] if op == "delete" else replacement_lines(operation.get("content", ""))
-                if op in {"replace", "insert_before", "insert_after"} and "content" not in operation:
+                if op in {"replace", "insert_before", "insert_after", "prepend", "append"} and "content" not in operation:
                     return f"Error: operations[{index}] requires content; file unchanged."
-                validated.append((start, end, op, content))
+                validated.append((start, end, op, content, insert_point))
 
             updated_lines = list(layout.lines)
-            for start, end, op, content in sorted(validated, key=lambda item: item[0], reverse=True):
-                if op in {"replace", "delete"}:
-                    updated_lines[start:end + 1] = content
+            prepend_content = []
+            append_content = []
+            operations_by_position = {}
+
+            for seq_num, (start, end, op, content, insert_point) in enumerate(validated):
+                if op == "prepend":
+                    prepend_content.extend(content)
+                elif op == "append":
+                    append_content.extend(content)
                 elif op == "insert_before":
-                    updated_lines[start:start] = content
+                    key = (start, "insert_before")
+                    if key not in operations_by_position:
+                        operations_by_position[key] = []
+                    operations_by_position[key].append((seq_num, content))
+                elif op == "insert_after":
+                    key = (start, "insert_after")
+                    if key not in operations_by_position:
+                        operations_by_position[key] = []
+                    operations_by_position[key].append((seq_num, content))
+                elif op in {"replace", "delete"}:
+                    key = (start, "replace_delete")
+                    operations_by_position[key] = [(seq_num, (end, content))]
+
+            # Build final operation list with merged inserts
+            operations_to_apply = []
+            for (idx, op_type), items in operations_by_position.items():
+                if op_type in {"insert_before", "insert_after"}:
+                    # Merge multiple inserts at same position, preserving order
+                    merged_content = []
+                    for seq, content in sorted(items, key=lambda x: x[0]):
+                        merged_content.extend(content)
+                    operations_to_apply.append((idx, op_type, merged_content, min(x[0] for x in items)))
                 else:
-                    updated_lines[start + 1:start + 1] = content
+                    # replace_delete: only one per position
+                    seq, data = items[0]
+                    operations_to_apply.append((idx, op_type, data, seq))
+
+            # Sort by: 1) index descending, 2) op type priority, 3) original sequence ascending
+            def sort_key(item):
+                idx, op_type, _, seq = item
+                priority = {"replace_delete": 0, "insert_before": 1, "insert_after": 2}
+                return (-idx, priority.get(op_type, 0), seq)
+
+            for idx, op_type, data, _ in sorted(operations_to_apply, key=sort_key):
+                if op_type == "replace_delete":
+                    end, content = data
+                    updated_lines[idx:end + 1] = content
+                elif op_type == "insert_before":
+                    updated_lines[idx:idx] = data
+                elif op_type == "insert_after":
+                    updated_lines[idx + 1:idx + 1] = data
+
+            if prepend_content:
+                updated_lines[0:0] = prepend_content
+            if append_content:
+                updated_lines.extend(append_content)
             updated = join_text(updated_lines, layout.newline, layout.final_newline)
             self._atomic_write(path, updated, encoding, bool(args.get("backup", False)))
             return (

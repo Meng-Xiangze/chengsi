@@ -2,7 +2,6 @@
 import os
 import sys
 import subprocess
-import py_compile
 from typing import Any, Dict, List
 
 from tools.base import BaseTool
@@ -25,17 +24,23 @@ class ProjectTest(BaseTool):
             "validation on the project. Optionally discover and run a test suite."
         )
 
+    def is_verification(self, arguments: Dict[str, Any]) -> bool:
+        return True
+
     @property
     def parameters(self) -> Dict[str, Any]:
         return {
             "scope": {
                 "type": "string",
-                "description": "One of: syntax, imports, config, all (default: all).",
+                "description": "One of: syntax, imports, config, tests, all (default: all).",
             },
         }
 
     def run(self, arguments: Dict[str, Any]) -> str:
-        scope = arguments.get("scope", "all")
+        scope = str(arguments.get("scope", "all")).strip().lower()
+        valid_scopes = {"syntax", "imports", "config", "tests", "all"}
+        if scope not in valid_scopes:
+            return f"Error: scope must be one of: {', '.join(sorted(valid_scopes))}."
         results: List[str] = []
 
         if scope in ("syntax", "all"):
@@ -44,6 +49,8 @@ class ProjectTest(BaseTool):
             results.append(self._check_imports())
         if scope in ("config", "all"):
             results.append(self._check_config())
+        if scope in ("tests", "all"):
+            results.append(self._run_tests())
 
         return "\n\n".join(results) if results else "No checks selected."
 
@@ -101,17 +108,6 @@ class ProjectTest(BaseTool):
         sys.path.insert(0, PROJECT_ROOT)
         for mod, fpath in modules:
             try:
-                # Only test import, don't execute
-                subprocess.run(
-                    [sys.executable, "-c", f"import {mod}"],
-                    capture_output=True, text=True, timeout=10,
-                    cwd=PROJECT_ROOT,
-                )
-                # lines.append(f"  OK  {mod}")
-            except Exception:
-                pass  # already captured below; just try
-
-            try:
                 subprocess.run(
                     [sys.executable, "-c", f"import {mod}"],
                     capture_output=True, text=True, timeout=10,
@@ -129,6 +125,32 @@ class ProjectTest(BaseTool):
         sys.path.pop(0)
         total = len(modules)
         lines.append(f"  {total - errors}/{total} imports passed, {errors} failed.")
+        return "\n".join(lines)
+
+    def _run_tests(self) -> str:
+        """Run the repository's deterministic unittest suite in a subprocess."""
+        tests_dir = os.path.join(PROJECT_ROOT, "tests")
+        if not os.path.isdir(tests_dir):
+            return "[tests] SKIP tests/ (not found)."
+        lines = ["[tests] Running unittest discovery..."]
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "[tests] FAIL: test runner timed out after 120 seconds."
+        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+        if completed.returncode:
+            lines.append(f"  FAIL: unittest exited with code {completed.returncode}.")
+        else:
+            lines.append("  OK: unittest exited with code 0.")
+        if output:
+            lines.append(output)
         return "\n".join(lines)
 
     def _check_config(self) -> str:

@@ -9,6 +9,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
+from core.agent_runtime import AgentRuntime, classify_tool_outcome, user_requested_tool_creation
 from core.tool_manager import ToolManager
 from core.session_manager import SessionManager
 from core.knowledge_base import KnowledgeBase
@@ -50,6 +51,7 @@ class SessionData:
         self.compressed_prompt_base: int = 0
         self.compressed_context_size: int = 0
         self.ctx_tokens: int = 0
+        self.runtime_snapshot: dict = {}
 
 
 class AgentState:
@@ -110,6 +112,35 @@ state = AgentState()
 def load_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def discover_skills() -> list[dict[str, str]]:
+    """Discover lightweight SKILL.md summaries without loading full instructions."""
+    skills_root = Path(PROJECT_ROOT) / "skills"
+    if not skills_root.is_dir():
+        return []
+    skills = []
+    for path in sorted(skills_root.glob("*/SKILL.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        name_match = re.search(r"^name:\s*(.+?)\s*$", text, re.MULTILINE)
+        description_match = re.search(r"^description:\s*(.+?)\s*$", text, re.MULTILINE)
+        name = (name_match.group(1).strip().strip('\\\"') if name_match else path.parent.name)
+        description = description_match.group(1).strip().strip('\\\"') if description_match else ""
+        if description:
+            skills.append({"name": name, "description": description, "path": str(path)})
+    return skills
+
+
+def _skills_prompt() -> str:
+    skills = discover_skills()
+    if not skills:
+        return ""
+    lines = ["Available local skills (read the SKILL.md file only when relevant):"]
+    lines.extend(f"- {item['name']}: {item['description']}" for item in skills)
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -193,14 +224,74 @@ def build_model_choices(providers_cfg: list[dict]) -> list[tuple[str, str, str]]
 #  4. SYSTEM PROMPT BUILDER
 # ══════════════════════════════════════════════════════════════════════
 
+def _legacy_tool_prompt(available_tools: dict, tool_manager=None) -> str:
+    """Describe tools and the text-call protocol for models without native tools."""
+    definitions = build_tool_defs(tool_manager, available_tools) or []
+    if not definitions:
+        return "No tools are available for this turn."
+    first_function = definitions[0]["function"]
+    first_schema = first_function.get("parameters", {})
+    sample_arguments = {}
+    for name in first_schema.get("required", []):
+        spec = first_schema.get("properties", {}).get(name, {})
+        sample_arguments[name] = {
+            "integer": 1,
+            "number": 1,
+            "boolean": True,
+            "array": [],
+            "object": {},
+        }.get(spec.get("type"), "value")
+    sample = json.dumps(
+        {"action": first_function["name"], "arguments": sample_arguments},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    lines = [
+        "This model does not support native tool calls. Use this exact text protocol when a tool is needed:",
+        f"<tool_call>{sample}</tool_call>",
+        "The example uses a real available tool. Choose the tool that matches the task and supply its declared arguments.",
+        "Output exactly one tool_call block and no other text. After its result, either call another tool or answer normally.",
+        "Never invent a tool or parameter. Available tools:",
+    ]
+    for definition in definitions:
+        function = definition["function"]
+        schema = function.get("parameters", {})
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []))
+        parameters = []
+        for name, spec in properties.items():
+            spec = spec if isinstance(spec, dict) else {}
+            detail = f"{name}: {spec.get('type', 'any')}"
+            detail += ", required" if name in required else ", optional"
+            if spec.get("enum"):
+                detail += f", values={json.dumps(spec['enum'], ensure_ascii=False)}"
+            if spec.get("description"):
+                detail += f" — {spec['description']}"
+            parameters.append(detail)
+        lines.append(f"\n- {function['name']}: {function.get('description', '')}")
+        lines.extend(f"  - {parameter}" for parameter in parameters)
+        if not parameters:
+            lines.append("  - arguments: {}")
+    return "\n".join(lines)
+
+
 def format_system_prompt(available_tools: dict = None, tool_manager=None,
                          failure_alert: str | None = None, native_tools: bool = False) -> str:
-    p = "You are Chengsi (澄思), an assistant with local KB and tools. You may create new tools. "
-    p += "Never delete or modify YOUR `core/` directory or `main.py`. (other project's ok)"
-    p += "For facts, check KB then web; output only tool_call, answer, or question—no reasoning."
-    p += " When a task may require a tool, discover the relevant tool and read its usage instructions before calling it."
+    p = """You are Chengsi (澄思), a pragmatic agent with local tools and a knowledge base.
+Complete the user's actual task, not an adjacent task. Use tools only when they add evidence or make a required change.
+Before changing files, inspect the relevant code and preserve the project's existing conventions. After changing files, run the most relevant available verification before claiming completion.
+Treat every tool result as an observation, not proof of success. Read status markers and errors exactly. If an attempt fails, change one variable or approach; never repeat the same call more than twice.
+Keep a concise internal task state: goal, completed work, current blocker, and next verification. Do not expose private reasoning. Return only a tool call, a necessary clarification, or the final answer.
+Do not create a new tool unless the user explicitly asks for a reusable tool. Do not modify Chengsi's own core/ directory or main.py; other projects may be modified when requested.
+Use the knowledge base or web only when the answer needs external facts, freshness, or citations; do not browse for routine local work."""
     if failure_alert:
-        p += f" Alert: {failure_alert} — stop retrying, suggest alternative."
+        p += f"\nExecution alert: {failure_alert}. Stop retrying and report the blocker or choose a materially different approach."
+    if not native_tools:
+        p += "\n\n" + _legacy_tool_prompt(available_tools or {}, tool_manager)
+    skills = _skills_prompt()
+    if skills:
+        p += "\n\n" + skills
+    p += "\n\nControl commands handled directly by Chengsi: /tool list, /tool reload, /knowledge list, /knowledge search <query>, /knowledge add <file-or-folder>."
     return p
 
 
@@ -208,7 +299,8 @@ def format_system_prompt(available_tools: dict = None, tool_manager=None,
 #  5. AGENT LOOP (shared by CLI & Web modes)
 # ══════════════════════════════════════════════════════════════════════
 
-_MAX_TOOL_CALLS = 25
+_MAX_TOOL_CALLS = 30
+_MAX_WORKING_MESSAGES = 48
 
 
 def _emit(event_type: str, data, session_id: str = ""):
@@ -234,18 +326,19 @@ def _store_full_output(session_id: str, content: str) -> str:
     return path
 
 def _truncate_output(result: str, session_id: str) -> str:
-    """Truncate tool output for model consumption; full output stored for retrieval."""
+    """Keep the start and diagnostic tail; store the complete output as an artifact."""
+    result = str(result)
     if len(result) <= _MAX_TOOL_OUTPUT_CHARS:
         return result
     file_path = _store_full_output(session_id, result)
-    truncated = result[:_MAX_TOOL_OUTPUT_CHARS]
-    remainder = len(result) - _MAX_TOOL_OUTPUT_CHARS
+    head_size = _MAX_TOOL_OUTPUT_CHARS // 2
+    tail_size = _MAX_TOOL_OUTPUT_CHARS - head_size
+    omitted = len(result) - head_size - tail_size
     note = (
-        f"\n\n--- [OUTPUT TRUNCATED] {remainder} more chars omitted ---\n"
-        f"Full output saved to: {file_path}\n"
-        f"Use `python_executor` with `open()` to read it if needed."
+        f"\n\n--- [OUTPUT TRUNCATED] {omitted} middle chars omitted ---\n"
+        f"Full output: {file_path}\n\n"
     )
-    return truncated + note
+    return result[:head_size] + note + result[-tail_size:]
 
 
 # ─── JSON parsing for Ollama <tool_call> tags ─────────────────────────
@@ -458,6 +551,8 @@ def build_tool_defs(tool_manager, available_tools: dict) -> list[dict] | None:
             desc = meta.get("description", "")
         if not desc:
             desc = getattr(tool, "description", name)
+        if not isinstance(raw_params, dict):
+            raw_params = getattr(tool, "parameters", None)
         params = {"type": "object", "properties": {}, "required": []}
         if raw_params and isinstance(raw_params, dict):
             clean_props = {}
@@ -479,8 +574,11 @@ def build_tool_defs(tool_manager, available_tools: dict) -> list[dict] | None:
     return defs if defs else None
 
 
-def _is_native(provider) -> bool:
-    return getattr(provider, 'supports_native_tools', False)
+def _is_native(provider, model_config: dict | None = None) -> bool:
+    """Return native tool support, allowing explicit per-model overrides."""
+    if isinstance(model_config, dict) and "tools" in model_config:
+        return bool(model_config.get("tools"))
+    return getattr(provider, "supports_native_tools", False)
 
 
 def _execute_tool(action: str, args: dict, available_tools: dict, session_id: str):
@@ -491,7 +589,7 @@ def _execute_tool(action: str, args: dict, available_tools: dict, session_id: st
     if action not in available_tools:
         err = f"Unknown tool '{action}'"
         _emit("tool_result", err, session_id=session_id)
-        return err
+        return classify_tool_outcome("Error: " + err)
     _emit("thinking", f"Executing {action}...", session_id=session_id)
     try:
         result = available_tools[action].run(args)
@@ -500,7 +598,7 @@ def _execute_tool(action: str, args: dict, available_tools: dict, session_id: st
     result = _publish_generated_image(result, session_id)
     visible_result = re.sub(rf"\n?{re.escape(_IMAGE_MARKER)}.*$", "", str(result), flags=re.DOTALL).strip()
     _emit("tool_result", visible_result, session_id=session_id)
-    return _truncate_output(result, session_id)
+    return classify_tool_outcome(_truncate_output(result, session_id))
 
 
 _IMAGE_MARKER = "__IMAGE_PATH__:"
@@ -660,17 +758,88 @@ def _image_prompt_with_history(messages: list[dict]) -> str:
     )
 
 
+def _split_compaction_messages(conversation: list[dict], keep_count: int = 6) -> tuple[list[dict], list[dict]]:
+    """Split history without orphaning tool results from their assistant call."""
+    recent_start = max(0, len(conversation) - keep_count)
+    while recent_start > 0 and conversation[recent_start].get("role") == "tool":
+        recent_start -= 1
+    return conversation[:recent_start], conversation[recent_start:]
+
+
+def _working_context(messages: list[dict], limit: int = _MAX_WORKING_MESSAGES) -> list[dict]:
+    """Bound outbound working memory while preserving system and tool-call groups."""
+    if len(messages) <= limit + 1:
+        return list(messages)
+    system = messages[:1] if messages and messages[0].get("role") == "system" else []
+    conversation = messages[len(system):]
+    start = max(0, len(conversation) - limit)
+    while start > 0 and conversation[start].get("role") == "tool":
+        start -= 1
+    recent = conversation[start:]
+    marker = {
+        "role": "user",
+        "content": f"[WORKING CONTEXT]\n{start} older messages are omitted from this request. Use the compacted context if present and focus on the current task.",
+    }
+    compacted = next(
+        (message for message in reversed(conversation[:start]) if str(message.get("content", "")).startswith("[COMPACTED CONTEXT]")),
+        None,
+    )
+    return system + ([compacted] if compacted else []) + [marker] + recent
+
+
+def _turn_tools(available_tools: dict, messages: list[dict]) -> dict:
+    tools = dict(available_tools)
+    if not user_requested_tool_creation(messages):
+        tools.pop("tool_creator", None)
+    return tools
+
+
 def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None):
     sd = state.get(session_id)
     if sd is None or sd.cancel.is_set():
         return
 
     model_config = model_config or {}
-    native_tools = _is_native(provider)
-    tool_defs = build_tool_defs(tool_manager, available_tools) if native_tools else None
+    native_tools = _is_native(provider, model_config)
+    turn_tools = _turn_tools(available_tools, sd.messages)
+    tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
+    # Refresh on every turn so model switches, reloads, and legacy sessions use
+    # the protocol and tool catalog for the active model.
+    system_prompt = format_system_prompt(
+        turn_tools,
+        tool_manager=tool_manager,
+        native_tools=native_tools,
+    )
+    if sd.messages and sd.messages[0].get("role") == "system":
+        sd.messages[0]["content"] = system_prompt
+    else:
+        sd.messages.insert(0, {"role": "system", "content": system_prompt})
     supports_vision = _model_supports_vision(model_config)
     request_messages = None
-    tool_call_count = 0
+    runtime = AgentRuntime.from_snapshot(
+        sd.runtime_snapshot if sd.runtime_snapshot.get("active") else {},
+        max_tool_calls=_MAX_TOOL_CALLS,
+    )
+    runtime.active = True
+
+    def persist_runtime_snapshot() -> None:
+        sd.runtime_snapshot = runtime.snapshot()
+        if _session_manager and session_id in state.sessions:
+            _session_manager.save(
+                session_id,
+                sd.messages,
+                history=list(sd.history),
+                token_stats={
+                    "input": sd.input_tokens,
+                    "output": sd.output_tokens,
+                    "prompt": sd.prompt_tokens,
+                    "eval": sd.eval_tokens,
+                    "ctx": sd.ctx_tokens,
+                    "compressed_prompt_base": sd.compressed_prompt_base,
+                    "compressed_context_size": sd.compressed_context_size,
+                    "runtime": sd.runtime_snapshot,
+                },
+            )
 
     # Image-capable models use the dedicated image endpoint. Non-image models stay
     # on the normal chat/tool path; their provider sanitizes image history as needed.
@@ -725,7 +894,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             stream_tool_calls = None
             stream_error = None
 
-            request_messages = list(sd.messages)
+            request_messages = _working_context(sd.messages)
             if getattr(state, "knowledge_base", None):
                 user_text = next((m.get("content", "") for m in reversed(sd.messages) if m.get("role") == "user"), "")
                 if isinstance(user_text, str):
@@ -785,12 +954,6 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
 
             # ── NATIVE TOOL CALLS (OpenAI-compatible) ──
             if stream_tool_calls:
-                tool_call_count += 1
-                if tool_call_count > _MAX_TOOL_CALLS:
-                    _emit("thinking", f"Tool call limit ({_MAX_TOOL_CALLS}) reached. Please simplify.", session_id=session_id)
-                    sd.messages.append({"role": "user", "content": f"Tool call limit ({_MAX_TOOL_CALLS}) reached."})
-                    continue
-
                 native_tc_list = [
                     {
                         "id": tc["id"],
@@ -805,20 +968,42 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 assistant_msg = {"role": "assistant", "content": full_content or None, "tool_calls": native_tc_list}
                 sd.messages.append(assistant_msg)
 
+                stop_reason = ""
                 for tc in stream_tool_calls:
-                    result = _execute_tool(tc["action"], tc["arguments"], available_tools, session_id)
-                    tool_msg = _inject_image_content({"role": "tool", "tool_call_id": tc["id"], "content": str(result)}, supports_vision=supports_vision)
+                    allowed, reason = runtime.allow(tc["action"], tc["arguments"])
+                    if allowed:
+                        outcome = _execute_tool(tc["action"], tc["arguments"], turn_tools, session_id)
+                        should_continue, reason = runtime.observe(
+                            tc["action"], tc["arguments"], outcome, turn_tools.get(tc["action"])
+                        )
+                        persist_runtime_snapshot()
+                        if not should_continue:
+                            stop_reason = reason
+                    else:
+                        outcome = classify_tool_outcome("Error: " + reason)
+                        stop_reason = reason
+                    tool_msg = _inject_image_content({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": outcome.for_model(),
+                    }, supports_vision=supports_vision)
                     sd.messages.append(tool_msg)
 
-                    if tc["action"] == "tool_creator":
+                    if allowed and tc["action"] == "tool_creator" and outcome.ok:
                         _emit("thinking", "Reloading tool registry...", session_id=session_id)
                         available_tools = tool_manager.load_tools()
-                        tool_defs = build_tool_defs(tool_manager, available_tools) if native_tools else None
+                        turn_tools = _turn_tools(available_tools, sd.messages)
+                        tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
                         sd.messages[0]["content"] = format_system_prompt(
                             available_tools, tool_manager=tool_manager, native_tools=native_tools
                         )
                         _emit("thinking", f"Tools updated: {list(available_tools.keys())}", session_id=session_id)
 
+                if stop_reason:
+                    message = f"Agent stopped safely: {stop_reason}"
+                    sd.messages.append({"role": "assistant", "content": message})
+                    _emit("agent_done", message, session_id=session_id)
+                    return
                 continue
 
             # ── LEGACY TEXT-BASED TOOL CALLS ──
@@ -827,12 +1012,6 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             # code, and prompt examples can contain those strings and cause false calls.
             match = None if native_tools else re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", full_content, re.DOTALL)
             if match:
-                tool_call_count += 1
-                if tool_call_count > _MAX_TOOL_CALLS:
-                    _emit("thinking", f"Tool call limit ({_MAX_TOOL_CALLS}) reached.", session_id=session_id)
-                    sd.messages.append({"role": "user", "content": f"Tool call limit ({_MAX_TOOL_CALLS}) reached."})
-                    continue
-
                 text_before = full_response[:match.start()].strip()
                 if text_before and len(text_before) > 10:
                     sd.messages.append({"role": "assistant", "content": text_before})
@@ -854,14 +1033,30 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     sd.messages.append({"role": "assistant", "content": clean_response})
                     _emit("agent_done", clean_response, session_id=session_id)
                     return
-                result = _execute_tool(action, args, available_tools, session_id)
-                tool_msg = _inject_image_content({"role": "user", "content": f"TOOL_RESULT: {result}"}, supports_vision=supports_vision)
+                allowed, reason = runtime.allow(action, args)
+                if not allowed:
+                    message = f"Agent stopped safely: {reason}"
+                    sd.messages.append({"role": "assistant", "content": message})
+                    _emit("agent_done", message, session_id=session_id)
+                    return
+                outcome = _execute_tool(action, args, turn_tools, session_id)
+                tool_msg = _inject_image_content({"role": "user", "content": outcome.for_model()}, supports_vision=supports_vision)
                 sd.messages.append(tool_msg)
+                should_continue, reason = runtime.observe(
+                    action, args, outcome, turn_tools.get(action)
+                )
+                persist_runtime_snapshot()
+                if not should_continue:
+                    message = f"Agent stopped safely: {reason}"
+                    sd.messages.append({"role": "assistant", "content": message})
+                    _emit("agent_done", message, session_id=session_id)
+                    return
 
-                if action == "tool_creator":
+                if action == "tool_creator" and outcome.ok:
                     _emit("thinking", "Reloading tool registry...", session_id=session_id)
                     available_tools = tool_manager.load_tools()
-                    tool_defs = build_tool_defs(tool_manager, available_tools) if native_tools else None
+                    turn_tools = _turn_tools(available_tools, sd.messages)
+                    tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
                     sd.messages[0]["content"] = format_system_prompt(
                         available_tools, tool_manager=tool_manager, native_tools=native_tools
                     )
@@ -870,7 +1065,17 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 continue
 
             # ── FINAL ANSWER ──
+            if runtime.can_request_verification():
+                runtime.mark_verification_reminder()
+                sd.messages.append({
+                    "role": "user",
+                    "content": "[RUNTIME REQUIREMENT] Files changed successfully, but no successful project_test has run since the change. Run the most relevant project_test now. If verification cannot run, report that limitation explicitly.",
+                })
+                continue
+
             clean_response = re.sub(r"<tool_call>.*?</tool_call>", "", full_response, flags=re.DOTALL).strip()
+            if runtime.needs_verification():
+                clean_response = (clean_response + "\n\nVerification was not completed after the file changes.").strip()
             if not clean_response:
                 clean_response = full_response.strip() or "(empty response)"
             # Strip thinking/reasoning that leaked into content
@@ -898,6 +1103,85 @@ _providers_cfg: list[dict] = []
 _available_tools: dict = {}
 _tool_manager: ToolManager | None = None
 _session_manager: SessionManager | None = None
+
+
+def _refresh_runtime_tools() -> dict:
+    """Reload Python tools and refresh system prompts for idle sessions."""
+    global _available_tools
+    if not _tool_manager:
+        return {}
+    _available_tools = _tool_manager.load_tools()
+    model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+    native = _is_native(_provider, model_config)
+    for session in state.sessions.values():
+        if session.messages and not session.processing:
+            session.messages[0] = {
+                "role": "system",
+                "content": format_system_prompt(
+                    _available_tools,
+                    tool_manager=_tool_manager,
+                    native_tools=native,
+                ),
+            }
+    return _available_tools
+
+
+def handle_control_command(command: str, session_id: str = "") -> str:
+    """Handle pi-like resource commands without spending a model turn."""
+    parts = command.split(maxsplit=2)
+    area = parts[0].lower()
+    action = parts[1].lower() if len(parts) > 1 else "list"
+    argument = parts[2].strip() if len(parts) > 2 else ""
+
+    if area == "/tool":
+        if action == "list":
+            names = sorted(_available_tools)
+            return "Available tools:\n" + "\n".join(f"- {name}" for name in names)
+        if action == "reload":
+            tools = _refresh_runtime_tools()
+            return f"Tools reloaded ({len(tools)}): {', '.join(sorted(tools))}"
+        return "Usage: /tool list | /tool reload"
+
+    if area == "/knowledge":
+        if not state.knowledge_base:
+            return "Knowledge base is not initialized."
+        if action == "list":
+            documents = state.knowledge_base.list_documents()
+            if not documents:
+                return "Knowledge base is empty."
+            return "Knowledge documents:\n" + "\n".join(
+                f"- [{item['id']}] {item['title']} ({item['source']})"
+                for item in documents
+            )
+        if action == "search":
+            if not argument:
+                return "Usage: /knowledge search <query>"
+            results = state.knowledge_base.search(argument)
+            if not results:
+                return "No matching knowledge-base documents."
+            return "\n\n".join(
+                f"[{item['id']}] {item['title']} ({item['source']})\n{item['snippet']}"
+                for item in results
+            )
+        if action == "add":
+            if not argument:
+                return "Usage: /knowledge add <file-or-folder>"
+            path = Path(argument.strip('\\\"')).expanduser().resolve()
+            if path.is_file():
+                return json.dumps(state.knowledge_base.ingest_file(str(path)), ensure_ascii=False)
+            if path.is_dir():
+                results = []
+                for item in sorted(path.rglob("*")):
+                    if item.is_file() and item.suffix.lower() in KnowledgeBase.SUPPORTED_SUFFIXES:
+                        try:
+                            results.append(state.knowledge_base.ingest_file(str(item)))
+                        except (OSError, ValueError) as exc:
+                            results.append({"source": str(item), "status": "error", "error": str(exc)})
+                return json.dumps({"path": str(path), "count": len(results), "items": results}, ensure_ascii=False)
+            return f"Path not found: {path}"
+        return "Usage: /knowledge list | /knowledge search <query> | /knowledge add <file-or-folder>"
+
+    return "Unknown control command."
 
 
 class WebAPI:
@@ -975,6 +1259,15 @@ class WebAPI:
         if not message.strip():
             return {"status": "error"}
 
+        # Keep lightweight slash commands out of the model loop.
+        if message.strip().startswith(("/tool", "/knowledge")):
+            sid = state.current_session_id
+            if not sid and _session_manager:
+                sid = _session_manager.create()["id"]
+                state.current_session_id = sid
+            result = handle_control_command(message.strip(), sid)
+            return {"status": "ok", "session_id": sid, "handled": True, "result": result}
+
         # Create session immediately
         sid = state.current_session_id
         if not sid or not _session_manager:
@@ -984,7 +1277,8 @@ class WebAPI:
 
         sd = state.ensure(sid)
         if not sd.messages:
-            native = _is_native(_provider)
+            model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+            native = _is_native(_provider, model_config)
             sd.messages = [{"role": "system", "content": format_system_prompt(_available_tools, tool_manager=_tool_manager, native_tools=native)}]
 
         sd.messages.append({"role": "user", "content": message})
@@ -1017,15 +1311,19 @@ class WebAPI:
         turn_model_config = _get_provider_model_capabilities(_providers_cfg, turn_provider, turn_model)
 
         def worker():
+            completed = False
             try:
                 sd.processing = True
                 process_agent_turn(turn_provider, turn_model, _available_tools, _tool_manager, session_id=sid, model_config=turn_model_config)
+                completed = True
             except Exception as e:
                 import traceback
                 err = f"Agent Error: {e}\n{traceback.format_exc()}"
                 _emit("agent_done", err, session_id=sid)
             finally:
                 sd.processing = False
+                if completed:
+                    sd.runtime_snapshot = {}
                 _emit("processing_done", {"cancelled": sd.cancel.is_set()}, session_id=sid)
                 sd.cancel.clear()
                 # Auto-save after turn (skip if session was deleted)
@@ -1041,6 +1339,7 @@ class WebAPI:
                             "ctx": sd.ctx_tokens,
                             "compressed_prompt_base": sd.compressed_prompt_base,
                             "compressed_context_size": sd.compressed_context_size,
+                            "runtime": sd.runtime_snapshot,
                         },
                     )
 
@@ -1158,7 +1457,8 @@ class WebAPI:
             return {"status": "error", "msg": "Session manager not initialized"}
         session = _session_manager.create()
         state.current_session_id = session["id"]
-        native = _is_native(_provider)
+        model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+        native = _is_native(_provider, model_config)
         state.ensure(session["id"]).messages = [{"role": "system", "content": format_system_prompt(_available_tools, tool_manager=_tool_manager, native_tools=native)}]
         return {"status": "ok", "session": session}
 
@@ -1199,6 +1499,7 @@ class WebAPI:
                 "ctx": sd.ctx_tokens or _estimate_ctx_tokens(sd.messages, _provider_model, _provider),
                 "compressed_prompt_base": sd.compressed_prompt_base,
                 "compressed_context_size": sd.compressed_context_size,
+                "runtime": sd.runtime_snapshot,
                 "processing": sd.processing,
             }
 
@@ -1207,7 +1508,8 @@ class WebAPI:
         if not session:
             return {"status": "error", "msg": "Session not found"}
         sd = state.ensure(session_id)
-        native = _is_native(_provider)
+        model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+        native = _is_native(_provider, model_config)
         # The session file is the canonical transcript. Provider-specific cleanup
         # belongs in prepare_messages(), immediately before the API request.
         disk_messages = [m for m in session.get("messages", []) if m.get("role") != "system"]
@@ -1220,6 +1522,7 @@ class WebAPI:
         sd.eval_tokens = sd.output_tokens
         sd.compressed_prompt_base = stats.get("compressed_prompt_base", 0)
         sd.compressed_context_size = stats.get("compressed_context_size", 0)
+        sd.runtime_snapshot = stats.get("runtime", {}) if isinstance(stats.get("runtime", {}), dict) else {}
         sd.ctx_tokens = stats.get("ctx", 0) or _estimate_ctx_tokens(sd.messages, _provider_model, _provider)
         state.current_session_id = session_id
         return {
@@ -1234,6 +1537,7 @@ class WebAPI:
             "ctx": sd.ctx_tokens,
             "compressed_prompt_base": stats.get("compressed_prompt_base", 0),
             "compressed_context_size": stats.get("compressed_context_size", 0),
+            "runtime": sd.runtime_snapshot,
             "processing": sd.processing,
         }
 
@@ -1276,7 +1580,7 @@ class WebAPI:
         keep_count = 6
         if len(conversation) <= keep_count + 2:
             return {"status": "error", "msg": "Context is already short; nothing to compact"}
-        older, recent = conversation[:-keep_count], conversation[-keep_count:]
+        older, recent = _split_compaction_messages(conversation, keep_count)
         # Snapshot context size BEFORE compaction
         pre_compact_ctx = _estimate_ctx_tokens(sd.messages, _provider_model, _provider)
         transcript = []
@@ -1308,7 +1612,9 @@ CONVERSATION:
         except Exception as exc:
             return {"status": "error", "msg": f"Compaction failed: {exc}"}
 
-        compact_marker = {"role": "system", "content": "[COMPACTED CONTEXT]\n" + summary.strip()}
+        # Persist the summary as conversation context. SessionManager intentionally
+        # removes system prompts because they are rebuilt when a session is loaded.
+        compact_marker = {"role": "user", "content": "[COMPACTED CONTEXT]\n" + summary.strip()}
 
         # Use the same estimator as live context statistics for both snapshots.
         new_messages = [system, compact_marker] + recent
@@ -1384,11 +1690,12 @@ CONVERSATION:
 #  7. CLI MODE
 # ══════════════════════════════════════════════════════════════════════
 
-def run_cli(provider, model: str, available_tools: dict, tool_manager: ToolManager):
+def run_cli(provider, model: str, available_tools: dict, tool_manager: ToolManager, model_config: dict | None = None):
     sid = "cli-session"
     sd = state.ensure(sid)
     state.current_session_id = sid
-    native = _is_native(provider)
+    model_config = model_config or {}
+    native = _is_native(provider, model_config)
     sd.messages = [{"role": "system", "content": format_system_prompt(available_tools, tool_manager=tool_manager, native_tools=native)}]
 
     pname = provider.name if hasattr(provider, 'name') else "provider"
@@ -1402,10 +1709,13 @@ def run_cli(provider, model: str, available_tools: dict, tool_manager: ToolManag
                 break
             if not user_input:
                 continue
+            if user_input.startswith(("/tool", "/knowledge")):
+                print(handle_control_command(user_input, sid))
+                continue
 
             sd.messages.append({"role": "user", "content": user_input})
             _emit("user", user_input)
-            process_agent_turn(provider, model, available_tools, tool_manager, session_id=sid)
+            process_agent_turn(provider, model, available_tools, tool_manager, session_id=sid, model_config=model_config)
     except KeyboardInterrupt:
         print("\nSession ended.")
 

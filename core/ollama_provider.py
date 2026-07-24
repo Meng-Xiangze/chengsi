@@ -20,10 +20,10 @@ class OllamaProvider(BaseProvider):
 
     @staticmethod
     def prepare_messages(messages: list[dict]) -> list[dict]:
-        converted = []
+        prepared = []
         for message in messages:
-            new_message = dict(message)
-            content = new_message.get("content", "")
+            item = dict(message)
+            content = item.get("content", "")
             if isinstance(content, list):
                 text_parts = []
                 images = []
@@ -37,32 +37,27 @@ class OllamaProvider(BaseProvider):
                         url = part.get("image_url", {})
                         if isinstance(url, dict):
                             url = url.get("url", "")
-                        # Local file URLs are generated-image history, not valid
-                        # Ollama image inputs. Keep the accompanying text only.
                         if isinstance(url, str) and url.startswith("data:image/") and "," in url:
                             images.append(url.split(",", 1)[1])
-                new_message["content"] = "\n".join(text_parts) if text_parts else ""
+                item["content"] = "\n".join(text_parts) if text_parts else ""
                 if images:
-                    new_message["images"] = images
-            if new_message.get("role") == "tool":
-                new_message["role"] = "user"
-                if new_message.get("content"):
-                    new_message["content"] = f"TOOL_RESULT: {new_message['content']}"
-            new_message.pop("tool_calls", None)
-            new_message.pop("tool_call_id", None)
-            converted.append(new_message)
-
-        merged = []
-        for message in converted:
-            if message.get("role") == "user" and merged and merged[-1].get("role") == "user":
-                previous = merged[-1].get("content", "")
-                current = message.get("content", "")
-                merged[-1]["content"] = f"{previous}\n{current}" if previous else current
-                if "images" in message:
-                    merged[-1]["images"] = merged[-1].get("images", []) + message["images"]
-            else:
-                merged.append(message)
-        return merged
+                    item["images"] = images
+            if item.get("role") == "assistant" and item.get("tool_calls"):
+                normalized_calls = []
+                for tool_call in item["tool_calls"]:
+                    call = dict(tool_call)
+                    function = dict(call.get("function") or {})
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        try:
+                            function["arguments"] = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            function["arguments"] = {}
+                    call["function"] = function
+                    normalized_calls.append(call)
+                item["tool_calls"] = normalized_calls
+            prepared.append(item)
+        return prepared
 
     @staticmethod
     def _convert_tool_defs(tool_defs: list[dict]) -> list[dict]:
@@ -119,7 +114,7 @@ class OllamaProvider(BaseProvider):
                             except Exception:
                                 arguments = {}
                         calls.append({
-                            "id": f"call_{len(calls):02d}",
+                            "id": tool_call.get("id") or f"call_{len(calls):02d}",
                             "action": function.get("name", ""),
                             "arguments": arguments,
                         })
