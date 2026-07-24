@@ -1,7 +1,8 @@
 import ast
+import base64
+import os
+import subprocess
 import sys
-import io
-import contextlib
 import warnings
 from typing import Any, Dict
 from tools.base import BaseTool
@@ -39,10 +40,11 @@ class PythonExecutor(BaseTool):
 
     @property
     def description(self) -> str:
-        return ("Execute Python code on the host machine for system operations, calculations, package installs, "
+        return ("Execute Python code in an isolated child process for system operations, calculations, package installs, "
                 "diagnostics, and file management such as creating, copying, moving, renaming, or packaging files. "
-                "Direct deletion is blocked; use system_cleaner. Use code_editor or code_context for routine project "
-                "source reads, edits, and searches. Manage knowledge-base records only through knowledge_base.")
+                "Child stdout/stderr are returned to the WebUI and child stdin is closed; interactive commands are not "
+                "supported. Direct deletion is blocked; use system_cleaner. Use code_editor or code_context for routine "
+                "project source reads, edits, and searches. Manage knowledge-base records only through knowledge_base.")
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -58,30 +60,59 @@ class PythonExecutor(BaseTool):
         if not code:
             return "Error: No code provided."
 
-        blocked = self._destructive_operation(str(code))
+        code = str(code)
+        blocked = self._destructive_operation(code)
         if blocked:
             return blocked
 
-        output_buffer = io.StringIO()
-        error_buffer = io.StringIO()
-        
-        with contextlib.redirect_stdout(output_buffer), contextlib.redirect_stderr(error_buffer):
-            try:
-                exec_globals = {}
-                exec(code, exec_globals)
-            except Exception as e:
-                # We print to stderr so it gets captured by error_buffer
-                print(f"Execution Error: {e}", file=sys.stderr)
+        # Run user code outside the WebView process. This prevents child
+        # processes started by the code from inheriting Chengsi's console.
+        runner = (
+            "import base64, sys, traceback\n"
+            "source = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+            "try:\n"
+            "    exec(source, {'__name__': '__main__'})\n"
+            "except BaseException:\n"
+            "    traceback.print_exc(file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+        )
+        encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", runner, encoded],
+                cwd=project_root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout_res = error.stdout or ""
+            stderr_res = error.stderr or ""
+            return self._format_result(stdout_res, stderr_res, "Execution timed out after 300 seconds.")
+        except OSError as error:
+            return f"Error: could not start isolated Python process: {error}"
 
-        stdout_res = output_buffer.getvalue()
-        stderr_res = error_buffer.getvalue()
-        
+        stdout_res = completed.stdout or ""
+        stderr_res = completed.stderr or ""
+        if completed.returncode:
+            stderr_res = stderr_res or f"Execution failed with exit code {completed.returncode}."
+        return self._format_result(stdout_res, stderr_res)
+
+    @staticmethod
+    def _format_result(stdout_res: str, stderr_res: str, extra_error: str = "") -> str:
         result = []
         if stdout_res:
             result.append(f"--- STDOUT ---\n{stdout_res}")
         if stderr_res:
             result.append(f"--- STDERR ---\n{stderr_res}")
-        
+        if extra_error:
+            result.append(extra_error)
         return "\n".join(result) if result else "Code executed successfully (no output)."
 
 if __name__ == "__main__":

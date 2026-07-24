@@ -9,10 +9,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import requests
-
 import yaml
 
+from core.http_client import HttpClient
 from tools.base import BaseTool
 
 
@@ -130,6 +129,7 @@ class ImageGenerationTool(BaseTool):
             return "Image generation error: prompt is required."
         provider, model = self._config()
         base_url = str(provider.get("base_url", "")).rstrip("/")
+        http = HttpClient(provider.get("network_mode", "auto"))
         headers = {"Authorization": f"Bearer {provider.get('api_key', '')}"}
         image_path = str(arguments.get("image_path", "")).strip()
         source = Path(image_path).expanduser().resolve() if image_path else None
@@ -141,13 +141,13 @@ class ImageGenerationTool(BaseTool):
                 data = {"model": model, "prompt": prompt, "size": "1024x1024"}
                 with source.open("rb") as image_file:
                     files = {"image": (source.name, image_file, mime)}
-                    response = requests.post(f"{base_url}/images/edits", headers=headers, data=data, files=files, timeout=300)
+                    response = http.post(f"{base_url}/images/edits", headers=headers, data=data, files=files, timeout=(8, 300))
             else:
-                response = requests.post(
+                response = http.post(
                     f"{base_url}/images/generations",
                     headers={**headers, "Content-Type": "application/json"},
                     json={"model": model, "prompt": prompt, "size": "1024x1024"},
-                    timeout=300,
+                    timeout=(8, 300),
                 )
             response.raise_for_status()
             entries = (response.json().get("data") or [])
@@ -163,7 +163,7 @@ class ImageGenerationTool(BaseTool):
             if url.startswith("data:"):
                 output.write_bytes(base64.b64decode(url.split(",", 1)[1]))
             else:
-                download = requests.get(url, timeout=120)
+                download = http.get(url, timeout=(8, 120))
                 download.raise_for_status()
                 output.write_bytes(download.content)
             artifact = json.dumps({

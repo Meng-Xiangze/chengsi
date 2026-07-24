@@ -2,11 +2,17 @@ import json
 
 import requests
 
+from core.http_client import HttpClient
 from core.provider import BaseProvider
 
 
 class OllamaProvider(BaseProvider):
     """Provider for local Ollama models."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        # Local model traffic must never be sent to a VPN or desktop proxy.
+        self.http = HttpClient("direct")
 
     @property
     def supports_native_tools(self) -> bool:
@@ -83,7 +89,7 @@ class OllamaProvider(BaseProvider):
         external_cancel = kwargs.get("cancel_event")
         self._cancel_event.clear()
         try:
-            response = requests.post(url, json=payload, timeout=300, stream=True)
+            response = self.http.post(url, json=payload, timeout=(3, 300), stream=True)
             response.raise_for_status()
             self._resp = response
             for line in response.iter_lines():

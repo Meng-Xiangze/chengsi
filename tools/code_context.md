@@ -20,5 +20,6 @@ examples:
       ext: ".py"
 usage_notes:
   - Use a plain keyword when possible; regex is supported.
+  - Results use LINE:HASH anchors that can be copied into code_editor edit operations.
   - This searches project files, not the whole computer.
 ---

@@ -3,6 +3,7 @@ import os
 import re
 from typing import Any, Dict, List
 
+from tools._hashline import anchor
 from tools.base import BaseTool
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -101,7 +102,7 @@ class CodeContext(BaseTool):
                         start = max(idx - 3, 0)
                         end = min(idx + 4, len(file_lines))
                         context = "".join(
-                            f"  {'>' if row == idx else ' '} {row + 1:4d} "
+                            f"  {'>' if row == idx else ' '} {anchor(row + 1, file_lines[row].rstrip(chr(10)).rstrip(chr(13)))}|"
                             f"{file_lines[row].rstrip()}\n"
                             for row in range(start, end)
                         )

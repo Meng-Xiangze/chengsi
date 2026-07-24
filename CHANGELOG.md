@@ -6,18 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-24
+
 ### Added
 
-- Desktop WebUI with persistent sessions and model selection.
-- Ollama and OpenAI-compatible provider adapters.
-- Extensible local tool system and local SQLite FTS5 knowledge base.
-- Image generation, session media storage, and direct image rendering.
-- Protected project paths for destructive local operations.
+- Configurable `auto`, `direct`, and `system_proxy` network modes for online providers.
+- Content-verified line anchors and file revisions for atomic source edits.
+- Regression tests for network fallback and hash-anchored editing.
 
 ### Changed
 
-- Tool calls and tool results are collapsed to one-line previews by default.
-- Successful image generation now ends the turn after displaying the image and report.
+- Local Ollama traffic always bypasses desktop HTTP proxies.
+- Tool usage is discovered from tool documentation instead of being embedded in the system prompt.
+- Python tool execution now runs in an isolated non-interactive child process with captured output.
+
+### Fixed
+
+- Online provider access when a VPN or unusable desktop proxy is enabled.
+- Child command output and interactive prompts leaking into Chengsi's background console.
+- Stale, overlapping, or ambiguous source edits modifying the wrong content.
 
 ## [0.1.0] - 2026-07-23
 

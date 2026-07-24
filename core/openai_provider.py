@@ -3,11 +3,16 @@ from typing import Any
 
 import requests
 
+from core.http_client import HttpClient
 from core.provider import BaseProvider
 
 
 class OpenAIProvider(BaseProvider):
     """Provider for OpenAI-compatible chat and image APIs."""
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self.http = HttpClient(self.config.get("network_mode", "auto"))
 
     @property
     def supports_native_tools(self) -> bool:
@@ -169,11 +174,11 @@ class OpenAIProvider(BaseProvider):
         self._cancel_event.clear()
         tool_parts: dict[int, dict] = {}
         try:
-            response = requests.post(
+            response = self.http.post(
                 f"{self._base_url}/chat/completions",
                 headers=self._headers,
                 json=payload,
-                timeout=300,
+                timeout=(8, 300),
                 stream=True,
             )
             response.raise_for_status()
@@ -228,10 +233,14 @@ class OpenAIProvider(BaseProvider):
                     yield "error", "; ".join(parse_errors)
                 else:
                     yield "tool_calls", calls
-        except requests.exceptions.ConnectionError:
-            yield "error", f"Could not connect to OpenAI-compatible provider ({self._base_url})"
-        except requests.exceptions.Timeout:
-            yield "error", f"Provider request timed out ({self._base_url})"
+        except requests.exceptions.ProxyError as error:
+            yield "error", f"System proxy could not reach provider ({self._base_url}): {error}"
+        except requests.exceptions.ConnectTimeout as error:
+            yield "error", f"Provider connection timed out ({self._base_url}): {error}"
+        except requests.exceptions.ConnectionError as error:
+            yield "error", f"Could not connect to OpenAI-compatible provider ({self._base_url}): {error}"
+        except requests.exceptions.Timeout as error:
+            yield "error", f"Provider response timed out ({self._base_url}): {error}"
         except requests.exceptions.HTTPError as error:
             status = error.response.status_code if error.response is not None else "?"
             body = self._response_text(error.response) if error.response is not None else ""
@@ -243,11 +252,11 @@ class OpenAIProvider(BaseProvider):
 
     def generate_image(self, model: str, prompt: str) -> dict[str, str]:
         payload = {"model": model, "prompt": prompt, "size": "1024x1024"}
-        response = requests.post(
+        response = self.http.post(
             f"{self._base_url}/images/generations",
             headers=self._headers,
             json=payload,
-            timeout=300,
+            timeout=(8, 300),
         )
         response.raise_for_status()
         result = response.json()

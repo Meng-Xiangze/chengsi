@@ -4,18 +4,23 @@ import shutil
 import tempfile
 from typing import Any, Dict
 
+from tools._hashline import (
+    format_lines,
+    join_text,
+    replacement_lines,
+    revision,
+    split_text,
+    validate_anchor,
+)
 from tools.base import BaseTool
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _SKIP_DIRS = {".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules"}
+_VALID_OPS = {"replace", "delete", "insert_before", "insert_after"}
 
 
 class CodeEditor(BaseTool):
-    """Small, predictable file editor designed for local models.
-
-    Keep the public API intentionally small: read, write, edit, search.
-    Common aliases are accepted, but the model only needs to learn four actions.
-    """
+    """Safe project editor using content-verified line anchors."""
 
     @property
     def tool_name(self) -> str:
@@ -24,59 +29,53 @@ class CodeEditor(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read or safely modify project files. Three actions: read (view file contents), "
-            "write (replace entire file), edit (targeted find-and-replace of one exact match). "
-            "Use this for ALL file operations. Do NOT use python_executor to read or write files."
+            "Read and safely modify project files. Read returns LINE:HASH anchors. "
+            "Use edit operations with copied anchors; stale or overlapping edits are rejected atomically."
         )
 
     @property
     def parameters(self) -> Dict[str, Any]:
-        # Flat, short descriptions and useful defaults are easier for small models.
         return {
             "action": {
                 "type": "string",
-                "description": "read, write, or edit (default: read). Use read before edit.",
+                "description": "read, write, edit, or search. Default: read. Read before edit.",
             },
-            "path": {
+            "path": {"type": "string", "description": "Relative project file path."},
+            "content": {"type": "string", "description": "Complete content for write."},
+            "revision": {
                 "type": "string",
-                "description": "Relative file path in the project.",
+                "description": "Optional file revision copied from read; rejects any stale snapshot.",
             },
-            "content": {
-                "type": "string",
-                "description": "Complete file content for write. Empty content is allowed.",
-            },
-            "old": {
-                "type": "string",
-                "description": "Exact text to replace; edit changes the first match only.",
-            },
-            "new": {
-                "type": "string",
-                "description": "Replacement text for edit.",
-            },
-            "backup": {
-                "type": "boolean",
-                "description": "Create path.bak before modifying. Default: false.",
-            },
-            "encoding": {
-                "type": "string",
-                "description": "File encoding. Default: utf-8.",
-            },
-            "changes": {
+            "operations": {
                 "type": "array",
-                "description": "Optional batch edit list: [{old: '...', new: '...'}]. Uses first-match for each.",
+                "description": (
+                    "Hash-anchored edits. Copy start/end anchors exactly from read or search. "
+                    "end is only for replace/delete ranges."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {"type": "string", "enum": sorted(_VALID_OPS)},
+                        "start": {"type": "string", "description": "Starting LINE:HASH anchor."},
+                        "end": {"type": "string", "description": "Optional ending LINE:HASH anchor."},
+                        "content": {"type": "string", "description": "Replacement or inserted text."},
+                    },
+                    "required": ["op", "start"],
+                },
             },
+            "offset": {"type": "integer", "description": "First line for read; default 1."},
+            "limit": {"type": "integer", "description": "Maximum read lines; default 400, maximum 2000."},
+            "backup": {"type": "boolean", "description": "Create path.bak before modifying. Default false."},
+            "encoding": {"type": "string", "description": "File encoding. Default utf-8."},
+            "pattern": {"type": "string", "description": "Regex or text for search."},
+            "glob": {"type": "string", "description": "Filename glob for search; default *."},
+            "max_results": {"type": "integer", "description": "Maximum search matches; default 50."},
         }
 
     def run(self, arguments: dict) -> str:
         args = arguments or {}
         action = str(args.get("action", "read")).strip().lower()
-        action = {"grep": "search", "replace": "edit", "replace_all": "edit"}.get(action, action)
-
-        # An omitted optional `changes` field may arrive as an empty list from
-        # the tool layer. Treat only a non-empty list as a batch edit; otherwise
-        # dispatch to the requested action normally.
-        if action == "edit" and isinstance(args.get("changes"), list) and args["changes"]:
-            return self._batch_edit(args)
+        action = {"grep": "search", "patch": "edit"}.get(action, action)
         if action == "read":
             return self._read(args)
         if action == "write":
@@ -95,9 +94,12 @@ class CodeEditor(BaseTool):
             if os.path.commonpath([PROJECT_ROOT, candidate]) != PROJECT_ROOT:
                 raise ValueError("path must stay inside the project")
             if write:
-                protected = os.path.join(PROJECT_ROOT, "core")
-                if os.path.commonpath([protected, candidate]) == protected:
-                    raise PermissionError("core is a read-only protected directory")
+                protected_paths = [os.path.join(PROJECT_ROOT, "core"), os.path.join(PROJECT_ROOT, "main.py")]
+                for protected in protected_paths:
+                    if candidate == protected or (
+                        os.path.isdir(protected) and os.path.commonpath([protected, candidate]) == protected
+                    ):
+                        raise PermissionError("the running core directory and main.py are read-only")
         except ValueError:
             raise ValueError("path must stay inside the project")
         return candidate
@@ -106,24 +108,32 @@ class CodeEditor(BaseTool):
     def _encoding(args: dict) -> str:
         return str(args.get("encoding") or "utf-8")
 
-    def _read_text(self, path: str, encoding: str) -> str:
-        with open(path, "r", encoding=encoding) as f:
-            return f.read()
+    @staticmethod
+    def _read_text(path: str, encoding: str) -> str:
+        with open(path, "r", encoding=encoding, newline="") as handle:
+            return handle.read()
 
     def _atomic_write(self, path: str, content: str, encoding: str, backup: bool) -> None:
         if backup and os.path.isfile(path):
             shutil.copy2(path, path + ".bak")
         directory = os.path.dirname(path) or PROJECT_ROOT
-        fd, tmp = tempfile.mkstemp(prefix=".code_editor_", dir=directory, text=True)
+        fd, temporary = tempfile.mkstemp(prefix=".code_editor_", dir=directory)
         try:
-            with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
-                f.write(content)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
+            with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
         finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    @staticmethod
+    def _bounded_integer(value: object, default: int, minimum: int, maximum: int) -> int:
+        try:
+            return max(minimum, min(int(value), maximum))
+        except (TypeError, ValueError):
+            return default
 
     def _read(self, args: dict) -> str:
         try:
@@ -131,11 +141,11 @@ class CodeEditor(BaseTool):
             if not os.path.isfile(path):
                 return "Error: file not found."
             text = self._read_text(path, self._encoding(args))
-            lines = text.splitlines()
-            # Numbered lines help the model make precise follow-up edits.
-            return "\n".join(f"{i}: {line}" for i, line in enumerate(lines, 1)) or "(empty file)"
-        except Exception as e:
-            return f"Error: cannot read file: {e}"
+            offset = self._bounded_integer(args.get("offset", 1), 1, 1, 10_000_000)
+            limit = self._bounded_integer(args.get("limit", 400), 400, 1, 2000)
+            return format_lines(text, os.path.relpath(path, PROJECT_ROOT), offset, limit)
+        except Exception as error:
+            return f"Error: cannot read file: {error}"
 
     def _write(self, args: dict) -> str:
         if "content" not in args:
@@ -143,51 +153,74 @@ class CodeEditor(BaseTool):
         try:
             path = self._resolve(args.get("path", ""), write=True)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            self._atomic_write(path, str(args.get("content", "")), self._encoding(args), bool(args.get("backup", False)))
-            return f"OK: wrote {os.path.relpath(path, PROJECT_ROOT)}"
-        except Exception as e:
-            return f"Error: cannot write file: {e}"
+            current = self._read_text(path, self._encoding(args)) if os.path.isfile(path) else ""
+            expected = str(args.get("revision") or "").strip()
+            if expected and revision(current) != expected:
+                return f"Error: stale revision; current revision is {revision(current)}. Re-read the file."
+            content = str(args.get("content", ""))
+            self._atomic_write(path, content, self._encoding(args), bool(args.get("backup", False)))
+            return f"OK: wrote {os.path.relpath(path, PROJECT_ROOT)} rev={revision(content)}"
+        except Exception as error:
+            return f"Error: cannot write file: {error}"
 
     def _edit(self, args: dict) -> str:
-        if not args.get("old"):
-            return "Error: old is required for edit."
+        operations = args.get("operations")
+        if not isinstance(operations, list) or not operations:
+            return "Error: operations must contain at least one hash-anchored edit. Read the file first."
         try:
             path = self._resolve(args.get("path", ""), write=True)
             if not os.path.isfile(path):
                 return "Error: file not found."
             encoding = self._encoding(args)
             text = self._read_text(path, encoding)
-            old, new = str(args["old"]), str(args.get("new", ""))
-            count = text.count(old)
-            if count == 0:
-                return "Error: exact old text not found; file unchanged."
-            updated = text.replace(old, new, 1)
-            self._atomic_write(path, updated, encoding, bool(args.get("backup", False)))
-            note = f" ({count} matches; changed first)" if count > 1 else ""
-            return f"OK: edited {os.path.relpath(path, PROJECT_ROOT)}{note}"
-        except Exception as e:
-            return f"Error: cannot edit file: {e}"
+            expected = str(args.get("revision") or "").strip()
+            current_revision = revision(text)
+            if expected and current_revision != expected:
+                return f"Error: stale revision {expected}; current revision is {current_revision}. Re-read the file."
+            layout = split_text(text)
+            validated = []
+            occupied_ranges = []
+            for index, operation in enumerate(operations, 1):
+                if not isinstance(operation, dict):
+                    return f"Error: operations[{index}] must be an object; file unchanged."
+                op = str(operation.get("op", "")).strip().lower()
+                if op not in _VALID_OPS:
+                    return f"Error: operations[{index}] has invalid op {op!r}; file unchanged."
+                start = validate_anchor(layout.lines, operation.get("start"))
+                end = start
+                if operation.get("end"):
+                    if op not in {"replace", "delete"}:
+                        return f"Error: operations[{index}] end is only valid for replace/delete; file unchanged."
+                    end = validate_anchor(layout.lines, operation.get("end"))
+                if end < start:
+                    return f"Error: operations[{index}] end precedes start; file unchanged."
+                target_start = start
+                target_end = end
+                for previous_start, previous_end in occupied_ranges:
+                    if not (target_end < previous_start or target_start > previous_end):
+                        return f"Error: operations[{index}] overlaps another edit; file unchanged."
+                occupied_ranges.append((target_start, target_end))
+                content = [] if op == "delete" else replacement_lines(operation.get("content", ""))
+                if op in {"replace", "insert_before", "insert_after"} and "content" not in operation:
+                    return f"Error: operations[{index}] requires content; file unchanged."
+                validated.append((start, end, op, content))
 
-    def _batch_edit(self, args: dict) -> str:
-        changes = args.get("changes")
-        if not changes:
-            return "Error: changes must contain at least one {old, new} item."
-        try:
-            path = self._resolve(args.get("path", ""), write=True)
-            encoding = self._encoding(args)
-            text = self._read_text(path, encoding)
-            updated = text
-            for i, change in enumerate(changes, 1):
-                if not isinstance(change, dict) or not change.get("old"):
-                    return f"Error: changes[{i}] needs old; file unchanged."
-                old, new = str(change["old"]), str(change.get("new", ""))
-                if old not in updated:
-                    return f"Error: changes[{i}] old text not found; file unchanged."
-                updated = updated.replace(old, new, 1)
+            updated_lines = list(layout.lines)
+            for start, end, op, content in sorted(validated, key=lambda item: item[0], reverse=True):
+                if op in {"replace", "delete"}:
+                    updated_lines[start:end + 1] = content
+                elif op == "insert_before":
+                    updated_lines[start:start] = content
+                else:
+                    updated_lines[start + 1:start + 1] = content
+            updated = join_text(updated_lines, layout.newline, layout.final_newline)
             self._atomic_write(path, updated, encoding, bool(args.get("backup", False)))
-            return f"OK: applied {len(changes)} edits to {os.path.relpath(path, PROJECT_ROOT)}"
-        except Exception as e:
-            return f"Error: batch edit failed; file unchanged when possible: {e}"
+            return (
+                f"OK: applied {len(validated)} hash edit(s) to {os.path.relpath(path, PROJECT_ROOT)} "
+                f"rev={revision(updated)} lines={len(updated_lines)}"
+            )
+        except Exception as error:
+            return f"Error: hash edit failed; file unchanged: {error}"
 
     def _search(self, args: dict) -> str:
         pattern = str(args.get("pattern", "")).strip()
@@ -198,21 +231,24 @@ class CodeEditor(BaseTool):
             regex = re.compile(pattern, re.IGNORECASE if not args.get("case_sensitive", False) else 0)
         except re.error:
             regex = re.compile(re.escape(pattern), re.IGNORECASE if not args.get("case_sensitive", False) else 0)
+        max_results = self._bounded_integer(args.get("max_results", 50), 50, 1, 200)
         results = []
         for base, dirs, files in os.walk(PROJECT_ROOT):
-            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+            dirs[:] = [directory for directory in dirs if directory not in _SKIP_DIRS]
             for name in files:
                 if not __import__("fnmatch").fnmatch(name, wanted):
                     continue
                 path = os.path.join(base, name)
                 try:
-                    with open(path, "r", encoding=self._encoding(args)) as f:
-                        for line_no, line in enumerate(f, 1):
-                            if regex.search(line):
-                                rel = os.path.relpath(path, PROJECT_ROOT)
-                                results.append(f"{rel}:{line_no}: {line.rstrip()}")
-                                if len(results) >= int(args.get("max_results", 50)):
-                                    return "\n".join(results) + "\n(truncated)"
+                    text = self._read_text(path, self._encoding(args))
+                    layout = split_text(text)
+                    for line_number, line in enumerate(layout.lines, 1):
+                        if regex.search(line):
+                            from tools._hashline import anchor
+                            rel = os.path.relpath(path, PROJECT_ROOT)
+                            results.append(f"{rel}:{anchor(line_number, line)}|{line}")
+                            if len(results) >= max_results:
+                                return "\n".join(results) + "\n[truncated]"
                 except (OSError, UnicodeError):
                     continue
         return "\n".join(results) if results else "No matches."

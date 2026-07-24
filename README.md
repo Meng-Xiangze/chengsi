@@ -129,6 +129,7 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
 | `name` | Yes | Human-readable provider name shown in the UI. |
 | `base_url` | Yes | Provider API root. Ollama normally uses `http://localhost:11434/api`; OpenAI-compatible services commonly use a URL ending in `/v1`. |
 | `api_key` | OpenAI-compatible only | Bearer token sent to the provider. Use a fake placeholder in public examples. |
+| `network_mode` | No | Online connection policy: `auto` (default, direct first with safe system-proxy fallback), `direct`, or `system_proxy`. Local Ollama always connects directly. |
 | `models` | Yes | Models available under this provider. Each entry may be a string or a model object. Objects are recommended. |
 
 ### Model Fields
@@ -168,6 +169,7 @@ Provider model names and capabilities vary by service. The names above are examp
   "name": "My API Provider",
   "api_key": "sk-example-replace-me",
   "base_url": "https://api.example.com/v1",
+  "network_mode": "auto",
   "models": [
     {
       "name": "example-model",
@@ -179,6 +181,8 @@ Provider model names and capabilities vary by service. The names above are examp
 ```
 
 Multiple providers and models can be configured in the same `providers` array. Restart Chengsi after editing `config.json`.
+
+In `auto` mode, Chengsi bypasses desktop/VPN HTTP proxies first and falls back to the system proxy only when connection establishment fails before any HTTP response is received. It never retries after a response or streamed data begins. `direct` bypasses HTTP/SOCKS environment and Windows proxy settings, but a VPN using TUN or global routing may still intercept traffic at the operating-system route layer.
 
 ## Architecture
 
