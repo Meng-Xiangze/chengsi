@@ -113,11 +113,29 @@ class ImageGenerationTool(BaseTool):
 
     def _config(self) -> tuple[dict, str]:
         config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        default_spec = config.get("default_image_model", "")
+        if default_spec:
+            target_prov, target_model = self._parse_default_spec(default_spec)
+            for provider in config.get("providers", []):
+                if target_prov and provider.get("name", "") != target_prov:
+                    continue
+                for model in provider.get("models", []):
+                    if isinstance(model, dict) and model.get("name", "") == target_model:
+                        return provider, target_model
+        # Fallback: first model with image_generation=true
         for provider in config.get("providers", []):
             for model in provider.get("models", []):
                 if isinstance(model, dict) and model.get("image_generation"):
                     return provider, str(model.get("name", ""))
         raise RuntimeError("No model with image_generation=true is configured")
+
+    @staticmethod
+    def _parse_default_spec(spec: str) -> tuple[str | None, str]:
+        """Parse 'provider/model' or 'model' into (provider_name_or_None, model_name)."""
+        if "/" in spec:
+            p, m = spec.split("/", 1)
+            return p.strip(), m.strip()
+        return None, spec.strip()
 
     @staticmethod
     def _data_url(path: Path) -> str:

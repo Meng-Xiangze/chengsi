@@ -1,4 +1,5 @@
 import sys, os, json, time, threading, queue, re, signal, subprocess, base64, shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime
 from pathlib import Path
@@ -9,7 +10,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from core.agent_runtime import AgentRuntime, classify_tool_outcome, user_requested_tool_creation
+from core.agent_runtime import AgentRuntime, classify_tool_outcome
 from core.tool_manager import ToolManager
 from core.session_manager import SessionManager
 from core.knowledge_base import KnowledgeBase
@@ -52,6 +53,7 @@ class SessionData:
         self.compressed_context_size: int = 0
         self.ctx_tokens: int = 0
         self.runtime_snapshot: dict = {}
+        self._active_provider = None
 
 
 class AgentState:
@@ -61,6 +63,7 @@ class AgentState:
         self.name: str = "Chengsi (澄思)"
         self.show_thinking: bool = True
         self.theme: str = "day"
+        self.parallel_tools: bool = False
         self.interface_mode: str = "web"
         self.current_session_id: str = ""
         self.knowledge_base = None
@@ -224,70 +227,18 @@ def build_model_choices(providers_cfg: list[dict]) -> list[tuple[str, str, str]]
 #  4. SYSTEM PROMPT BUILDER
 # ══════════════════════════════════════════════════════════════════════
 
-def _legacy_tool_prompt(available_tools: dict, tool_manager=None) -> str:
-    """Describe tools and the text-call protocol for models without native tools."""
-    definitions = build_tool_defs(tool_manager, available_tools) or []
-    if not definitions:
-        return "No tools are available for this turn."
-    first_function = definitions[0]["function"]
-    first_schema = first_function.get("parameters", {})
-    sample_arguments = {}
-    for name in first_schema.get("required", []):
-        spec = first_schema.get("properties", {}).get(name, {})
-        sample_arguments[name] = {
-            "integer": 1,
-            "number": 1,
-            "boolean": True,
-            "array": [],
-            "object": {},
-        }.get(spec.get("type"), "value")
-    sample = json.dumps(
-        {"action": first_function["name"], "arguments": sample_arguments},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    lines = [
-        "This model does not support native tool calls. Use this exact text protocol when a tool is needed:",
-        f"<tool_call>{sample}</tool_call>",
-        "The example uses a real available tool. Choose the tool that matches the task and supply its declared arguments.",
-        "Output exactly one tool_call block and no other text. After its result, either call another tool or answer normally.",
-        "Never invent a tool or parameter. Available tools:",
-    ]
-    for definition in definitions:
-        function = definition["function"]
-        schema = function.get("parameters", {})
-        properties = schema.get("properties", {})
-        required = set(schema.get("required", []))
-        parameters = []
-        for name, spec in properties.items():
-            spec = spec if isinstance(spec, dict) else {}
-            detail = f"{name}: {spec.get('type', 'any')}"
-            detail += ", required" if name in required else ", optional"
-            if spec.get("enum"):
-                detail += f", values={json.dumps(spec['enum'], ensure_ascii=False)}"
-            if spec.get("description"):
-                detail += f" — {spec['description']}"
-            parameters.append(detail)
-        lines.append(f"\n- {function['name']}: {function.get('description', '')}")
-        lines.extend(f"  - {parameter}" for parameter in parameters)
-        if not parameters:
-            lines.append("  - arguments: {}")
-    return "\n".join(lines)
-
-
 def format_system_prompt(available_tools: dict = None, tool_manager=None,
                          failure_alert: str | None = None, native_tools: bool = False) -> str:
     p = """You are Chengsi (澄思), a pragmatic agent with local tools and a knowledge base.
-Complete the user's actual task, not an adjacent task. Use tools only when they add evidence or make a required change.
-Before changing files, inspect the relevant code and preserve the project's existing conventions. After changing files, run the most relevant available verification before claiming completion.
-Treat every tool result as an observation, not proof of success. Read status markers and errors exactly. If an attempt fails, change one variable or approach; never repeat the same call more than twice.
+Complete the user's task. When asked to act, use an available tool instead of giving instructions.
+Inspect before editing and verify the end state afterward. Never claim success when tool output contains errors.
+If an attempt fails, change approach; never repeat the same call more than twice.
 Keep a concise internal task state: goal, completed work, current blocker, and next verification. Do not expose private reasoning. Return only a tool call, a necessary clarification, or the final answer.
 Do not create a new tool unless the user explicitly asks for a reusable tool. Do not modify Chengsi's own core/ directory or main.py; other projects may be modified when requested.
 Use the knowledge base or web only when the answer needs external facts, freshness, or citations; do not browse for routine local work."""
     if failure_alert:
         p += f"\nExecution alert: {failure_alert}. Stop retrying and report the blocker or choose a materially different approach."
-    if not native_tools:
-        p += "\n\n" + _legacy_tool_prompt(available_tools or {}, tool_manager)
+
     skills = _skills_prompt()
     if skills:
         p += "\n\n" + skills
@@ -339,85 +290,6 @@ def _truncate_output(result: str, session_id: str) -> str:
         f"Full output: {file_path}\n\n"
     )
     return result[:head_size] + note + result[-tail_size:]
-
-
-# ─── JSON parsing for Ollama <tool_call> tags ─────────────────────────
-
-def _parse_tool_call_json(text: str) -> tuple[dict | None, str]:
-    """
-    Extract and parse a JSON object from text.
-    Supports:
-      - A direct JSON string
-      - Extra text around the object, such as <tool_call> tags
-      - Braces inside parameter strings, such as regular expressions
-    """
-    text = text.strip()
-    decoder = json.JSONDecoder()
-
-    # 1. 尝试直接解析整个文本
-    try:
-        return json.loads(text), ""
-    except json.JSONDecodeError:
-        pass
-
-    # 2. Try raw_decode from the start after leading whitespace.
-    try:
-        obj, _ = decoder.raw_decode(text)
-        return obj, ""
-    except json.JSONDecodeError:
-        pass
-
-    # 3. Find the first '{' and try raw_decode on the substring.
-    start = text.find('{')
-    if start == -1:
-        return None, "No JSON object found"
-    try:
-        obj, _ = decoder.raw_decode(text[start:])
-        return obj, ""
-    except json.JSONDecodeError:
-        pass
-
-    # 4. As a final fallback, extract the outermost JSON while skipping braces inside strings.
-    depth = 0
-    in_string = False
-    escape = False
-    end = start
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            # Handle escape sequences.
-            if ch == '\\' and not escape:
-                escape = True
-            elif ch == '"' and not escape:
-                in_string = False
-            else:
-                escape = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-
-    if depth != 0:
-        return None, "Unbalanced braces"
-
-    json_str = text[start:end]
-
-    # Normalize full-width quotation marks.
-    json_str = json_str.replace('\u201c', '"').replace('\u201d', '"')
-    # Remove trailing commas.
-    json_str = re.sub(r',\s*}', '}', json_str)
-    json_str = re.sub(r',\s*]', ']', json_str)
-
-    try:
-        return json.loads(json_str), ""
-    except json.JSONDecodeError as e:
-        return None, f"Invalid JSON: {e}"
 
 
 def _strip_thinking_prefix(text: str) -> str:
@@ -587,7 +459,8 @@ def _execute_tool(action: str, args: dict, available_tools: dict, session_id: st
         args["_session_id"] = session_id
     _emit("tool_call", {"action": action, "arguments": args}, session_id=session_id)
     if action not in available_tools:
-        err = f"Unknown tool '{action}'"
+        names = ", ".join(sorted(available_tools)) or "none"
+        err = f"Unknown tool '{action}'. Available tools: {names}"
         _emit("tool_result", err, session_id=session_id)
         return classify_tool_outcome("Error: " + err)
     _emit("thinking", f"Executing {action}...", session_id=session_id)
@@ -638,6 +511,90 @@ def _publish_generated_image(result, session_id: str) -> str:
         return f"Image artifact error: {error}"
 
 
+def _auto_describe_image(img_path: str) -> str:
+    """One-shot: send image to the default vision model and return its description."""
+    spec = _default_vision_model
+    if not spec:
+        return "(auto-describe unavailable: no default_vision_model configured)"
+
+    # Parse "provider/model" or bare "model"
+    if "/" in spec:
+        target_prov, target_model = spec.split("/", 1)
+        target_prov = target_prov.strip()
+        target_model = target_model.strip()
+    else:
+        target_prov, target_model = None, spec.strip()
+
+    # Find the provider + model for the default vision model
+    vision_provider_cfg = None
+    vision_model_name = None
+    for pcfg in _providers_cfg:
+        if target_prov and pcfg.get("name", "") != target_prov:
+            continue
+        for entry in pcfg.get("models", []):
+            mn = entry if isinstance(entry, str) else entry.get("name", "")
+            if mn == target_model:
+                vision_provider_cfg = pcfg
+                vision_model_name = mn
+                break
+        if vision_provider_cfg:
+            break
+
+    if not vision_provider_cfg:
+        who = f"'{spec}'" if not target_prov else f"'{target_model}' in provider '{target_prov}'"
+        return f"(auto-describe: default vision model {who} not found in config)"
+
+    # Build provider
+    ptype = vision_provider_cfg.get("type", "openai")
+    try:
+        if ptype == "openai":
+            from core.openai_provider import OpenAIProvider
+            client = OpenAIProvider.from_config(vision_provider_cfg)
+        elif ptype == "ollama":
+            from core.ollama_provider import OllamaProvider
+            client = OllamaProvider.from_config(vision_provider_cfg)
+        else:
+            return f"(auto-describe: unsupported provider type '{ptype}')"
+    except Exception as e:
+        return f"(auto-describe: failed to init provider — {e})"
+
+    # Build multimodal message
+    try:
+        import base64, mimetypes
+        ext = os.path.splitext(img_path)[1].lower()
+        mime_map = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+        }
+        mime = mime_map.get(ext, "image/png")
+        with open(img_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        data_uri = f"data:{mime};base64,{b64}"
+    except Exception as e:
+        return f"(auto-describe: failed to encode image — {e})"
+
+    messages = [
+        {"role": "system", "content": "You are an image analyst. Describe the image briefly and factually in 2-4 sentences. Note any text, tables, diagrams, charts, or key visual elements. Reply in English."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Describe this image concisely."},
+            {"type": "image_url", "image_url": {"url": data_uri}},
+        ]},
+    ]
+
+    try:
+        description_parts: list[str] = []
+        for event_type, data in client.chat_stream(vision_model_name, messages):
+            if event_type == "content":
+                description_parts.append(data)
+            elif event_type == "error":
+                return f"(auto-describe error: {data})"
+    except Exception as e:
+        return f"(auto-describe error: {e})"
+
+    desc = "".join(description_parts).strip()
+    return desc if desc else "(auto-describe: no description returned)"
+
+
 def _model_supports_vision(model_config: dict) -> bool:
     """Whether image input is enabled for this model in config.json."""
     return bool(model_config.get("vision", False))
@@ -646,7 +603,7 @@ def _model_supports_vision(model_config: dict) -> bool:
 def _inject_image_content(message: dict, supports_vision: bool = True) -> dict:
     """Detect __IMAGE_PATH__ marker in tool/user message content and convert
     to multimodal content format so the model can actually see the image.
-    If the model doesn't support vision, strip the image and keep only text metadata."""
+    If the model doesn't support vision, auto-route to the default vision model."""
     content = message.get("content", "")
     if not isinstance(content, str) or _IMAGE_MARKER not in content:
         return message
@@ -659,10 +616,11 @@ def _inject_image_content(message: dict, supports_vision: bool = True) -> dict:
     if not os.path.isfile(img_path):
         return message
 
-    # Model doesn't support vision — strip image, keep text metadata only
+    # Model doesn't support vision — auto-route to default vision model
     if not supports_vision:
+        description = _auto_describe_image(img_path)
         new_msg = dict(message)
-        new_msg["content"] = text_part + f"\n[Image skipped: the current model does not support vision]"
+        new_msg["content"] = text_part + f"\n\n[Image analysis by default vision model]:\n{description}"
         return new_msg
 
     try:
@@ -787,11 +745,66 @@ def _working_context(messages: list[dict], limit: int = _MAX_WORKING_MESSAGES) -
     return system + ([compacted] if compacted else []) + [marker] + recent
 
 
+# ─── Stream wrapper: thread+queue for responsive cancel ─────────────
+_STREAM_POLL_SEC = 0.15
+
+
+def _iter_stream_with_cancel(gen, cancel_event):
+    """Wrap a generator in a thread+queue so the consumer can poll cancel
+    every _STREAM_POLL_SEC instead of blocking on gen.__next__() forever."""
+    q = queue.Queue()
+    done = threading.Event()
+
+    def producer():
+        try:
+            for item in gen:
+                q.put(('v', item))
+            q.put(('done', None))
+        except Exception as e:
+            q.put(('err', e))
+        finally:
+            done.set()
+
+    t = threading.Thread(target=producer, daemon=True)
+    t.start()
+    try:
+        while True:
+            try:
+                msg = q.get(timeout=_STREAM_POLL_SEC)
+            except queue.Empty:
+                if cancel_event.is_set():
+                    return  # consumer detected cancel
+                continue
+            typ = msg[0]
+            if typ == 'done':
+                return
+            elif typ == 'err':
+                raise msg[1]
+            elif typ == 'v':
+                yield msg[1]
+    finally:
+        # Only wait for producer if NOT cancelled. When cancelled, the producer
+        # may be stuck on a blocking socket read and we must return immediately.
+        if not cancel_event.is_set():
+            done.wait(timeout=3)
+
+
 def _turn_tools(available_tools: dict, messages: list[dict]) -> dict:
-    tools = dict(available_tools)
-    if not user_requested_tool_creation(messages):
-        tools.pop("tool_creator", None)
-    return tools
+    """Return the set of tools available this turn."""
+    return dict(available_tools)
+
+
+def _append_knowledge_context(messages: list[dict], context: str) -> list[dict]:
+    """Add retrieved context without violating chat-template role ordering."""
+    if not context or not messages:
+        return messages
+    if messages[0].get("role") != "system":
+        return messages
+    updated = list(messages)
+    system = dict(updated[0])
+    system["content"] = f"{system.get('content', '')}\n\n{context}".strip()
+    updated[0] = system
+    return updated
 
 
 def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None):
@@ -899,16 +912,19 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 user_text = next((m.get("content", "") for m in reversed(sd.messages) if m.get("role") == "user"), "")
                 if isinstance(user_text, str):
                     kb_context = state.knowledge_base.context(user_text)
-                    if kb_context:
-                        request_messages.insert(1, {"role": "system", "content": kb_context})
+                    request_messages = _append_knowledge_context(request_messages, kb_context)
 
-            for kind, chunk in provider.chat_stream(model, request_messages, tool_defs=tool_defs, supports_vision=supports_vision, cancel_event=sd.cancel):
+            stream_gen = provider.chat_stream(model, request_messages, tool_defs=tool_defs, supports_vision=supports_vision, cancel_event=sd.cancel)
+            for kind, chunk in _iter_stream_with_cancel(stream_gen, sd.cancel):
                 if kind == "error":
                     stream_error = chunk
                     break
                 elif kind == "cancelled":
                     _emit("thinking", "Cancelled by user.", session_id=session_id)
-                    _emit("agent_done", "\n\n*[stopped]*", session_id=session_id)
+                    stop_msg = "\n\n*[stopped]*"
+                    # Save stop marker to messages so conversation is properly closed on reload
+                    sd.messages.append({"role": "assistant", "content": stop_msg})
+                    _emit("agent_done", stop_msg, session_id=session_id)
                     return
                 elif kind == "thinking":
                     full_thinking += chunk
@@ -947,6 +963,13 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 _emit("agent_done", stream_error, session_id=session_id)
                 return
 
+            # Connection may have been closed externally by cancel_stream(); catch that here
+            if sd.cancel.is_set():
+                stop_msg = "\n\n*[stopped]*"
+                sd.messages.append({"role": "assistant", "content": stop_msg})
+                _emit("agent_done", stop_msg, session_id=session_id)
+                return
+
             # Thinking is diagnostic-only. Never parse it as a tool call or include it
             # in the user-visible answer: it may quote prompts, source code, or examples
             # containing literal <tool_call> tags.
@@ -968,20 +991,51 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 assistant_msg = {"role": "assistant", "content": full_content or None, "tool_calls": native_tc_list}
                 sd.messages.append(assistant_msg)
 
-                stop_reason = ""
+                # ── Preflight all tool calls sequentially ──
+                preflight: list[tuple[dict, bool, str]] = []
                 for tc in stream_tool_calls:
                     allowed, reason = runtime.allow(tc["action"], tc["arguments"])
-                    if allowed:
-                        outcome = _execute_tool(tc["action"], tc["arguments"], turn_tools, session_id)
-                        should_continue, reason = runtime.observe(
-                            tc["action"], tc["arguments"], outcome, turn_tools.get(tc["action"])
-                        )
-                        persist_runtime_snapshot()
-                        if not should_continue:
-                            stop_reason = reason
-                    else:
+                    preflight.append((tc, allowed, reason))
+
+                # ── Execute (parallel or sequential) ──
+                parallel = state.parallel_tools and len(stream_tool_calls) > 1
+                outcomes: dict[str, object] = {}  # tc_id -> ToolOutcome
+
+                if parallel:
+                    _emit("thinking", f"Running {len(stream_tool_calls)} tools in parallel...", session_id=session_id)
+                    with ThreadPoolExecutor(max_workers=min(len(stream_tool_calls), 6)) as ex:
+                        futures_map: dict[Any, str] = {}
+                        for tc, allowed, _ in preflight:
+                            if allowed:
+                                fut = ex.submit(_execute_tool, tc["action"], tc["arguments"], turn_tools, session_id)
+                                futures_map[fut] = tc["id"]
+                        for fut in as_completed(futures_map):
+                            try:
+                                outcomes[futures_map[fut]] = fut.result()
+                            except Exception as exc:
+                                outcomes[futures_map[fut]] = classify_tool_outcome(f"Tool error: {exc}")
+                else:
+                    for tc, allowed, _ in preflight:
+                        if allowed:
+                            outcomes[tc["id"]] = _execute_tool(tc["action"], tc["arguments"], turn_tools, session_id)
+
+                # ── Observe and build messages in original order ──
+                stop_reason = ""
+                for tc, allowed, reason in preflight:
+                    if not allowed:
                         outcome = classify_tool_outcome("Error: " + reason)
                         stop_reason = reason
+                    else:
+                        outcome = outcomes.get(tc["id"])
+                        if outcome is None:
+                            outcome = classify_tool_outcome("Error: tool execution skipped")
+                        else:
+                            should_continue, obs_reason = runtime.observe(
+                                tc["action"], tc["arguments"], outcome, turn_tools.get(tc["action"])
+                            )
+                            persist_runtime_snapshot()
+                            if not should_continue:
+                                stop_reason = obs_reason
                     tool_msg = _inject_image_content({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -989,79 +1043,11 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     }, supports_vision=supports_vision)
                     sd.messages.append(tool_msg)
 
-                    if allowed and tc["action"] == "tool_creator" and outcome.ok:
-                        _emit("thinking", "Reloading tool registry...", session_id=session_id)
-                        available_tools = tool_manager.load_tools()
-                        turn_tools = _turn_tools(available_tools, sd.messages)
-                        tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
-                        sd.messages[0]["content"] = format_system_prompt(
-                            available_tools, tool_manager=tool_manager, native_tools=native_tools
-                        )
-                        _emit("thinking", f"Tools updated: {list(available_tools.keys())}", session_id=session_id)
-
                 if stop_reason:
                     message = f"Agent stopped safely: {stop_reason}"
                     sd.messages.append({"role": "assistant", "content": message})
                     _emit("agent_done", message, session_id=session_id)
                     return
-                continue
-
-            # ── LEGACY TEXT-BASED TOOL CALLS ──
-            # Native-tool providers must use their structured `tool_calls` response.
-            # Do not scan their ordinary text for XML-like tags: tool results, source
-            # code, and prompt examples can contain those strings and cause false calls.
-            match = None if native_tools else re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", full_content, re.DOTALL)
-            if match:
-                text_before = full_response[:match.start()].strip()
-                if text_before and len(text_before) > 10:
-                    sd.messages.append({"role": "assistant", "content": text_before})
-
-                tool_req, parse_err = _parse_tool_call_json(match.group(1).strip())
-                if parse_err or not isinstance(tool_req, dict):
-                    # A malformed legacy tag is model text, not a failed tool request.
-                    # Returning it to the model as TOOL_RESULT caused self-reinforcing
-                    # parse-error loops; show it once and end this turn instead.
-                    clean_response = _strip_thinking_prefix(full_content).strip() or "Unable to parse the requested tool call."
-                    sd.messages.append({"role": "assistant", "content": clean_response})
-                    _emit("agent_done", clean_response, session_id=session_id)
-                    return
-
-                action = tool_req.get("action", "")
-                args = tool_req.get("arguments", {})
-                if not isinstance(action, str) or not action or not isinstance(args, dict):
-                    clean_response = _strip_thinking_prefix(full_content).strip() or "Invalid tool call."
-                    sd.messages.append({"role": "assistant", "content": clean_response})
-                    _emit("agent_done", clean_response, session_id=session_id)
-                    return
-                allowed, reason = runtime.allow(action, args)
-                if not allowed:
-                    message = f"Agent stopped safely: {reason}"
-                    sd.messages.append({"role": "assistant", "content": message})
-                    _emit("agent_done", message, session_id=session_id)
-                    return
-                outcome = _execute_tool(action, args, turn_tools, session_id)
-                tool_msg = _inject_image_content({"role": "user", "content": outcome.for_model()}, supports_vision=supports_vision)
-                sd.messages.append(tool_msg)
-                should_continue, reason = runtime.observe(
-                    action, args, outcome, turn_tools.get(action)
-                )
-                persist_runtime_snapshot()
-                if not should_continue:
-                    message = f"Agent stopped safely: {reason}"
-                    sd.messages.append({"role": "assistant", "content": message})
-                    _emit("agent_done", message, session_id=session_id)
-                    return
-
-                if action == "tool_creator" and outcome.ok:
-                    _emit("thinking", "Reloading tool registry...", session_id=session_id)
-                    available_tools = tool_manager.load_tools()
-                    turn_tools = _turn_tools(available_tools, sd.messages)
-                    tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
-                    sd.messages[0]["content"] = format_system_prompt(
-                        available_tools, tool_manager=tool_manager, native_tools=native_tools
-                    )
-                    _emit("thinking", f"Tools updated: {list(available_tools.keys())}", session_id=session_id)
-
                 continue
 
             # ── FINAL ANSWER ──
@@ -1100,6 +1086,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
 _provider = None
 _provider_model = ""
 _providers_cfg: list[dict] = []
+_default_vision_model = ""
 _available_tools: dict = {}
 _tool_manager: ToolManager | None = None
 _session_manager: SessionManager | None = None
@@ -1214,6 +1201,21 @@ class WebAPI:
     def get_theme(self):
         return {"theme": state.theme}
 
+    def get_parallel_tools(self):
+        return {"parallel_tools": state.parallel_tools}
+
+    def set_parallel_tools(self, enabled: bool):
+        try:
+            config_path = os.path.join(PROJECT_ROOT, "config.json")
+            config = load_config(config_path)
+            config["parallel_tools"] = enabled
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+            state.parallel_tools = enabled
+            return {"status": "ok", "parallel_tools": enabled}
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": f"Could not save: {exc}"}
+
     def select_model(self, idx: int):
         global _provider, _provider_model
         # Model switching is global for new requests, but must not be blocked by
@@ -1312,6 +1314,7 @@ class WebAPI:
 
         def worker():
             completed = False
+            sd._active_provider = turn_provider
             try:
                 sd.processing = True
                 process_agent_turn(turn_provider, turn_model, _available_tools, _tool_manager, session_id=sid, model_config=turn_model_config)
@@ -1321,6 +1324,7 @@ class WebAPI:
                 err = f"Agent Error: {e}\n{traceback.format_exc()}"
                 _emit("agent_done", err, session_id=sid)
             finally:
+                sd._active_provider = None
                 sd.processing = False
                 if completed:
                     sd.runtime_snapshot = {}
@@ -1351,6 +1355,11 @@ class WebAPI:
         sd = state.sessions.get(session_id)
         if sd:
             sd.cancel.set()
+            # Use the exact provider instance that is running this session
+            # (not the global _provider, which may have changed due to model switch)
+            active = sd._active_provider
+            if active:
+                active.cancel()
         return {"status": "ok"}
 
     def save_generated_image(self, source_path: str, filename: str = ""):
@@ -1751,6 +1760,7 @@ def main():
     config = load_config(config_path)
     state.show_thinking = config.get("show_thinking", True)
     state.theme = config.get("theme", "day")
+    state.parallel_tools = config.get("parallel_tools", False)
     if state.theme not in ("day", "night"):
         state.theme = "day"
     state.interface_mode = "web"
@@ -1788,10 +1798,11 @@ def main():
         import webview
 
         # Store globals for WebAPI
-        global _provider, _provider_model, _providers_cfg, _available_tools, _tool_manager, _session_manager
+        global _provider, _provider_model, _providers_cfg, _available_tools, _tool_manager, _session_manager, _default_vision_model
         _provider = selected_provider
         _provider_model = selected_model
         _providers_cfg = providers_cfg
+        _default_vision_model = config.get("default_vision_model", "")
         _available_tools = available_tools
         _tool_manager = tool_manager
         _session_manager = SessionManager(

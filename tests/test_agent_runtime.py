@@ -1,6 +1,6 @@
 import unittest
 
-from core.agent_runtime import AgentRuntime, classify_tool_outcome, user_requested_tool_creation
+from core.agent_runtime import AgentRuntime, classify_tool_outcome
 from tools.base import BaseTool
 from core.ollama_provider import OllamaProvider
 
@@ -10,9 +10,9 @@ class AgentRuntimeTests(unittest.TestCase):
         runtime = AgentRuntime(max_identical_calls=2)
         arguments = {"path": "sample.py"}
 
-        self.assertTrue(runtime.allow("code_editor", arguments)[0])
-        self.assertTrue(runtime.allow("code_editor", arguments)[0])
-        allowed, reason = runtime.allow("code_editor", arguments)
+        self.assertTrue(runtime.allow("edit", arguments)[0])
+        self.assertTrue(runtime.allow("edit", arguments)[0])
+        allowed, reason = runtime.allow("edit", arguments)
 
         self.assertFalse(allowed)
         self.assertIn("already attempted twice", reason)
@@ -60,8 +60,8 @@ class AgentRuntimeTests(unittest.TestCase):
     def test_file_change_requires_project_test(self):
         runtime = AgentRuntime()
         runtime.observe(
-            "code_editor",
-            {"action": "edit", "path": "sample.py"},
+            "edit",
+            {"path": "sample.py", "edits": [{"oldText": "x", "newText": "y"}]},
             classify_tool_outcome("OK: updated sample.py"),
         )
 
@@ -113,10 +113,6 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertFalse(classify_tool_outcome("--- STDOUT ---\n\n--- STDERR ---\nTraceback").ok)
         self.assertFalse(classify_tool_outcome("[syntax] 10 passed, 1 failed.").ok)
         self.assertTrue(classify_tool_outcome("No matches found").ok)
-
-    def test_tool_creation_requires_explicit_user_request(self):
-        self.assertFalse(user_requested_tool_creation([{"role": "user", "content": "Fix web search"}]))
-        self.assertTrue(user_requested_tool_creation([{"role": "user", "content": "创建工具来搜索网页"}]))
 
     def test_ollama_preserves_native_tool_call_chain(self):
         messages = [

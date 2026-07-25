@@ -140,8 +140,8 @@ class AgentRuntime:
         # built-in tools migrate to explicit capabilities.
         if not mutating:
             mutating = (
-                (action == "code_editor" and arguments.get("action", "read") in ("write", "edit"))
-                or (action == "tool_creator" and arguments.get("action") in ("create", "delete"))
+                (action == "edit" and bool(arguments.get("edits")))
+                or (action == "write" and bool(arguments.get("content")))
             )
         if not verifying:
             verifying = action == "project_test"
@@ -165,20 +165,3 @@ class AgentRuntime:
     def mark_verification_reminder(self) -> None:
         self.verification_reminder_sent = True
 
-
-def user_requested_tool_creation(messages: list[dict]) -> bool:
-    text = next(
-        (str(message.get("content", "")) for message in reversed(messages) if message.get("role") == "user"),
-        "",
-    ).lower()
-    patterns = (
-        "create a tool",
-        "create tool",
-        "new tool",
-        "build a tool",
-        "创建工具",
-        "新建工具",
-        "生成工具",
-        "写一个工具",
-    )
-    return any(pattern in text for pattern in patterns)

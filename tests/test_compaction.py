@@ -44,7 +44,7 @@ class CompactionTests(unittest.TestCase):
             "tool_calls": [{
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "code_context", "arguments": '{"query":"AgentRuntime"}'},
+                "function": {"name": "read", "arguments": '{"query":"AgentRuntime"}'},
             }],
         }]
 

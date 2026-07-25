@@ -8,12 +8,17 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 
 - Local desktop chat interface powered by `pywebview`
 - Local Ollama and OpenAI-compatible model providers
-- Native and text-based tool calling
+- Native function calling for all models — no text-based tool protocols
+- 13 discoverable tools: read (text, PDF, DOCX, images, code search), write, edit, bash, ls, python_executor, web search/fetch, knowledge base, image generation, and more
 - SQLite FTS5 local knowledge base with user-managed search, ingest, list, and remove operations
 - Persistent conversations and generated media
 - Image generation through a configured image-capable model
-- Discoverable Python tools with Markdown documentation
+- PDF and DOCX reading with dual text/visual modes — vision models can see rendered pages
+- DOCX creation with Markdown-like formatting syntax
 - Day and night themes
+- Optional parallel tool execution — run independent tools concurrently
+- **Qwen/Ollama thinking safety net**: when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native function calls (a known Ollama interaction), the provider automatically extracts and executes them — thinking stays on so the model keeps its full reasoning quality
+- Responsive cancel: stops immediately without waiting for stuck streams
 
 Knowledge-base records are user-managed. Use the `knowledge_base` tool to search, ingest text or supported local files, list documents, and remove selected records. The bundled `knowledge/knowledge.db` contains the project's starter knowledge and is included for release; do not edit the SQLite file directly.
 
@@ -23,6 +28,17 @@ Knowledge-base records are user-managed. Use the `knowledge_base` tool to search
 - Windows 10/11 recommended
 - Ollama for the default local configuration, or an OpenAI-compatible API
 - Internet access only when using online providers or web-connected tools
+
+## Tips for Local Models
+
+Chengsi's default configuration uses Ollama with Qwen3 8B, a capable but resource-constrained local model. To get the best results:
+
+- **Go step by step.** Ask for one clear action at a time ("read README.md", "list the tools/ directory") rather than bundling multiple complex tasks into a single message.
+- **Break down complex tasks.** Instead of "build a complete Snake game and launch it," start with "create a snake.py file with the game loop" and iterate from there.
+- **Be specific about file paths.** Say "put it on my Desktop at C:\\Users\\...\\Desktop" rather than "put it on the desktop."
+- **Use `bash` for install commands directly.** "pip install pygame" is more effective than describing the need for pygame and hoping the model infers the command.
+- **Watch the token counter** in the top bar. When context exceeds ~20K tokens with small models, reasoning quality degrades noticeably. Use the ↧ compact button to reclaim space.
+- **Thinking stays on.** The Ollama provider keeps `think: true` so the model reasons before acting. If the model ever produces thinking text but fails to emit a tool call, Chengsi automatically scans the thinking buffer and extracts any tool calls it finds — this works around a known Ollama interaction with Qwen models.
 
 ## Quick Start
 
@@ -108,6 +124,9 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
       ]
     }
   ],
+  "default_vision_model": "openai/gpt-5.6-sol",
+  "default_image_model": "openai/gpt-image-2",
+  "parallel_tools": false,
   "show_thinking": true,
   "theme": "day"
 }
@@ -118,7 +137,10 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `providers` | array | Ordered list of model providers shown in the model selector. |
+| `default_vision_model` | string | `provider/model` identifier for auto image description. Non-vision models route images here. |
+| `default_image_model` | string | `provider/model` identifier used by the `image_generator` tool. |
 | `show_thinking` | boolean | Shows model reasoning/status events in a collapsed UI section when available. |
+| `parallel_tools` | boolean | When true, independent tool calls from a single assistant response execute concurrently. Default: `false`. |
 | `theme` | string | Initial interface theme: `day` or `night`. |
 
 ### Provider Fields
@@ -139,6 +161,7 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
 | `name` | Yes | Exact model identifier accepted by the provider. |
 | `vision` | No | Enables image input for the model. Set this only when the chat model accepts image content. Default: `false`. |
 | `image_generation` | No | Routes requests made with this selected model to the image generation endpoint. It also makes the model available to the `image_generator` tool. Default: `false`. |
+| `tools` | No | Override native tool-calling support. Set `true` or `false` explicitly. Default: auto-detected from provider type. |
 
 `vision` and `image_generation` describe different capabilities. A model can analyze images without generating them, and an image generation model does not automatically support chat or image analysis.
 
@@ -197,8 +220,11 @@ WebView API and agent loop (main.py)
         |      +--> OpenAI-compatible (core/openai_provider.py)
         |
         +--> Tool manager (core/tool_manager.py)
-        |      +--> Built-in image generator
-        |      +--> Discoverable tools in tools/
+        |      +--> 13 auto-discovered tools in tools/
+        |      +--> Image generator, bash, python_executor
+        |      +--> read (text, PDF, DOCX, images, search)
+        |      +--> write (text + formatted DOCX)
+        |      +--> edit (surgical text + DOCX editing)
         |
         +--> Knowledge base (core/knowledge_base.py -> SQLite FTS5)
         |
@@ -209,11 +235,12 @@ WebView API and agent loop (main.py)
 
 1. The WebUI sends a user message through the `pywebview` bridge in `main.py`.
 2. `main.py` selects the configured provider and builds the system prompt and tool definitions.
-3. The provider streams text, reasoning events, or structured tool calls.
-4. Tool calls are resolved by `ToolManager`; results are returned to the model when another model step is needed.
+3. The provider streams text, reasoning events, or structured tool calls via native function calling.
+4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. Results are returned to the model when another model step is needed.
 5. Final responses and UI events are saved by `SessionManager`.
 6. Knowledge searches use the local SQLite FTS5 index and are explicitly invoked through the knowledge-base tool.
 7. Generated images are moved into a session-specific directory under `media/` and rendered directly in the WebUI.
+8. Stop requests cancel immediately via a thread+queue polling mechanism without blocking on stuck streams.
 
 ### Main Components
 
@@ -223,24 +250,29 @@ WebView API and agent loop (main.py)
 | `core/index.html` | Complete desktop WebUI, including session navigation, model selection, chat rendering, tools, and image display. |
 | `core/provider.py` | Abstract provider contract. |
 | `core/ollama_provider.py` | Ollama chat streaming and tool-call conversion. |
-| `core/openai_provider.py` | OpenAI-compatible SSE chat streaming and image generation. |
-| `core/tool_manager.py` | Tool discovery, metadata catalog, execution support, and the built-in image tool. |
+| `core/openai_provider.py` | OpenAI-compatible SSE chat streaming, image generation, and image auto-description. |
+| `core/tool_manager.py` | Tool auto-discovery from `tools/*.py`, metadata catalog from `.md` front-matter, and execution support. |
 | `core/knowledge_base.py` | SQLite FTS5 document ingestion, search, listing, and removal. |
 | `core/session_manager.py` | Session persistence, titles, history, token statistics, and media cleanup. |
 | `tools/` | Extensible local tools and their Markdown documentation. |
 
 ## Tools
 
-Each tool inherits from `tools.base.BaseTool` and implements:
+Chengsi automatically discovers tools from Python files in the `tools/` directory. Each tool inherits from `tools.base.BaseTool` and implements `tool_name`, `description`, `parameters`, and `run(arguments)`.
 
-- `tool_name`
-- `description`
-- `parameters`
-- `run(arguments)`
+### Available Tools (13)
 
-Use `tool_creator` to generate or remove a tool consistently. The tool registry updates the Python module, its documentation, and `tools/TOC.md`.
+| Category | Tools |
+| --- | --- |
+| File I/O | `read` — text, PDF, DOCX, images, code search. `write` — create/overwrite files + formatted DOCX. `edit` — precise text replacement. `ls` — directory listing. |
+| Execution | `bash` — shell commands (file ops, git, pip). `python_executor` — Python for multi-step logic and data processing. |
+| Web | `web_searcher` — DuckDuckGo search. `web_reader` — fetch and extract web page content. |
+| Project | `project_test` — syntax, import, and unittest checks. `system_cleaner` — preview/clean temp files and caches. |
+| Meta | `knowledge_base` — local document search and management. `chat_exporter` — export sessions as Markdown. `image_generator` — generate images via cloud API. |
 
-Tools execute on the host computer with the permissions of the Chengsi process. `python_executor` can run Python code, and `system_cleaner` can delete selected files. The `core` and `knowledge` directories belonging to the running project are protected, but this protection is not a general-purpose sandbox.
+Models receive tool descriptions through native function calling — the system prompt stays lean (~260 tokens) and only tools relevant to the task are described. Each tool's `.md` front-matter provides the canonical description sent to models.
+
+Tools execute on the host computer with the permissions of the Chengsi process. `python_executor` can run Python code, `bash` can execute shell commands, and `system_cleaner` can delete selected files. The `core` and `knowledge` directories belonging to the running project are protected, but this protection is not a general-purpose sandbox.
 
 ## Local Data and Privacy
 
@@ -273,11 +305,12 @@ Before sharing logs or issue reports, remove API keys, personal paths, conversat
 Chengsi/
 |-- main.py
 |-- config.example.json
+|-- config.json           (private, not tracked)
 |-- requirements.txt
 |-- setup_and_run.bat
 |-- chengsi.bat
 |-- setup_and_run.sh
-|-- skills/              # optional SKILL.md capability packages
+|-- skills/               optional SKILL.md capability packages
 |-- core/
 |   |-- index.html
 |   |-- provider.py
@@ -289,10 +322,10 @@ Chengsi/
 |-- tools/
 |   |-- base.py
 |   |-- TOC.md
-|   `-- ...
-|-- knowledge/          # local database at runtime
-|-- sessions/           # local session data at runtime
-`-- media/              # generated media at runtime
+|   `-- read.py, write.py, edit.py, bash.py, ls.py, ...
+|-- knowledge/            local database at runtime
+|-- sessions/             local session data at runtime
+`-- media/                generated media at runtime
 ```
 
 ## Development Checks
@@ -311,6 +344,7 @@ For a release, also test setup from a clean clone, start the WebUI, send a norma
 - Tool protection checks reduce common accidents but do not provide OS-level isolation.
 - Provider compatibility depends on each service's implementation of chat streaming, tool calls, vision, and image APIs.
 - Linux and macOS desktop behavior has not been comprehensively tested.
+- DOCX text extraction uses XML parsing; complex layouts may differ from Word's rendered appearance. Use `mode=visual` with a vision model for exact page rendering.
 
 ## License
 

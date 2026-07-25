@@ -40,11 +40,11 @@ class PythonExecutor(BaseTool):
 
     @property
     def description(self) -> str:
-        return ("Execute Python code in an isolated child process for system operations, calculations, package installs, "
-                "diagnostics, and file management such as creating, copying, moving, renaming, or packaging files. "
-                "Child stdout/stderr are returned to the WebUI and child stdin is closed; interactive commands are not "
-                "supported. Direct deletion is blocked; use system_cleaner. Use code_editor or code_context for routine "
-                "project source reads, edits, and searches. Manage knowledge-base records only through knowledge_base.")
+        return ("Run Python code in an isolated child process. PREFERRED for: multi-step logic, "
+                "data processing (JSON, CSV, text), calculations, API calls, string/encoding work, "
+                "or anything needing loops, conditionals, or libraries. "
+                "Stdout/stderr returned; stdin closed. Deletion blocked (use bash rm). "
+                "For one-shot file ops, git, or shell commands, use bash instead.")
 
     @property
     def parameters(self) -> Dict[str, Any]:

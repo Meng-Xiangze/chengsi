@@ -432,6 +432,16 @@
       transition: .18s ease;
     }
     .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+    /* ── iOS-style toggle switch ── */
+    .toggle-switch { position: relative; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+    .toggle-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .toggle-track { width: 36px; height: 20px; background: #c4c9cc; border-radius: 20px; position: relative; transition: background .22s ease; flex-shrink: 0; }
+    .toggle-thumb { width: 16px; height: 16px; background: #fff; border-radius: 50%; position: absolute; top: 2px; left: 2px; transition: transform .22s ease; box-shadow: 0 1px 3px rgba(0,0,0,.24); }
+    .toggle-switch input:checked + .toggle-track { background: var(--accent); }
+    .toggle-switch input:checked + .toggle-track .toggle-thumb { transform: translateX(16px); }
+    .toggle-label { font-size: .78rem; color: var(--muted); white-space: nowrap; }
+
     .sidebar-scrim { display: none; }
     @media (max-width: 680px) {
       :root { --sidebar: min(82vw, 280px); }
@@ -470,6 +480,11 @@
         <select class="model-select" id="modelSelect" aria-label="Model"></select>
         <div class="top-spacer"></div>
         <span class="stats" id="stats" title="Input, output, and current context tokens">↑ 0 · ↓ 0 · 0 ctx</span>
+        <label class="toggle-switch" title="Run independent tools in parallel" id="parallelToggle">
+          <input type="checkbox" id="parallelCheck">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">∥</span>
+        </label>
         <button class="icon-button" id="compactButton" title="Compact context" aria-label="Compact context">↧</button>
         <button class="icon-button" id="exportButton" title="Export conversation" aria-label="Export conversation">⇩</button>
         <button class="icon-button" id="themeButton" title="Toggle theme" aria-label="Toggle theme">◐</button>
@@ -998,6 +1013,12 @@
       if (!app.api) return;
       const theme = await app.api.get_theme();
       applyTheme(theme?.theme || "day");
+      const pt = await app.api.get_parallel_tools();
+      $("parallelCheck").checked = !!pt?.parallel_tools;
+      $("parallelCheck").addEventListener("change", async () => {
+        const result = await app.api.set_parallel_tools($("parallelCheck").checked);
+        if (result?.status !== "ok") toast("Could not save setting");
+      });
       await Promise.all([loadModels(), loadSessions()]);
       const current = await app.api.get_current_session();
       if (current?.session_id) await openSession(current.session_id);

@@ -10,9 +10,9 @@ class ToolManagerTests(unittest.TestCase):
         manager = ToolManager(str(root / "tools"))
         tools = manager.load_tools()
 
-        self.assertIn("file_deleter", tools)
+        self.assertIn("write", tools)
         self.assertIn("web_reader", tools)
-        self.assertIn("web_search_read", tools)
+        self.assertIn("web_searcher", tools)
         for name, tool in tools.items():
             metadata = manager.registry.get(name)
             self.assertIsNotNone(metadata, name)

@@ -55,6 +55,9 @@
       ]
     }
   ],
+  "default_vision_model": "",
+  "default_image_model": "",
+  "parallel_tools": false,
   "show_thinking": true,
   "theme": "day"
 }

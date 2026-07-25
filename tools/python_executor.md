@@ -1,6 +1,6 @@
 ---
 name: python_executor
-description: Execute Python code for system operations, calculations, diagnostics, and controlled file management.
+description: "Run Python code. Preferred for: multi-step logic, data processing (JSON, CSV), calculations, loops/conditionals. Deletion blocked — use bash rm. Returns stdout+stderr."
 parameters:
   code:
     type: string
@@ -17,6 +17,6 @@ usage_notes:
   - For GitHub authentication, ask the user to complete `gh auth login` in a separate trusted terminal, then retry the requested task.
   - Direct deletion is blocked; use system_cleaner for controlled cleanup and deletion.
   - The core and knowledge directories are permanently protected.
-  - Prefer code_editor or code_context for routine project source reads, edits, and searches.
+  - Prefer read for file inspection and code search; use edit for edits.
   - stdout and stderr are returned separately.
 ---

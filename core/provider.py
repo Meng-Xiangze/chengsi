@@ -28,6 +28,27 @@ class BaseProvider(ABC):
                 response.close()
             except Exception:
                 pass
+            # Force-shutdown the underlying TCP socket so any blocking recv()
+            # in the worker thread returns immediately (critical on Windows).
+            try:
+                raw = response.raw
+                fp = raw._fp if hasattr(raw, '_fp') else raw
+                sock = fp._sock if hasattr(fp, '_sock') else None
+                if sock is None and hasattr(fp, 'fileno'):
+                    import socket as _socket
+                    sock = _socket.fromfd(fp.fileno(), _socket.AF_INET, _socket.SOCK_STREAM)
+                if sock is not None:
+                    try:
+                        sock.shutdown(2)  # SHUT_RDWR
+                    except Exception:
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        self._resp = None
 
     @abstractmethod
     def chat_stream(

@@ -4,7 +4,52 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] - 2026-07-25
+
+### Added
+
+- **Unified `read` tool**: single tool for text files, PDF, DOCX, images, and code search. Supports `offset`/`limit` pagination, `glob`/`ext`/`case_sensitive` search filters, and dual text/visual modes for PDF and DOCX.
+- **`write` tool**: create or overwrite text files and formatted DOCX with Markdown-like syntax (`**bold**`, `*italic*`, `^superscript^`, `_subscript_`, `{size:N}`, `{color:...}`, headings, lists, tables, images).
+- **`edit` tool**: precise file editing with exact-text anchors. Supports replace, insert_before, insert_after, delete, prepend, and append operations. Works on both text files and DOCX paragraphs.
+- **`bash` tool**: execute shell commands (cmd on Windows, bash on Linux/Mac) with 60s timeout. Prefer for file ops, git, and one-shot terminal tasks.
+- **`ls` tool**: list directory contents with file sizes and types.
+- **DOCX read support**: text extraction with formatting markers, numbered list reconstruction from `word/numbering.xml`, table extraction, MathType equation placeholders, embedded image counting, and visual mode (LibreOffice page render or zip image extraction).
+- **PDF read support**: per-page text extraction via PyMuPDF (primary) or pypdf (fallback), and visual mode rendering pages at 200 DPI for vision models.
+- **Auto image description**: non-vision models automatically route images to the configured default vision model for one-shot description.
+- **Default model conventions**: `provider/model` format in `config.json` (`default_vision_model`, `default_image_model`) to avoid cross-provider name collisions.
+- **Stream cancel responsiveness**: thread+queue wrapper (`_iter_stream_with_cancel`) polls cancel event every 0.15s instead of blocking on generator iteration.
+- **Operation spinners**: the WebUI shows a spinner during context compaction and chat export to indicate active processing.
+- **Parallel tool execution**: optional concurrent execution of multiple tool calls from a single model response, with iOS-style toggle switch in the WebUI. Preflight (permission checks) runs sequentially; independent tools execute in a thread pool (up to 6 workers); observe steps run sequentially in original call order. Defaults to off (`parallel_tools: false`).
+
+### Changed
+
+- **Tool consolidation**: reduced from 14 to 13 tools by removing redundancy. `read` replaces `image_reader` + `code_context`; `edit` replaces `code_editor`; standalone `grep`, `file_deleter`, `tool_creator`, and `tool_info` removed as their functionality is covered by other tools.
+- **System prompt simplified**: tool descriptions are now exclusively delivered through native function calling — the system prompt no longer embeds tool lists or text-call protocols.
+- **`system_cleaner` simplified**: reduced from 8 parameters to 2 (`target_type`, `dry_run`), code reduced from 290 to 130 lines.
+- **`python_executor` and `bash` descriptions**: clear mutual cross-references so models can route to the right tool (bash for file ops/git/one-shots, python_executor for multi-step logic/data processing).
+- **`build_tool_defs`**: uses `.md` front-matter descriptions as the primary source, falling back to `.py` tool class descriptions. Descriptions stay concise (~100-200 chars).
+- **Stop behavior**: cancel immediately returns to the user instead of waiting for a stuck stream producer. Stop markers saved to conversation history for clean reload.
+
+### Removed
+
+- `code_editor` — replaced by `edit`
+- `code_context` — merged into `read`
+- `image_reader` — merged into `read`
+- `web_search_read` — models can chain `web_searcher` → `web_reader` natively
+- `grep` — merged into `read` (search mode with `glob`/`case_sensitive`)
+- `file_deleter` — `bash rm` covers file deletion
+- `tool_creator` — `write` covers tool file creation
+- `tool_info` — `read` covers tool documentation reading
+- Legacy text-based tool call protocol (`_legacy_tool_prompt`, `_parse_tool_call_json`) — all models now use native function calling
+- `user_requested_tool_creation` and `_turn_tools` filtering
+
+### Fixed
+
+- **Numbered lists in DOCX**: counters now tracked per `(numId, ilvl)` from `word/numbering.xml`, supporting decimal and bullet formats across 9 nesting levels.
+- **MathType equations in DOCX**: `<w:object>` elements detected and represented as `[Equation]` placeholders instead of being silently dropped.
+- **YAML front-matter parsing**: colons in description values no longer break YAML parsing in tool `.md` files.
+- **Stop marker persistence**: `*[stopped]*` messages saved to conversation so reloaded sessions show the correct end state.
+- **Qwen3 thinking + tools → empty output**: Ollama provider now detects when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native `tool_calls` (Ollama #10976). When a response produces thinking text but zero `content` and zero native `tool_calls`, the provider scans the accumulated thinking buffer for `<tool_call>...</tool_call>` blocks and extracts them, supporting both Hermes-style JSON (`{"name":"...","arguments":{...}}`) and Qwen-Coder XML (`<function=name><parameter=k>v</parameter></function>`) formats. Thinking remains enabled (`think: true`) so the model retains full reasoning quality; the extraction is a pure safety net that only activates when the model would otherwise produce nothing.
 
 ## [0.2.0] - 2026-07-24
 

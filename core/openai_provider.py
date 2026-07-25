@@ -86,7 +86,7 @@ class OpenAIProvider(BaseProvider):
                     prepared.append(item)
                     prepared.append({
                         "role": "user",
-                        "content": ([{"type": "text", "text": "Image returned by image_reader:"}] if not text else [{"type": "text", "text": "Image returned by image_reader.\n" + text}]) + image_parts,
+                        "content": ([{"type": "text", "text": "Image returned by read:"}] if not text else [{"type": "text", "text": "Image returned by read.\n" + text}]) + image_parts,
                     })
                     continue
                 item["content"] = ([{"type": "text", "text": text}] if text else []) + image_parts
@@ -240,6 +240,10 @@ class OpenAIProvider(BaseProvider):
                         current["name"] += function["name"]
                     if function.get("arguments"):
                         current["arguments"] += function["arguments"]
+            # After loop, check cancel before using potentially incomplete tool_parts
+            if self._cancel_event.is_set() or (external_cancel and external_cancel.is_set()):
+                yield "cancelled", None
+                return
             if tool_parts:
                 calls = self._finish_tool_calls(tool_parts)
                 parse_errors = [call.pop("parse_error") for call in calls if call.get("parse_error")]
@@ -248,19 +252,37 @@ class OpenAIProvider(BaseProvider):
                 else:
                     yield "tool_calls", calls
         except requests.exceptions.ProxyError as error:
-            yield "error", f"System proxy could not reach provider ({self._base_url}): {error}"
+            if self._cancel_event.is_set():
+                yield "cancelled", None
+            else:
+                yield "error", f"System proxy could not reach provider ({self._base_url}): {error}"
         except requests.exceptions.ConnectTimeout as error:
-            yield "error", f"Provider connection timed out ({self._base_url}): {error}"
+            if self._cancel_event.is_set():
+                yield "cancelled", None
+            else:
+                yield "error", f"Provider connection timed out ({self._base_url}): {error}"
         except requests.exceptions.ConnectionError as error:
-            yield "error", f"Could not connect to OpenAI-compatible provider ({self._base_url}): {error}"
+            if self._cancel_event.is_set():
+                yield "cancelled", None
+            else:
+                yield "error", f"Could not connect to OpenAI-compatible provider ({self._base_url}): {error}"
         except requests.exceptions.Timeout as error:
-            yield "error", f"Provider response timed out ({self._base_url}): {error}"
+            if self._cancel_event.is_set():
+                yield "cancelled", None
+            else:
+                yield "error", f"Provider response timed out ({self._base_url}): {error}"
         except requests.exceptions.HTTPError as error:
-            status = error.response.status_code if error.response is not None else "?"
-            body = self._response_text(error.response) if error.response is not None else ""
-            yield "error", f"Provider returned HTTP {status}: {body}"
+            if self._cancel_event.is_set():
+                yield "cancelled", None
+            else:
+                status = error.response.status_code if error.response is not None else "?"
+                body = self._response_text(error.response) if error.response is not None else ""
+                yield "error", f"Provider returned HTTP {status}: {body}"
         except Exception as error:
-            yield "error", f"Provider request failed: {error}"
+            if self._cancel_event.is_set():
+                yield "cancelled", None
+            else:
+                yield "error", f"Provider request failed: {error}"
         finally:
             self._resp = None
 
