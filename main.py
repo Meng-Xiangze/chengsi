@@ -235,7 +235,8 @@ Inspect before editing and verify the end state afterward. Never claim success w
 If an attempt fails, change approach; never repeat the same call more than twice.
 Keep a concise internal task state: goal, completed work, current blocker, and next verification. Do not expose private reasoning. Return only a tool call, a necessary clarification, or the final answer.
 Do not create a new tool unless the user explicitly asks for a reusable tool. Do not modify Chengsi's own core/ directory or main.py; other projects may be modified when requested.
-Use the knowledge base or web only when the answer needs external facts, freshness, or citations; do not browse for routine local work."""
+Use the knowledge base or web only when the answer needs external facts, freshness, or citations; do not browse for routine local work.
+When multiple independent operations can proceed simultaneously (e.g., reading several files, searching several paths), issue them as a batch of tool calls in a single response."""
     if failure_alert:
         p += f"\nExecution alert: {failure_alert}. Stop retrying and report the blocker or choose a materially different approach."
 
@@ -250,8 +251,8 @@ Use the knowledge base or web only when the answer needs external facts, freshne
 #  5. AGENT LOOP (shared by CLI & Web modes)
 # ══════════════════════════════════════════════════════════════════════
 
-_MAX_TOOL_CALLS = 30
-_MAX_WORKING_MESSAGES = 48
+_MAX_TOOL_CALLS = 20
+_MAX_WORKING_MESSAGES = 24
 
 
 def _emit(event_type: str, data, session_id: str = ""):
@@ -894,6 +895,13 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             _emit("agent_done", error, session_id=session_id)
         return
 
+    # Retrieve knowledge base context once per turn (not every tool-call iteration)
+    kb_context = ""
+    if getattr(state, "knowledge_base", None):
+        user_text = next((m.get("content", "") for m in reversed(sd.messages) if m.get("role") == "user"), "")
+        if isinstance(user_text, str):
+            kb_context = state.knowledge_base.context(user_text)
+
     try:
         while True:
             if sd.cancel.is_set():
@@ -908,11 +916,8 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             stream_error = None
 
             request_messages = _working_context(sd.messages)
-            if getattr(state, "knowledge_base", None):
-                user_text = next((m.get("content", "") for m in reversed(sd.messages) if m.get("role") == "user"), "")
-                if isinstance(user_text, str):
-                    kb_context = state.knowledge_base.context(user_text)
-                    request_messages = _append_knowledge_context(request_messages, kb_context)
+            if kb_context:
+                request_messages = _append_knowledge_context(request_messages, kb_context)
 
             stream_gen = provider.chat_stream(model, request_messages, tool_defs=tool_defs, supports_vision=supports_vision, cancel_event=sd.cancel)
             for kind, chunk in _iter_stream_with_cancel(stream_gen, sd.cancel):

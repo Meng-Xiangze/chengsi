@@ -2,8 +2,8 @@
 name: write
 description: "Create or overwrite files — raw text or formatted DOCX"
 parameters:
-  path: {type: string, description: "File path. Creates parent dirs automatically."}
-  content: {type: string, description: "Complete file content. For DOCX: Markdown-like syntax."}
+  path: {type: string, description: "File path (auto-creates parent dirs)"}
+  content: {type: string, description: "File content (Markdown-like for DOCX)"}
 examples:
   - {path: script.py, content: "print('hello')"}
   - {path: report.docx, content: "# Title ## Section {size:14,bold}Big bold text{/size} **bold** *italic* H_2_O - bullet 1. numbered |Name|Value| |Q|9B| ![](chart.png)"}

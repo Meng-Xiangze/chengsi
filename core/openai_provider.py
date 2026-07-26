@@ -4,6 +4,7 @@ from typing import Any
 import requests
 
 from core.http_client import HttpClient
+from core.json_repair import try_parse_arguments
 from core.provider import BaseProvider
 
 
@@ -101,11 +102,7 @@ class OpenAIProvider(BaseProvider):
         for index in sorted(parts):
             part = parts[index]
             raw_arguments = part.get("arguments", "")
-            try:
-                arguments = json.loads(raw_arguments) if raw_arguments else {}
-            except json.JSONDecodeError as error:
-                arguments = {}
-                part["parse_error"] = f"Invalid tool arguments for {part.get('name', 'tool')}: {error}"
+            arguments = try_parse_arguments(raw_arguments)
             call = {
                 "id": part.get("id") or f"call_{index:02d}",
                 "action": part.get("name", ""),

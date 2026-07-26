@@ -2,8 +2,8 @@
 name: system_cleaner
 description: "Preview and clean system temp files, Python caches, recycle bin"
 parameters:
-  target_type: {type: string, enum: [temp, python_cache, recycle_bin, all], description: "What to clean. Default: all"}
-  dry_run: {type: boolean, description: "Preview only (true, default) or actually delete (false)"}
+  target_type: {type: string, enum: [temp, python_cache, recycle_bin, all], description: "Target type (default all)"}
+  dry_run: {type: boolean, description: "Preview (true, default) or delete (false)"}
 examples:
   - {target_type: temp, dry_run: true, note: "Preview temp files"}
   - {target_type: all, dry_run: false, note: "Clean everything"}

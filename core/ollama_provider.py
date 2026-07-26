@@ -4,6 +4,7 @@ import re
 import requests
 
 from core.http_client import HttpClient
+from core.json_repair import repair_json, try_parse_arguments
 from core.provider import BaseProvider
 
 
@@ -50,10 +51,7 @@ class OllamaProvider(BaseProvider):
                     function = dict(call.get("function") or {})
                     arguments = function.get("arguments", {})
                     if isinstance(arguments, str):
-                        try:
-                            function["arguments"] = json.loads(arguments)
-                        except json.JSONDecodeError:
-                            function["arguments"] = {}
+                        function["arguments"] = try_parse_arguments(arguments)
                     call["function"] = function
                     normalized_calls.append(call)
                 item["tool_calls"] = normalized_calls
@@ -97,16 +95,14 @@ class OllamaProvider(BaseProvider):
                 continue
             # 1) Try Hermes-style JSON
             if block.startswith('{'):
-                try:
-                    data = json.loads(block)
+                data = repair_json(block)
+                if data:
                     calls.append({
                         "id": f"extracted_{idx}",
                         "action": str(data.get("name", data.get("function", ""))),
                         "arguments": data.get("arguments", data.get("parameters", {})),
                     })
                     continue
-                except (json.JSONDecodeError, ValueError):
-                    pass
             # 2) Try Qwen-Coder XML
             func_match = re.search(r'<function=(\w+)>(.*?)</function>', block, re.DOTALL)
             if func_match:
@@ -163,10 +159,7 @@ class OllamaProvider(BaseProvider):
                         function = tool_call.get("function", {})
                         arguments = function.get("arguments", {})
                         if isinstance(arguments, str):
-                            try:
-                                arguments = json.loads(arguments)
-                            except Exception:
-                                arguments = {}
+                            arguments = try_parse_arguments(arguments)
                         calls.append({
                             "id": tool_call.get("id") or f"call_{len(calls):02d}",
                             "action": function.get("name", ""),

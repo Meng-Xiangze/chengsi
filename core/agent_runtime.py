@@ -20,8 +20,9 @@ class ToolOutcome:
     code: str = "ok"
 
     def for_model(self) -> str:
-        status = "ok" if self.ok else "error"
-        return f"[TOOL_RESULT status={status} code={self.code}]\n{self.content}"
+        if self.ok:
+            return self.content
+        return f"Error: {self.content}"
 
 
 def classify_tool_outcome(result: Any) -> ToolOutcome:

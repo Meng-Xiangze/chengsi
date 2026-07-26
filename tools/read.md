@@ -4,12 +4,12 @@ description: "Read text files, PDFs, DOCX, view images, or search code — one u
 parameters:
   path: {type: string, description: "File path to read (text, PDF, DOCX, or image). For search: optional root directory."}
   query: {type: string, description: "Search query — activates code search mode"}
-  offset: {type: integer, description: "For text: line (1-indexed). PDF: page. DOCX: paragraph."}
-  limit: {type: integer, description: "For text: max lines (200). PDF: max pages (1). DOCX: max paragraphs (50). Search: max results (20)."}
-  ext: {type: string, description: "File extension filter for search, e.g. .py"}
-  glob: {type: string, description: "File name glob for search, e.g. '*.py'. Overrides ext."}
-  case_sensitive: {type: boolean, description: "Match case in search. Default: false."}
-  mode: {type: string, description: "For PDF/DOCX: 'text' (default) or 'visual' (render as image for vision models)"}
+  offset: {type: integer, description: "Start line/page/paragraph (1-indexed)"}
+  limit: {type: integer, description: "Max lines(200)/pages(1)/paragraphs(50)/results(20)"}
+  ext: {type: string, description: "File extension filter (e.g. .py)"}
+  glob: {type: string, description: "Glob pattern for search, overrides ext"}
+  case_sensitive: {type: boolean, description: "Case-sensitive search (default false)"}
+  mode: {type: string, description: "'text' (default) or 'visual' for PDF/DOCX"}
 examples:
   - {query: "def run", glob: "*.py", limit: 5, note: "Search with glob"}
   - {query: "TODO", path: "src/", case_sensitive: true, note: "Case-sensitive search in dir"}

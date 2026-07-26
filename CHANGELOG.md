@@ -4,6 +4,22 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.1] - 2026-01-26
+
+### Changed
+
+- **Token efficiency — tool result wrapper removed**: `ToolOutcome.for_model()` no longer prefixes every result with `[TOOL_RESULT status=ok code=...]`. Success results pass through unchanged; only errors get an `Error: ` prefix. Saves ~50 chars per tool call.
+- **Token efficiency — knowledge base context retrieved once per turn**: KB context is now fetched before the tool-call loop instead of re-retrieved and re-appended to the system prompt on every iteration. Eliminates redundant system prompt growth during multi-tool turns.
+- **Token efficiency — tighter agent loop limits**: reduced `_MAX_TOOL_CALLS` 30→20 and `_MAX_WORKING_MESSAGES` 48→24, shrinking the maximum context window per turn and encouraging earlier context compaction.
+- **Token efficiency — compact tool parameter descriptions**: trimmed verbose parameter `description` strings across `read`, `edit`, `write`, `web_reader`, `knowledge_base`, `system_cleaner`, and `python_executor` tool definitions. Total tool definitions payload reduced ~30%.
+- **Parallel tool calls actually triggered**: added explicit instruction to the system prompt directing the model to batch independent operations into a single multi-tool-call response. The parallel execution infrastructure (`parallel_tools: true`, `ThreadPoolExecutor`) already existed but was never exercised because the model was never told it could emit multiple tool calls at once. Verified with `tests/test_parallel_tools.py` confirming concurrent execution when multiple tool calls are issued.
+
+### Fixed
+
+- **JSON repair fallback (json_repair)**: added `core/json_repair.py` module with deterministic JSON repair inserted before all `json.loads` calls in Ollama/OpenAI providers. Handles common JSON formatting errors from local models (Fable, Qwen, etc.): unclosed strings/brackets, trailing commas, single quotes, Unicode curly quotes, markdown code fences. Core `_balance` algorithm scans once to complete missing closures, ensuring at least valid closed JSON objects are returned to the model instead of silently discarding arguments due to parse failures (resulting in `{}`).
+
 ## [0.3.0] - 2026-07-25
 
 ### Added
@@ -50,7 +66,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **YAML front-matter parsing**: colons in description values no longer break YAML parsing in tool `.md` files.
 - **Stop marker persistence**: `*[stopped]*` messages saved to conversation so reloaded sessions show the correct end state.
 - **Qwen3 thinking + tools → empty output**: Ollama provider now detects when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native `tool_calls` (Ollama #10976). When a response produces thinking text but zero `content` and zero native `tool_calls`, the provider scans the accumulated thinking buffer for `<tool_call>...</tool_call>` blocks and extracts them, supporting both Hermes-style JSON (`{"name":"...","arguments":{...}}`) and Qwen-Coder XML (`<function=name><parameter=k>v</parameter></function>`) formats. Thinking remains enabled (`think: true`) so the model retains full reasoning quality; the extraction is a pure safety net that only activates when the model would otherwise produce nothing.
-
 ## [0.2.0] - 2026-07-24
 
 ### Added

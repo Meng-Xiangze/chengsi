@@ -2,16 +2,16 @@
 name: edit
 description: "Precise surgical edits — replace, insert, delete, prepend, append with exact-text anchors"
 parameters:
-  path: {type: string, description: "File path to edit."}
+  path: {type: string, description: "File path to edit"}
   edits:
     type: array
     description: "List of {op, oldText, newText} objects."
     items:
       properties:
-        op: {type: string, enum: [replace, insert_before, insert_after, delete, prepend, append], description: "Operation. Default: replace."}
-        oldText: {type: string, description: "Anchor text. Must be unique. Not needed for prepend/append."}
-        newText: {type: string, description: "Replacement/inserted text. Not needed for delete."}
-  revision: {type: string, description: "Optional content hash. Rejects edit if file changed since this revision."}
+        op: {type: string, enum: [replace, insert_before, insert_after, delete, prepend, append], description: "Operation (default replace)"}
+        oldText: {type: string, description: "Unique anchor text (skip for prepend/append)"}
+        newText: {type: string, description: "Replacement or insert text (skip for delete)"}
+  revision: {type: string, description: "Optional content hash guard"}
 examples:
   - {path: config.py, edits: [{oldText: "DEBUG = True", newText: "DEBUG = False"}]}
   - {path: app.py, edits: [{op: insert_after, oldText: "import sys\n", newText: "import os\n"}]}

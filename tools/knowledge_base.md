@@ -4,29 +4,29 @@ description: Search and explicitly ingest, list, or remove local knowledge-base 
 parameters:
   action:
     type: string
-    description: "Operation: search, ingest_file, ingest, list, or remove"
+    description: "search | ingest_file | ingest | list | remove"
     required: true
   query:
     type: string
     description: Search text
   path:
     type: string
-    description: Local text/Markdown/JSON/CSV/LOG path
+    description: File path
   content:
     type: string
     description: Text to ingest
   source:
     type: string
-    description: Stable source id
+    description: Source identifier
   title:
     type: string
-    description: Optional title
+    description: Document title
   document_id:
     type: string
-    description: Id to remove
+    description: Document ID to remove
   limit:
     type: integer
-    description: Maximum result count
+    description: Max results
 ---
 
 The knowledge base is local SQLite FTS5 storage at knowledge/knowledge.db. Search results include stable [KB:id] references. Ingestion is explicit and idempotent by source plus content hash. Supported documents include PDF, DOCX, XLSX/XLS, PPTX, TXT, Markdown, JSON, CSV, and LOG. Images must use read.

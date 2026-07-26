@@ -4,7 +4,7 @@ description: "Run Python code. Preferred for: multi-step logic, data processing 
 parameters:
   code:
     type: string
-    description: Required Python code to execute.
+    description: Python code to execute
     required: true
 examples:
   - action: python_executor
