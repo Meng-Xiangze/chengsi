@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-27
+
 ### Fixed
 
 - **Streaming agent checkpoints**: normal model content is now emitted to the UI as `agent_delta` chunks while the provider is still streaming, and the existing thinking/tool/result events remain incremental. The agent loop still waits for complete tool-call arguments before executing a tool, then immediately resumes the next model step.
