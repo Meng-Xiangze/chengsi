@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-27
+
+### Changed
+
+- **Context management rewritten**: removed the fixed 24-message working window (`_MAX_WORKING_MESSAGES`). The model now receives the full conversation history by default — no silent truncation.
+- **Tool-call intermediate cleanup**: completed-turn tool-call and tool-result messages are now stripped from the model request on each new user turn. Within a single agent turn (inner loop) the model still sees all tool calls and results; when the user sends a new message (outer loop), previous-turn intermediates are removed and only user messages and assistant text responses remain. This prevents context pollution and saves tokens without losing substantive conversation content.
+
 ## [0.4.0] - 2026-07-27
 
 ### Fixed

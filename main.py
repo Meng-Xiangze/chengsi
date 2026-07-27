@@ -255,7 +255,6 @@ When multiple independent operations can proceed simultaneously (e.g., reading s
 # tool-count wall: identical-call protection, real consecutive failures,
 # cancellation, truncation, and context management remain active.
 _MAX_TOOL_CALLS = None
-_MAX_WORKING_MESSAGES = 24
 
 
 def _emit(event_type: str, data, session_id: str = ""):
@@ -816,39 +815,54 @@ OLDER TRANSCRIPT (historical evidence):
 """ + format_messages(older) + "\n\nRECENT VERBATIM CONTEXT (authoritative; read this last):\n" + format_messages(recent)
 
 
-def _working_context(messages: list[dict], limit: int = _MAX_WORKING_MESSAGES) -> list[dict]:
-    """Bound outbound working memory while preserving system and tool-call groups."""
-    if len(messages) <= limit + 1:
-        return list(messages)
-    system = messages[:1] if messages and messages[0].get("role") == "system" else []
-    conversation = messages[len(system):]
-    start = max(0, len(conversation) - limit)
-    while start > 0 and conversation[start].get("role") == "tool":
-        start -= 1
-    recent = conversation[start:]
+def _build_request_messages(messages: list[dict]) -> list[dict]:
+    """Build model request messages by stripping tool-call intermediates
+    from completed turns while keeping the current turn intact.
 
-    # Anchor the original task so the model never forgets it when older messages
-    # are trimmed out of the working window. Find the most recent real user
-    # message in the truncated portion (skip synthetic [BRACKET] markers).
-    task_anchor = None
-    for msg in reversed(conversation[:start]):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip() and not content.startswith("["):
-                task_anchor = content[:500]
+    Within one agent turn (inner loop), tool calls and their results must
+    be visible so the model can continue. When a new user message starts
+    the next turn (outer loop), previous-turn tool intermediates are noise
+    and are removed — only user messages and assistant text responses remain.
+    """
+    if not messages:
+        return messages
+
+    # Find the last real user message (skip synthetic [BRACKET] markers)
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            content = str(messages[i].get("content", ""))
+            if content.strip() and not content.startswith("["):
+                last_user_idx = i
                 break
 
-    marker_text = f"[WORKING CONTEXT]\n{start} older messages are omitted from this request."
-    if task_anchor:
-        marker_text += f"\n\nORIGINAL TASK (pinned from earlier in conversation):\n{task_anchor}"
-    marker_text += "\n\nUse the compacted context if present and continue the current task."
-    marker = {"role": "user", "content": marker_text}
+    if last_user_idx is None:
+        return list(messages)
 
-    compacted = next(
-        (message for message in reversed(conversation[:start]) if str(message.get("content", "")).startswith("[COMPACTED CONTEXT]")),
-        None,
-    )
-    return system + ([compacted] if compacted else []) + [marker] + recent
+    system = messages[:1] if messages and messages[0].get("role") == "system" else []
+    previous = messages[len(system):last_user_idx]   # completed turns
+    current = messages[last_user_idx:]                # current turn onwards
+
+    cleaned = list(system)
+    for msg in previous:
+        role = msg.get("role")
+        if role == "user":
+            cleaned.append(msg)
+        elif role == "assistant":
+            has_tool_calls = bool(msg.get("tool_calls"))
+            has_content = bool(msg.get("content"))
+            if has_tool_calls and not has_content:
+                continue  # pure tool_calls — skip entirely
+            if has_tool_calls:
+                # Keep text content, strip tool_calls metadata
+                clean_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+                cleaned.append(clean_msg)
+            else:
+                cleaned.append(msg)
+        # tool messages are skipped
+
+    cleaned.extend(current)
+    return cleaned
 
 
 # ─── Stream wrapper: thread+queue for responsive cancel ─────────────
@@ -1020,7 +1034,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             stream_tool_calls = None
             stream_error = None
 
-            request_messages = _working_context(sd.messages)
+            request_messages = _build_request_messages(sd.messages)
             if kb_context:
                 request_messages = _append_knowledge_context(request_messages, kb_context)
 
