@@ -47,7 +47,7 @@ if errorlevel 1 goto :error
 set "CHENGSI_HOME=%ROOT%"
 set "PATH=%ROOT%;%PATH%"
 echo Starting Chengsi...
-"%VENV_PYTHON%" "%ROOT%\main.py" %APP_ARGS%
+call "%ROOT%\chengsi.bat" %APP_ARGS%
 if errorlevel 1 goto :error
 exit /b 0
 

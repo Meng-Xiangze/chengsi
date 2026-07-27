@@ -616,6 +616,7 @@
     }
 
     function addCopyAction(row, body, content) {
+      body.dataset.copyContent = String(content ?? "");
       const actions = document.createElement("div");
       actions.className = "message-actions";
       const copy = document.createElement("button");
@@ -624,7 +625,7 @@
       copy.textContent = "Copy";
       copy.title = "Copy message text";
       copy.onclick = async () => {
-        try { await navigator.clipboard.writeText(String(content ?? "")); copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1200); }
+        try { await navigator.clipboard.writeText(body.dataset.copyContent || ""); copy.textContent = "Copied"; setTimeout(() => copy.textContent = "Copy", 1200); }
         catch (_) { toast("Could not copy message"); }
       };
       actions.appendChild(copy);
@@ -833,6 +834,7 @@
         }
         app.currentAgentText += String(data ?? "");
         app.currentAgent.innerHTML = renderMarkdown(app.currentAgentText);
+        app.currentAgent.dataset.copyContent = app.currentAgentText;
         scrollToBottom();
         return;
       }
@@ -842,7 +844,7 @@
         if (app.currentAgent) {
           app.currentAgentText = String(data ?? "");
           app.currentAgent.innerHTML = renderMarkdown(app.currentAgentText);
-          addCopyAction(app.currentAgent, app.currentAgentText);
+          app.currentAgent.dataset.copyContent = app.currentAgentText;
           app.currentAgent = null;
         } else addMessage("agent", data);
         return;

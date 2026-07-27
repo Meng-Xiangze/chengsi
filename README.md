@@ -1,5 +1,7 @@
 # Chengsi (澄思)
 
+**Version 0.4.0**
+
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
 > Chengsi can execute Python and perform local file operations through tools. The protection checks reduce accidental damage, but they are not a security sandbox. Review enabled tools, use trusted model providers, and keep backups of important data.
@@ -9,7 +11,7 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - Local desktop chat interface powered by `pywebview`
 - Local Ollama and OpenAI-compatible model providers
 - Native function calling for all models — no text-based tool protocols
-- 13 discoverable tools: read (text, PDF, DOCX, images, code search), write, edit, bash, ls, python_executor, web search/fetch, knowledge base, image generation, and more
+- 11 discoverable tools: read (text, PDF, DOCX, images, code search), write, edit, bash, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
 - SQLite FTS5 local knowledge base with user-managed search, ingest, list, and remove operations
 - Persistent conversations and generated media
 - Image generation through a configured image-capable model
@@ -60,7 +62,7 @@ cd Chengsi
 
 4. Double-click `setup_and_run.bat`.
 
-The script creates a project-local `.venv`, installs dependencies, verifies the required runtime modules, checks for Microsoft Edge WebView2 Runtime, copies `config.example.json` to the private `config.json` when needed, registers the user-level `CHENGSI_HOME` environment variable, adds the installation folder to the user `PATH`, and starts Chengsi. WebView2 is required for the modern Windows interface; the installer checks common installation locations, attempts `winget`, and then downloads and runs the official Evergreen x64 installer when it is missing. It automatically uses the Windows Python launcher (`py -3`) or `python`; it does not depend on the installer's username or Python location. Set `CHENGSI_PYTHON` to an explicit Python executable only when automatic detection is unavailable. Open a new terminal afterward and run `chengsi` from any directory to start it again.
+The script creates a project-local `.venv`, installs dependencies, verifies the required runtime modules, checks for Microsoft Edge WebView2 Runtime, copies `config.example.json` to the private `config.json` when needed, registers the user-level `CHENGSI_HOME` environment variable pointing to the installation directory, adds that directory to the user `PATH`, and starts Chengsi via `chengsi.bat`. WebView2 is required for the modern Windows interface; the installer checks common installation locations, attempts `winget`, and then downloads and runs the official Evergreen x64 installer when it is missing. It automatically detects Python using the Windows launcher (`py -3`) or `python`; it does not depend on the installer's username or Python location. Set `CHENGSI_PYTHON` to an explicit Python executable path only when automatic detection fails. After setup completes, open a new terminal and run `chengsi` from any directory to start it again.
 
 ### Manual Start
 
@@ -69,7 +71,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy config.example.json config.json
-python main.py
+python launcher.py
 ```
 
 ### macOS and Linux
@@ -220,8 +222,8 @@ WebView API and agent loop (main.py)
         |      +--> OpenAI-compatible (core/openai_provider.py)
         |
         +--> Tool manager (core/tool_manager.py)
-        |      +--> 13 auto-discovered tools in tools/
-        |      +--> Image generator, bash, python_executor
+        |      +--> 11 auto-discovered tools in tools/
+        |      +--> image_generator, bash, python_executor
         |      +--> read (text, PDF, DOCX, images, search)
         |      +--> write (text + formatted DOCX)
         |      +--> edit (surgical text + DOCX editing)
@@ -303,29 +305,35 @@ Before sharing logs or issue reports, remove API keys, personal paths, conversat
 
 ```text
 Chengsi/
-|-- main.py
-|-- config.example.json
+|-- main.py               core agent loop and WebView bridge
+|-- launcher.py           entry point with clipboard compatibility layer
+|-- clipboard_compat.py   Windows clipboard workaround for pywebview
+|-- config.example.json   template configuration
 |-- config.json           (private, not tracked)
 |-- requirements.txt
-|-- setup_and_run.bat
-|-- chengsi.bat
-|-- setup_and_run.sh
+|-- setup_and_run.bat     Windows first-time setup and launch
+|-- chengsi.bat           Windows daily-use launcher
+|-- setup_and_run.sh      macOS/Linux setup and launch
 |-- skills/               optional SKILL.md capability packages
 |-- core/
-|   |-- index.html
-|   |-- provider.py
+|   |-- index.html        WebUI
+|   |-- provider.py       provider abstraction
 |   |-- ollama_provider.py
 |   |-- openai_provider.py
-|   |-- knowledge_base.py
+|   |-- knowledge_base.py SQLite FTS5 knowledge store
 |   |-- session_manager.py
-|   `-- tool_manager.py
+|   `-- tool_manager.py   tool discovery and execution
 |-- tools/
-|   |-- base.py
-|   |-- TOC.md
-|   `-- read.py, write.py, edit.py, bash.py, ls.py, ...
-|-- knowledge/            local database at runtime
-|-- sessions/             local session data at runtime
-`-- media/                generated media at runtime
+|   |-- base.py           tool base class
+|   |-- TOC.md            tool reference
+|   `-- 11 tool modules: read, write, edit, bash, ls, python_executor,
+|                        web_searcher, web_reader, knowledge_base,
+|                        chat_exporter, system_cleaner, project_test,
+|                        image_generator (provided by tool_manager)
+|-- tests/                unit tests
+|-- knowledge/            SQLite database at runtime (private)
+|-- sessions/             conversation history at runtime (private)
+`-- media/                generated images at runtime (private)
 ```
 
 ## Development Checks
