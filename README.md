@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.4.4**
+**Version 0.4.5**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 

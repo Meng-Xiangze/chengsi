@@ -993,6 +993,34 @@ def _summarize_turn_process(provider, model: str, tool_records: list[dict], canc
     return summary.strip()[:6000]
 
 
+def _format_persistent_turn_summary(records: list[dict], stop_reason: str = "") -> str:
+    """Create a compact durable handoff for the next user turn.
+
+    A user turn includes every model/tool exchange after one user message. The
+    summary is retained after that turn ends because completed tool messages are
+    intentionally removed from later provider requests.
+    """
+    if not records and not stop_reason:
+        return ""
+    lines = ["[TURN_TOOL_SUMMARY]", "Completed work from the previous user turn:"]
+    for index, record in enumerate(records, 1):
+        arguments = json.dumps(record.get("arguments", {}), ensure_ascii=False, sort_keys=True, default=str)
+        status = "succeeded" if record.get("ok") else "failed"
+        result = str(record.get("result", "")).strip() or "(no output)"
+        lines.append(f"{index}. {record.get('tool', 'unknown')}({arguments}) -> {status}")
+        lines.append(f"   Result: {result[:3000]}")
+    if stop_reason:
+        lines.append(f"Turn ended with a blocker: {stop_reason}")
+    lines.append("Treat this as factual prior-turn state. Continue from it when the next user request depends on that work; do not repeat completed calls without a reason.")
+    return "\n".join(lines)
+
+
+def _append_persistent_turn_summary(sd, records: list[dict], stop_reason: str = "") -> None:
+    summary = _format_persistent_turn_summary(records, stop_reason)
+    if summary:
+        sd.messages.append({"role": "assistant", "content": summary})
+
+
 def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None, fallback_mode: bool = False):
     sd = state.get(session_id)
     if sd is None or sd.cancel.is_set():
@@ -1270,6 +1298,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
 
                 if stop_reason:
                     message = f"Agent stopped safely: {stop_reason}"
+                    _append_persistent_turn_summary(sd, turn_tool_records, stop_reason)
                     sd.messages.append({"role": "assistant", "content": message})
                     _emit("agent_done", message, session_id=session_id)
                     return
@@ -1305,6 +1334,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             # Strip thinking/reasoning that leaked into content
             clean_response = _strip_thinking_prefix(clean_response)
             sd.messages.append({"role": "assistant", "content": clean_response})
+            _append_persistent_turn_summary(sd, turn_tool_records)
             _emit("agent_done", clean_response, session_id=session_id)
             return
 

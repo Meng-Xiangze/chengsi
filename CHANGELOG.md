@@ -4,7 +4,18 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.5] - 2026-07-28
+
+### Changed
+
+- **User-message turn continuity**: one turn is now defined as the complete processing lifecycle after one user message, including all model/tool exchanges until a final answer, an explicit blocker, or cancellation.
+- **Persistent tool handoffs**: completed turns retain a compact `[TURN_TOOL_SUMMARY]` with tool names, arguments, success/failure, results, and blocker reasons. The next user turn receives this factual handoff even though raw completed tool-call protocol messages are removed.
+- Tool failure stops now preserve enough context for the next request to continue from the blocker instead of appearing to restart from scratch.
+
+### Files changed
+
+- `main.py` — durable per-user-turn tool summaries and failed-turn continuity.
+- `README.md`, `CHANGELOG.md` — 0.4.5 behavior and release documentation.
 
 ## [0.4.4] - 2026-07-28
 
