@@ -1,6 +1,6 @@
 ---
 name: bash
-description: "Run a shell command. Preferred for: file ops (ls, cp, mv, rm, mkdir, find), git, pip install — one-shot terminal tasks. For multi-step logic use python_executor. Returns stdout+stderr. 60s timeout."
+description: "Run a bounded foreground shell command for quick one-shot terminal tasks. Returns stdout+stderr. 60s timeout; use job for commands that may run longer."
 parameters:
   command: {type: string, description: "Shell command to execute", required: true}
 examples:

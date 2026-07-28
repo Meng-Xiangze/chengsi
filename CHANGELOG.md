@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-28
+
+### Added
+
+- **Persistent background jobs**: the new `job` tool starts long-running shell commands as detached processes and returns a `job_id` immediately. Users and later agent turns can inspect status and log tails, list jobs, or explicitly cancel a job. Metadata and combined stdout/stderr logs live in the user's Chengsi data directory and survive application restarts.
+- **Model-stream idle protection**: foreground model requests now fail only after five minutes without a provider event. This is an inactivity timeout rather than a total turn limit, so active conversations and multi-step tasks may continue for hours.
+
+### Changed
+
+- One-turn process summaries now show a visible `Summarizing tool progress...` status and use a separate 30-second idle timeout. A stalled auxiliary summary is skipped instead of blocking the next agent step for the provider's full timeout.
+- Completed-turn tool-call assistant messages are now removed atomically, including any progress preamble text emitted alongside the tool call. This prevents models from treating orphaned old tool preambles as unfinished work on the next user turn.
+- Long calculations and commands should use `job start`; ordinary `bash` and `python_executor` calls retain their bounded foreground timeouts. Background jobs are never automatically killed because they produce no logs; cancellation remains explicit.
+- README and the tool catalog now document the distinction between foreground agent work, model-stream inactivity, and persistent background execution.
+
+### Files changed
+
+- `main.py` — progress-based stream timeout handling, bounded visible process summaries, and atomic cleanup of completed-turn tool-call preambles.
+- `tools/job.py`, `tools/_job_runner.py` — persistent job management and detached process runner.
+- `tools/job.md`, `tools/TOC.md` — background-job tool contract and catalog entry.
+- `README.md`, `CHANGELOG.md` — 0.4.4 behavior and release documentation.
+
 ## [0.4.3] - 2026-07-28
 
 ### Added

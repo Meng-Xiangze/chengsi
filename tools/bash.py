@@ -19,6 +19,7 @@ class Bash(BaseTool):
             "git (status, diff, log, commit), package installs (pip install), system info. "
             "Single-line commands are fastest — use bash for 1-shot terminal tasks. "
             "For multi-step logic, data processing, or complex scripting, use python_executor. "
+            "For commands that may run longer than one minute, use job so they continue in the background. "
             "Timeout: 60s."
         )
 

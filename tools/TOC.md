@@ -7,8 +7,9 @@
 - `ls`: List directory contents with file sizes and types.
 
 ## Execution
-- `bash`: Run a shell command. Required: `command`. 60s timeout.
-- `python_executor`: Run Python code for calculations, file I/O, OS operations. Required: `code`.
+- `bash`: Run a bounded foreground shell command. Required: `command`. 60s timeout.
+- `python_executor`: Run bounded foreground Python code for calculations, file I/O, and OS operations. Required: `code`.
+- `job`: Start and manage persistent background shell jobs. Actions: start, status, logs, list, cancel.
 
 ## Web
 - `web_searcher`: Search the web via DuckDuckGo. Required: `query`.

@@ -869,16 +869,13 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
             if not content.startswith("[TURN_PROCESS_SUMMARY]"):
                 cleaned.append(msg)
         elif role == "assistant":
-            has_tool_calls = bool(msg.get("tool_calls"))
-            has_content = bool(msg.get("content"))
-            if has_tool_calls and not has_content:
-                continue  # pure tool_calls — skip entirely
-            if has_tool_calls:
-                # Keep text content, strip tool_calls metadata
-                clean_msg = {k: v for k, v in msg.items() if k != "tool_calls"}
-                cleaned.append(clean_msg)
-            else:
-                cleaned.append(msg)
+            if msg.get("tool_calls"):
+                # The entire message belongs to the completed tool exchange. Some
+                # models include a progress preamble alongside tool_calls; keeping
+                # that text after removing the call/result leaves an orphaned
+                # assistant continuation that can derail the next user turn.
+                continue
+            cleaned.append(msg)
         # tool messages are skipped
 
     cleaned.extend(current)
@@ -889,11 +886,19 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
 _STREAM_POLL_SEC = 0.15
 
 
-def _iter_stream_with_cancel(gen, cancel_event):
-    """Wrap a generator in a thread+queue so the consumer can poll cancel
-    every _STREAM_POLL_SEC instead of blocking on gen.__next__() forever."""
+class StreamIdleTimeout(TimeoutError):
+    """Raised when a model stream produces no usable event for too long."""
+
+
+def _iter_stream_with_cancel(gen, cancel_event, idle_timeout: float | None = None, on_idle_timeout=None):
+    """Wrap a generator so cancellation and idle streams stay responsive.
+
+    ``idle_timeout`` measures time since the last provider event, not total turn
+    duration. Long-running turns remain valid while they continue to progress.
+    """
     q = queue.Queue()
     done = threading.Event()
+    last_progress = time.monotonic()
 
     def producer():
         try:
@@ -914,6 +919,13 @@ def _iter_stream_with_cancel(gen, cancel_event):
             except queue.Empty:
                 if cancel_event.is_set():
                     return  # consumer detected cancel
+                if idle_timeout is not None and time.monotonic() - last_progress >= idle_timeout:
+                    if on_idle_timeout is not None:
+                        try:
+                            on_idle_timeout()
+                        except Exception:
+                            pass
+                    raise StreamIdleTimeout(f"Model stream made no progress for {int(idle_timeout)} seconds.")
                 continue
             typ = msg[0]
             if typ == 'done':
@@ -921,6 +933,7 @@ def _iter_stream_with_cancel(gen, cancel_event):
             elif typ == 'err':
                 raise msg[1]
             elif typ == 'v':
+                last_progress = time.monotonic()
                 yield msg[1]
     finally:
         # Only wait for producer if NOT cancelled. When cancelled, the producer
@@ -968,7 +981,9 @@ def _summarize_turn_process(provider, model: str, tool_records: list[dict], canc
             cancel_event=cancel_event,
             request_api=request_api,
         )
-        for kind, chunk in _iter_stream_with_cancel(stream, cancel_event):
+        for kind, chunk in _iter_stream_with_cancel(
+            stream, cancel_event, idle_timeout=30, on_idle_timeout=provider.cancel
+        ):
             if kind == "content":
                 summary += str(chunk)
             elif kind in ("error", "cancelled"):
@@ -1106,50 +1121,55 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 fallback_mode=fallback_mode,
                 request_api=request_api,
             )
-            for kind, chunk in _iter_stream_with_cancel(stream_gen, sd.cancel):
-                if kind == "error":
-                    stream_error = chunk
-                    break
-                elif kind == "cancelled":
-                    _emit("thinking", "Cancelled by user.", session_id=session_id)
-                    stop_msg = "\n\n*[stopped]*"
-                    # Save stop marker to messages so conversation is properly closed on reload
-                    sd.messages.append({"role": "assistant", "content": stop_msg})
-                    _emit("agent_done", stop_msg, session_id=session_id)
-                    return
-                elif kind == "thinking":
-                    full_thinking += chunk
-                    _emit("thinking_delta", full_thinking, session_id=session_id)
-                elif kind == "content":
-                    full_content += chunk
-                    # Forward normal answer text immediately so the UI can show
-                    # progress while the provider is still streaming.
-                    _emit("agent_delta", chunk, session_id=session_id)
-                elif kind == "tool_calls":
-                    stream_tool_calls = chunk
-                elif kind == "tokens":
-                    # Count provider-reported usage for the actual requests. The
-                    # latest prompt usage is also the authoritative current ctx.
-                    input_tokens = chunk.get("input", chunk.get("prompt", 0))
-                    output_tokens = chunk.get("output", chunk.get("eval", 0))
-                    sd.input_tokens += input_tokens
-                    sd.output_tokens += output_tokens
-                    sd.prompt_tokens = sd.input_tokens
-                    sd.eval_tokens = sd.output_tokens
-                    if chunk.get("actual", False):
-                        sd.ctx_tokens = chunk.get("prompt", 0)
-                        provider_prompt_seen = True
-                    elif not provider_prompt_seen:
-                        sd.ctx_tokens = _estimate_ctx_tokens(sd.messages, model, provider)
-                    _emit("tokens", {
-                        "input": sd.input_tokens,
-                        "output": sd.output_tokens,
-                        "prompt": sd.prompt_tokens,
-                        "eval": sd.eval_tokens,
-                        "ctx": sd.ctx_tokens,
-                        "compressed_prompt_base": sd.compressed_prompt_base,
-                        "compressed_context_size": sd.compressed_context_size,
-                    }, session_id=session_id)
+            try:
+                for kind, chunk in _iter_stream_with_cancel(
+                    stream_gen, sd.cancel, idle_timeout=300, on_idle_timeout=provider.cancel
+                ):
+                    if kind == "error":
+                        stream_error = chunk
+                        break
+                    elif kind == "cancelled":
+                        _emit("thinking", "Cancelled by user.", session_id=session_id)
+                        stop_msg = "\n\n*[stopped]*"
+                        # Save stop marker to messages so conversation is properly closed on reload
+                        sd.messages.append({"role": "assistant", "content": stop_msg})
+                        _emit("agent_done", stop_msg, session_id=session_id)
+                        return
+                    elif kind == "thinking":
+                        full_thinking += chunk
+                        _emit("thinking_delta", full_thinking, session_id=session_id)
+                    elif kind == "content":
+                        full_content += chunk
+                        # Forward normal answer text immediately so the UI can show
+                        # progress while the provider is still streaming.
+                        _emit("agent_delta", chunk, session_id=session_id)
+                    elif kind == "tool_calls":
+                        stream_tool_calls = chunk
+                    elif kind == "tokens":
+                        # Count provider-reported usage for the actual requests. The
+                        # latest prompt usage is also the authoritative current ctx.
+                        input_tokens = chunk.get("input", chunk.get("prompt", 0))
+                        output_tokens = chunk.get("output", chunk.get("eval", 0))
+                        sd.input_tokens += input_tokens
+                        sd.output_tokens += output_tokens
+                        sd.prompt_tokens = sd.input_tokens
+                        sd.eval_tokens = sd.output_tokens
+                        if chunk.get("actual", False):
+                            sd.ctx_tokens = chunk.get("prompt", 0)
+                            provider_prompt_seen = True
+                        elif not provider_prompt_seen:
+                            sd.ctx_tokens = _estimate_ctx_tokens(sd.messages, model, provider)
+                        _emit("tokens", {
+                            "input": sd.input_tokens,
+                            "output": sd.output_tokens,
+                            "prompt": sd.prompt_tokens,
+                            "eval": sd.eval_tokens,
+                            "ctx": sd.ctx_tokens,
+                            "compressed_prompt_base": sd.compressed_prompt_base,
+                            "compressed_context_size": sd.compressed_context_size,
+                        }, session_id=session_id)
+            except StreamIdleTimeout as error:
+                stream_error = str(error)
 
             if stream_error:
                 # API failures are UI events, never synthetic user messages. Persisting
@@ -1253,6 +1273,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     sd.messages.append({"role": "assistant", "content": message})
                     _emit("agent_done", message, session_id=session_id)
                     return
+                _emit("thinking", "Summarizing tool progress...", session_id=session_id)
                 turn_process_summary = _summarize_turn_process(
                     provider, model, turn_tool_records, sd.cancel, supports_vision, request_api
                 )

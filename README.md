@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.4.3**
+**Version 0.4.4**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -11,7 +11,7 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - Local desktop chat interface powered by `pywebview`
 - Local Ollama and OpenAI-compatible model providers
 - Native function calling for all models — no text-based tool protocols
-- 13 discoverable tools: read (text, CSV, XLSX, PDF, DOCX, images, code search), write, edit, bash, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
+- 14 discoverable tools: read (text, CSV, XLSX, PDF, DOCX, images, code search), write, edit, bash, job, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
 - SQLite FTS5 local knowledge base with user-managed search, ingest, list, and remove operations
 - Persistent conversations and generated media
 - Image generation through a configured image-capable model
@@ -21,6 +21,8 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - One-turn process summaries preserve factual exploration across inner tool loops and expire before the next user turn
 - User-controlled text-only fallback requests and optional automatic pip installation in Settings
 - Per-model Chat Completions or Responses API selection for OpenAI-compatible aggregators
+- Persistent background jobs for commands that run for minutes or hours, with status, log, list, and cancel operations
+- Progress-based model-stream protection: five minutes without an event stops a stalled request, but active turns have no total duration limit
 - Day and night themes
 - Optional parallel tool execution — run independent tools concurrently
 - **Qwen/Ollama thinking safety net**: when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native function calls (a known Ollama interaction), the provider automatically extracts and executes them — thinking stays on so the model keeps its full reasoning quality
@@ -263,8 +265,8 @@ WebView API and agent loop (main.py)
         |      +--> OpenAI-compatible (core/openai_provider.py)
         |
         +--> Tool manager (core/tool_manager.py)
-        |      +--> 11 auto-discovered tools in tools/
-        |      +--> image_generator, bash, python_executor
+        |      +--> 13 auto-discovered tools in tools/
+        |      +--> built-in image_generator
         |      +--> read (text, CSV, XLSX, PDF, DOCX, images, search)
         |      +--> write (text, CSV, XLSX + formatted DOCX)
         |      +--> edit (surgical text/DOCX + exact spreadsheet cells)
@@ -279,11 +281,13 @@ WebView API and agent loop (main.py)
 1. The WebUI sends a user message through the `pywebview` bridge in `main.py`.
 2. `main.py` selects the configured provider and builds the system prompt and tool definitions.
 3. OpenAI-compatible models use their configured `request_api`: Chat Completions streams `/chat/completions` events, while Responses streams `/responses` output, reasoning, usage, and function-call events. Ollama continues to use its native chat endpoint.
-4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. After tool batches, a short-lived model summary records concrete exploration for the next inner step and is removed before the next user turn.
-5. Final responses and UI events are saved by `SessionManager`.
-6. Knowledge searches use the local SQLite FTS5 index and are explicitly invoked through the knowledge-base tool.
-7. Generated images are moved into a session-specific directory under `media/` and rendered directly in the WebUI.
-8. Stop requests cancel immediately via a thread+queue polling mechanism without blocking on stuck streams.
+4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. After tool batches, a short-lived model summary records concrete exploration for the next inner step and is removed before the next user turn. Summary requests stop after 30 seconds without progress and are skipped on failure.
+5. Model streams use a five-minute inactivity timeout, not a five-minute turn limit. Every provider event resets the timer, so active multi-step turns may continue as long as needed.
+6. Commands expected to run for minutes or hours use the detached `job` tool. Jobs continue outside the conversation worker, persist metadata and logs across Chengsi restarts, and stop only when they finish, fail, or are explicitly cancelled.
+7. Final responses and UI events are saved by `SessionManager`.
+8. Knowledge searches use the local SQLite FTS5 index and are explicitly invoked through the knowledge-base tool.
+9. Generated images are moved into a session-specific directory under `media/` and rendered directly in the WebUI.
+10. Stop requests cancel active model streams immediately via a thread+queue polling mechanism without blocking on stuck streams.
 
 ### Main Components
 
@@ -303,19 +307,19 @@ WebView API and agent loop (main.py)
 
 Chengsi automatically discovers tools from Python files in the `tools/` directory. Each tool inherits from `tools.base.BaseTool` and implements `tool_name`, `description`, `parameters`, and `run(arguments)`.
 
-### Available Tools (13)
+### Available Tools (14)
 
 | Category | Tools |
 | --- | --- |
 | File I/O | `read` — text, CSV, XLSX, PDF, DOCX, images, code search. `write` — create/overwrite text, CSV, XLSX, and formatted DOCX. `edit` — precise text/DOCX edits and exact-cell spreadsheet replacement. `ls` — directory listing. |
-| Execution | `bash` — shell commands (file ops, git, pip). `python_executor` — Python for multi-step logic and data processing. |
+| Execution | `bash` — bounded foreground shell commands (file ops, git, pip). `python_executor` — bounded foreground Python for multi-step logic and data processing. `job` — persistent background commands with status, logs, list, and explicit cancellation. |
 | Web | `web_searcher` — DuckDuckGo search. `web_reader` — fetch and extract web page content. |
 | Project | `project_test` — syntax, import, and unittest checks. `system_cleaner` — preview/clean temp files and caches. |
 | Meta | `knowledge_base` — local document search and management. `chat_exporter` — export sessions as Markdown. `image_generator` — generate images via cloud API. |
 
 Models receive tool descriptions through native function calling — the system prompt stays lean (~260 tokens) and only tools relevant to the task are described. Each tool's `.md` front-matter provides the canonical description sent to models.
 
-Tools execute on the host computer with the permissions of the Chengsi process. `python_executor` can run Python code, `bash` can execute shell commands, and `system_cleaner` can delete selected files. The `core` and `knowledge` directories belonging to the running project are protected, but this protection is not a general-purpose sandbox.
+Tools execute on the host computer with the permissions of the Chengsi process. `python_executor` and `bash` are bounded foreground tools. Use `job start` for a command expected to run longer than a normal tool call; it returns a `job_id` immediately, writes combined output to a log, and can be inspected in later turns with `job status` or `job logs`. A quiet background job is not killed automatically, because scientific calculations may legitimately produce no output for long periods. Use `job cancel` only when termination is intended. `system_cleaner` can delete selected files. The `core` and `knowledge` directories belonging to the running project are protected, but this protection is not a general-purpose sandbox.
 
 ## Local Data and Privacy
 
@@ -327,6 +331,7 @@ Chengsi stores local runtime data in these paths:
 | `CHENGSI_HOME` | User-level environment variable pointing to the Chengsi installation folder. |
 | `sessions/` | Conversation messages, UI event history, and token statistics. |
 | `media/` | Generated images and session media. |
+| `%LOCALAPPDATA%/Chengsi/jobs/` on Windows or `~/.chengsi/jobs/` elsewhere | Persistent background-job metadata and combined stdout/stderr logs. |
 | `knowledge/knowledge.db` | Local knowledge-base documents and search index. |
 
 These paths are ignored by Git where appropriate. Online providers receive the conversation and tool context sent to them. Local operation does not imply that all enabled providers or tools are offline.
@@ -367,7 +372,7 @@ Chengsi/
 |-- tools/
 |   |-- base.py           tool base class
 |   |-- TOC.md            tool reference
-|   `-- 11 tool modules: read, write, edit, bash, ls, python_executor,
+|   `-- 13 tool modules: read, write, edit, bash, job, ls, python_executor,
 |                        web_searcher, web_reader, knowledge_base,
 |                        chat_exporter, system_cleaner, project_test,
 |                        image_generator (provided by tool_manager)
