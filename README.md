@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.4.2**
+**Version 0.4.3**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -20,6 +20,7 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - CSV/XLSX reading, creation, and exact-cell editing through the standard file tools
 - One-turn process summaries preserve factual exploration across inner tool loops and expire before the next user turn
 - User-controlled text-only fallback requests and optional automatic pip installation in Settings
+- Per-model Chat Completions or Responses API selection for OpenAI-compatible aggregators
 - Day and night themes
 - Optional parallel tool execution — run independent tools concurrently
 - **Qwen/Ollama thinking safety net**: when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native function calls (a known Ollama interaction), the provider automatically extracts and executes them — thinking stays on so the model keeps its full reasoning quality
@@ -118,11 +119,13 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
       "models": [
         {
           "name": "example-chat-model",
+          "request_api": "chat_completions",
           "vision": true,
           "image_generation": false
         },
         {
           "name": "example-image-model",
+          "request_api": "chat_completions",
           "vision": false,
           "image_generation": true
         }
@@ -168,9 +171,39 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `name` | Yes | Exact model identifier accepted by the provider. |
+| `request_api` | OpenAI-compatible chat models | Request endpoint and streaming protocol for this exact model. Use `chat_completions` for `/chat/completions` or `responses` for `/responses`. If omitted, Chengsi uses `chat_completions` for backward compatibility. |
 | `vision` | No | Enables image input for the model. Set this only when the chat model accepts image content. Default: `false`. |
 | `image_generation` | No | Routes requests made with this selected model to the image generation endpoint. It also makes the model available to the `image_generator` tool. Default: `false`. |
 | `tools` | No | Override native tool-calling support. Set `true` or `false` explicitly. Default: auto-detected from provider type. |
+
+`request_api` is deliberately model-level rather than provider-level. Aggregators can route models behind one base URL to unrelated upstream vendors, so each model states its own request contract without inheritance or ambiguous provider defaults.
+
+The same provider can therefore contain models using different APIs:
+
+```json
+{
+  "type": "openai",
+  "name": "Aggregator",
+  "api_key": "sk-example",
+  "base_url": "https://api.example.com/v1",
+  "models": [
+    {
+      "name": "vendor-a-model",
+      "request_api": "chat_completions",
+      "vision": false,
+      "image_generation": false
+    },
+    {
+      "name": "vendor-b-model",
+      "request_api": "responses",
+      "vision": false,
+      "image_generation": false
+    }
+  ]
+}
+```
+
+The Settings dialog edits this field on the currently selected model. Fallback request mode is separate: it JSON-packs the conversation into one text message, disables tools, and sends that text through the selected model's `request_api`.
 
 `vision` and `image_generation` describe different capabilities. A model can analyze images without generating them, and an image generation model does not automatically support chat or image analysis.
 
@@ -205,6 +238,7 @@ Provider model names and capabilities vary by service. The names above are examp
   "models": [
     {
       "name": "example-model",
+      "request_api": "chat_completions",
       "vision": false,
       "image_generation": false
     }
@@ -212,7 +246,7 @@ Provider model names and capabilities vary by service. The names above are examp
 }
 ```
 
-Multiple providers and models can be configured in the same `providers` array. Restart Chengsi after editing `config.json`.
+Multiple providers and models can be configured in the same `providers` array. The Settings dialog can change `request_api` for the currently selected OpenAI-compatible model and writes the choice directly into that model object. Restart Chengsi after other manual edits to `config.json`.
 
 In `auto` mode, Chengsi bypasses desktop/VPN HTTP proxies first and falls back to the system proxy only when connection establishment fails before any HTTP response is received. It never retries after a response or streamed data begins. `direct` bypasses HTTP/SOCKS environment and Windows proxy settings, but a VPN using TUN or global routing may still intercept traffic at the operating-system route layer.
 
@@ -244,7 +278,7 @@ WebView API and agent loop (main.py)
 
 1. The WebUI sends a user message through the `pywebview` bridge in `main.py`.
 2. `main.py` selects the configured provider and builds the system prompt and tool definitions.
-3. The provider streams text, reasoning events, or structured tool calls via native function calling.
+3. OpenAI-compatible models use their configured `request_api`: Chat Completions streams `/chat/completions` events, while Responses streams `/responses` output, reasoning, usage, and function-call events. Ollama continues to use its native chat endpoint.
 4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. After tool batches, a short-lived model summary records concrete exploration for the next inner step and is removed before the next user turn.
 5. Final responses and UI events are saved by `SessionManager`.
 6. Knowledge searches use the local SQLite FTS5 index and are explicitly invoked through the knowledge-base tool.

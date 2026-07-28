@@ -21,6 +21,7 @@
       "models": [
         {
           "name": "gpt-5.6-sol",
+          "request_api": "chat_completions",
           "vision": true,
           "image_generation": false
         }
@@ -35,6 +36,7 @@
       "models": [
         {
           "name": "deepseek-v4-pro",
+          "request_api": "responses",
           "vision": false,
           "image_generation": false
         }
@@ -49,6 +51,7 @@
       "models": [
         {
           "name": "gpt-image-2",
+          "request_api": "chat_completions",
           "vision": false,
           "image_generation": true
         }

@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-28
+
+### Added
+
+- **Model-level OpenAI request API selection**: every OpenAI-compatible model can explicitly set `request_api` to `chat_completions` or `responses`. The setting belongs to the model rather than the provider because one aggregator base URL may route different models to unrelated upstream vendors.
+- **Responses API streaming**: the OpenAI-compatible adapter now sends `/responses` requests, converts conversation and function-call history into Responses input items, streams output text and reasoning summaries, reports usage, parses function calls, and surfaces failed response events.
+- **Request API selector in Settings**: users can switch the currently selected OpenAI-compatible model between `Chat Completions API (/chat/completions)` and `Responses API (/responses)`. The choice is written directly into that model object in `config.json`; Ollama models disable the selector.
+
+### Changed
+
+- Fallback mode remains independent of protocol selection. It sends the same JSON-packed single text message through whichever request API the selected model declares, with tools disabled.
+- Existing model entries without `request_api` remain compatible and use `chat_completions`; no provider-level inheritance or automatic retry is introduced.
+- README and example configuration now document the unambiguous model-level schema.
+
+### Files changed
+
+- `core/openai_provider.py` — Chat Completions/Responses payload construction and streaming event parsing.
+- `main.py` — model request API resolution, runtime routing, settings persistence, vision and summary request propagation.
+- `core/index.html` — selected-model request API control.
+- `config.example.json`, `README.md`, `CHANGELOG.md` — 0.4.3 configuration and release documentation.
+
 ## [0.4.2] - 2026-07-28
 
 ### Added

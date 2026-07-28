@@ -330,6 +330,8 @@
     .settings-card h2 { margin: 0 0 16px; font-size: 18px; }
     .settings-card label { display: block; margin-top: 13px; font-weight: 600; }
     .settings-card p { margin: 5px 0 0 23px; color: var(--muted); font-size: 12px; }
+    .settings-card select { width: 100%; height: 34px; margin-top: 6px; padding: 0 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
+    .settings-card .field-note { margin-left: 0; }
     .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
     .typing { display: inline-flex; gap: 4px; padding: 10px 0; }
     .typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--muted); animation: pulse 1.1s infinite; }
@@ -530,8 +532,14 @@
   <div class="settings-dialog" id="settingsDialog" hidden>
     <div class="settings-card">
       <h2>Settings</h2>
+      <label for="requestApiSelect" id="requestApiLabel">Request API for selected model</label>
+      <select id="requestApiSelect">
+        <option value="chat_completions">Chat Completions API (/chat/completions)</option>
+        <option value="responses">Responses API (/responses)</option>
+      </select>
+      <p class="field-note" id="requestApiNote">Saved directly on the selected OpenAI-compatible model.</p>
       <label><input type="checkbox" id="fallbackCheck"> Fallback request mode</label>
-      <p>Send one text-only JSON bundle and disable tools for the request.</p>
+      <p>Send one text-only JSON bundle through the selected request API and disable tools.</p>
       <label><input type="checkbox" id="autoInstallCheck"> Automatically install missing Python packages</label>
       <p>When disabled, optional features report the required pip command.</p>
       <div class="settings-actions"><button class="small-button" id="settingsCancel">Cancel</button><button class="small-button" id="settingsSave">Save</button></div>
@@ -1095,7 +1103,12 @@
       select.onchange = async () => {
         const result = await app.api.select_model(Number(select.value));
         if (result?.status !== "ok") toast(result?.msg || "Could not switch model");
-        else toast(`Using ${result.model}`);
+        else {
+          toast(`Using ${result.model}`);
+          const settings = await app.api.get_settings();
+          $("requestApiSelect").value = settings?.request_api || "chat_completions";
+          $("requestApiSelect").disabled = !settings?.request_api_available;
+        }
       };
     }
 
@@ -1125,6 +1138,11 @@
       const settings = await app.api.get_settings();
       $("fallbackCheck").checked = !!settings?.fallback_mode;
       $("autoInstallCheck").checked = !!settings?.auto_install_dependencies;
+      $("requestApiSelect").value = settings?.request_api || "chat_completions";
+      $("requestApiSelect").disabled = !settings?.request_api_available;
+      $("requestApiLabel").textContent = settings?.request_api_available
+        ? `Request API for ${settings.request_api_model}`
+        : "Request API (OpenAI-compatible models only)";
       const pt = await app.api.get_parallel_tools();
       $("parallelCheck").checked = !!pt?.parallel_tools;
       $("parallelCheck").addEventListener("change", async () => {
@@ -1146,11 +1164,20 @@
       const settings = await app.api.get_settings();
       $("fallbackCheck").checked = !!settings?.fallback_mode;
       $("autoInstallCheck").checked = !!settings?.auto_install_dependencies;
+      $("requestApiSelect").value = settings?.request_api || "chat_completions";
+      $("requestApiSelect").disabled = !settings?.request_api_available;
+      $("requestApiLabel").textContent = settings?.request_api_available
+        ? `Request API for ${settings.request_api_model}`
+        : "Request API (OpenAI-compatible models only)";
       $("settingsDialog").hidden = false;
     };
     $("settingsCancel").onclick = () => { $("settingsDialog").hidden = true; };
     $("settingsSave").onclick = async () => {
-      const result = await app.api.set_settings($("fallbackCheck").checked, $("autoInstallCheck").checked);
+      const result = await app.api.set_settings(
+        $("fallbackCheck").checked,
+        $("autoInstallCheck").checked,
+        $("requestApiSelect").value
+      );
       if (result?.status === "ok") { $("settingsDialog").hidden = true; toast("Settings saved"); }
       else toast(result?.msg || "Could not save settings");
     };

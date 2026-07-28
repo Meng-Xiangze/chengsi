@@ -201,6 +201,12 @@ def _get_model_capabilities(providers_cfg: list[dict], provider_idx: int, model:
     return {}
 
 
+def _model_request_api(model_config: dict | None) -> str:
+    """Return the explicit request API for an OpenAI-compatible model."""
+    value = str((model_config or {}).get("request_api", "chat_completions")).strip()
+    return value if value in ("chat_completions", "responses") else "chat_completions"
+
+
 def _get_provider_model_capabilities(providers_cfg: list[dict], provider, model: str) -> dict:
     """Return capabilities for an active provider/model pair."""
     provider_name = getattr(provider, "name", "")
@@ -641,7 +647,17 @@ def _auto_describe_image(img_path: str) -> str:
 
     try:
         description_parts: list[str] = []
-        for event_type, data in client.chat_stream(vision_model_name, messages):
+        vision_model_config = {}
+        for entry in vision_provider_cfg.get("models", []):
+            name, config = _model_config(entry)
+            if name == vision_model_name:
+                vision_model_config = config
+                break
+        for event_type, data in client.chat_stream(
+            vision_model_name,
+            messages,
+            request_api=_model_request_api(vision_model_config),
+        ):
             if event_type == "content":
                 description_parts.append(data)
             elif event_type == "error":
@@ -931,7 +947,7 @@ def _append_knowledge_context(messages: list[dict], context: str) -> list[dict]:
     return updated
 
 
-def _summarize_turn_process(provider, model: str, tool_records: list[dict], cancel_event, supports_vision: bool) -> str:
+def _summarize_turn_process(provider, model: str, tool_records: list[dict], cancel_event, supports_vision: bool, request_api: str = "chat_completions") -> str:
     """Compress current-turn exploration for the next inner model step only."""
     if not tool_records or cancel_event.is_set():
         return ""
@@ -950,6 +966,7 @@ def _summarize_turn_process(provider, model: str, tool_records: list[dict], canc
             tool_defs=None,
             supports_vision=supports_vision,
             cancel_event=cancel_event,
+            request_api=request_api,
         )
         for kind, chunk in _iter_stream_with_cancel(stream, cancel_event):
             if kind == "content":
@@ -982,6 +999,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
     else:
         sd.messages.insert(0, {"role": "system", "content": system_prompt})
     supports_vision = _model_supports_vision(model_config)
+    request_api = _model_request_api(model_config)
     request_messages = None
     runtime = AgentRuntime.from_snapshot(
         sd.runtime_snapshot if sd.runtime_snapshot.get("active") else {},
@@ -1079,7 +1097,15 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             if kb_context:
                 request_messages = _append_knowledge_context(request_messages, kb_context)
 
-            stream_gen = provider.chat_stream(model, request_messages, tool_defs=tool_defs, supports_vision=supports_vision, cancel_event=sd.cancel, fallback_mode=fallback_mode)
+            stream_gen = provider.chat_stream(
+                model,
+                request_messages,
+                tool_defs=tool_defs,
+                supports_vision=supports_vision,
+                cancel_event=sd.cancel,
+                fallback_mode=fallback_mode,
+                request_api=request_api,
+            )
             for kind, chunk in _iter_stream_with_cancel(stream_gen, sd.cancel):
                 if kind == "error":
                     stream_error = chunk
@@ -1228,7 +1254,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     _emit("agent_done", message, session_id=session_id)
                     return
                 turn_process_summary = _summarize_turn_process(
-                    provider, model, turn_tool_records, sd.cancel, supports_vision
+                    provider, model, turn_tool_records, sd.cancel, supports_vision, request_api
                 )
                 continue
             if runtime.can_request_verification():
@@ -1393,17 +1419,53 @@ class WebAPI:
         return {"theme": state.theme}
 
     def get_settings(self):
+        model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+        is_openai = isinstance(_provider, OpenAIProvider)
         return {
             "fallback_mode": state.fallback_mode,
             "auto_install_dependencies": state.auto_install_dependencies,
+            "request_api": _model_request_api(model_config) if is_openai else "",
+            "request_api_available": is_openai,
+            "request_api_model": _provider_model if is_openai else "",
         }
 
-    def set_settings(self, fallback_mode: bool, auto_install_dependencies: bool):
+    def set_settings(self, fallback_mode: bool, auto_install_dependencies: bool, request_api: str = "chat_completions"):
         try:
             config_path = os.path.join(PROJECT_ROOT, "config.json")
             config = load_config(config_path)
             config["fallback_mode"] = bool(fallback_mode)
             config["auto_install_dependencies"] = bool(auto_install_dependencies)
+            if isinstance(_provider, OpenAIProvider):
+                if request_api not in ("chat_completions", "responses"):
+                    return {"status": "error", "msg": "Invalid request API."}
+                provider_name = getattr(_provider, "name", "")
+                updated = False
+                for provider_config in config.get("providers", []):
+                    if provider_config.get("name", "") != provider_name:
+                        continue
+                    for model_index, entry in enumerate(provider_config.get("models", [])):
+                        name, model_config = _model_config(entry)
+                        if name != _provider_model:
+                            continue
+                        explicit = dict(model_config) if isinstance(entry, dict) else {"name": name}
+                        explicit["request_api"] = request_api
+                        provider_config["models"][model_index] = explicit
+                        updated = True
+                        break
+                    if updated:
+                        break
+                if not updated:
+                    return {"status": "error", "msg": "Selected model was not found in config.json."}
+                for provider_config in _providers_cfg:
+                    if provider_config.get("name", "") != provider_name:
+                        continue
+                    for model_index, entry in enumerate(provider_config.get("models", [])):
+                        name, model_config = _model_config(entry)
+                        if name == _provider_model:
+                            explicit = dict(model_config) if isinstance(entry, dict) else {"name": name}
+                            explicit["request_api"] = request_api
+                            provider_config["models"][model_index] = explicit
+                            break
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=4)
             state.fallback_mode = bool(fallback_mode)

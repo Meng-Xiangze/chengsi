@@ -97,6 +97,68 @@ class OpenAIProvider(BaseProvider):
         return prepared
 
     @staticmethod
+    def _responses_input(messages: list[dict]) -> list[dict]:
+        """Convert Chat Completions history into Responses API input items."""
+        items: list[dict] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "tool":
+                items.append({
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": str(content or ""),
+                })
+                continue
+            if role == "assistant" and message.get("tool_calls"):
+                if content:
+                    items.append({"role": "assistant", "content": str(content)})
+                for call in message.get("tool_calls") or []:
+                    function = call.get("function") or {}
+                    arguments = function.get("arguments", "{}")
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii=False, default=str)
+                    items.append({
+                        "type": "function_call",
+                        "call_id": call.get("id", ""),
+                        "name": function.get("name", ""),
+                        "arguments": arguments,
+                    })
+                continue
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "text":
+                        parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+                    elif part.get("type") == "image_url":
+                        image_url = part.get("image_url", {})
+                        url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+                        if url:
+                            parts.append({"type": "input_image", "image_url": url})
+                items.append({"role": role, "content": parts})
+            else:
+                items.append({"role": role, "content": str(content or "")})
+        return items
+
+    @staticmethod
+    def _responses_tools(tool_defs: list[dict] | None) -> list[dict] | None:
+        """Flatten Chat Completions function definitions for Responses API."""
+        converted = []
+        for definition in tool_defs or []:
+            function = definition.get("function") or {}
+            if definition.get("type") != "function" or not function.get("name"):
+                continue
+            converted.append({
+                "type": "function",
+                "name": function["name"],
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {"type": "object", "properties": {}}),
+            })
+        return converted or None
+
+    @staticmethod
     def _finish_tool_calls(parts: dict[int, dict]) -> list[dict]:
         calls = []
         for index in sorted(parts):
@@ -172,28 +234,44 @@ class OpenAIProvider(BaseProvider):
 
     def chat_stream(self, model: str, messages: list[dict], tool_defs=None, **kwargs):
         fallback_mode = bool(kwargs.get("fallback_mode", False))
+        request_api = kwargs.get("request_api", "chat_completions")
+        if request_api not in ("chat_completions", "responses"):
+            request_api = "chat_completions"
         prepared_messages = self.prepare_messages(messages, kwargs.get("supports_vision", True))
         if fallback_mode:
-            prepared_messages = [{
-                "role": "user",
-                "content": json.dumps({"messages": prepared_messages}, ensure_ascii=False, default=str),
-            }]
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": prepared_messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tool_defs and not fallback_mode:
-            payload["tools"] = tool_defs
-            payload["tool_choice"] = "auto"
+            bundle = json.dumps({"messages": prepared_messages}, ensure_ascii=False, default=str)
+            prepared_messages = [{"role": "user", "content": bundle}]
+
+        if request_api == "responses":
+            payload: dict[str, Any] = {
+                "model": model,
+                "input": self._responses_input(prepared_messages),
+                "stream": True,
+            }
+            response_tools = self._responses_tools(tool_defs) if not fallback_mode else None
+            if response_tools:
+                payload["tools"] = response_tools
+                payload["tool_choice"] = "auto"
+            endpoint = "/responses"
+        else:
+            payload = {
+                "model": model,
+                "messages": prepared_messages,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if tool_defs and not fallback_mode:
+                payload["tools"] = tool_defs
+                payload["tool_choice"] = "auto"
+            endpoint = "/chat/completions"
 
         external_cancel = kwargs.get("cancel_event")
         self._cancel_event.clear()
         tool_parts: dict[int, dict] = {}
+        response_tool_indexes: dict[str, int] = {}
         try:
             response = self.http.post(
-                f"{self._base_url}/chat/completions",
+                f"{self._base_url}{endpoint}",
                 headers=self._headers,
                 json=payload,
                 timeout=(8, 300),
@@ -213,6 +291,56 @@ class OpenAIProvider(BaseProvider):
                 except json.JSONDecodeError as error:
                     yield "error", f"Provider returned malformed SSE JSON: {error}"
                     continue
+
+                if request_api == "responses":
+                    event_type = chunk.get("type", "")
+                    if event_type == "response.output_text.delta" and chunk.get("delta"):
+                        yield "content", chunk["delta"]
+                    elif event_type in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta") and chunk.get("delta"):
+                        yield "thinking", chunk["delta"]
+                    elif event_type == "response.output_item.added":
+                        item = chunk.get("item") or {}
+                        if item.get("type") == "function_call":
+                            key = str(item.get("id") or item.get("call_id") or chunk.get("output_index", len(tool_parts)))
+                            index = int(chunk.get("output_index", len(tool_parts)))
+                            response_tool_indexes[key] = index
+                            tool_parts[index] = {
+                                "id": item.get("call_id") or item.get("id") or f"call_{index:02d}",
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", ""),
+                            }
+                    elif event_type == "response.function_call_arguments.delta":
+                        key = str(chunk.get("item_id") or chunk.get("call_id") or chunk.get("output_index", 0))
+                        index = response_tool_indexes.get(key, int(chunk.get("output_index", 0)))
+                        current = tool_parts.setdefault(index, {
+                            "id": chunk.get("call_id") or key,
+                            "name": chunk.get("name", ""),
+                            "arguments": "",
+                        })
+                        current["arguments"] += str(chunk.get("delta", ""))
+                    elif event_type == "response.output_item.done":
+                        item = chunk.get("item") or {}
+                        if item.get("type") == "function_call":
+                            index = int(chunk.get("output_index", 0))
+                            tool_parts[index] = {
+                                "id": item.get("call_id") or item.get("id") or f"call_{index:02d}",
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", ""),
+                            }
+                    elif event_type == "response.completed":
+                        usage = (chunk.get("response") or {}).get("usage") or {}
+                        if usage:
+                            input_tokens = usage.get("input_tokens", 0)
+                            output_tokens = usage.get("output_tokens", 0)
+                            yield "tokens", {
+                                "input": input_tokens, "output": output_tokens,
+                                "prompt": input_tokens, "eval": output_tokens, "actual": True,
+                            }
+                    elif event_type in ("response.failed", "error"):
+                        error = (chunk.get("response") or {}).get("error") or chunk.get("error") or chunk
+                        yield "error", f"Responses API failed: {json.dumps(error, ensure_ascii=False, default=str)[:1000]}"
+                    continue
+
                 usage = chunk.get("usage")
                 if usage:
                     input_tokens = usage.get("prompt_tokens", 0)
@@ -244,7 +372,6 @@ class OpenAIProvider(BaseProvider):
                         current["name"] += function["name"]
                     if function.get("arguments"):
                         current["arguments"] += function["arguments"]
-            # After loop, check cancel before using potentially incomplete tool_parts
             if self._cancel_event.is_set() or (external_cancel and external_cancel.is_set()):
                 yield "cancelled", None
                 return
