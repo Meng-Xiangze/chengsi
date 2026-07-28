@@ -64,6 +64,8 @@ class AgentState:
         self.show_thinking: bool = True
         self.theme: str = "day"
         self.parallel_tools: bool = False
+        self.fallback_mode: bool = False
+        self.auto_install_dependencies: bool = False
         self.interface_mode: str = "web"
         self.current_session_id: str = ""
         self.knowledge_base = None
@@ -847,7 +849,9 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
     for msg in previous:
         role = msg.get("role")
         if role == "user":
-            cleaned.append(msg)
+            content = str(msg.get("content", ""))
+            if not content.startswith("[TURN_PROCESS_SUMMARY]"):
+                cleaned.append(msg)
         elif role == "assistant":
             has_tool_calls = bool(msg.get("tool_calls"))
             has_content = bool(msg.get("content"))
@@ -927,14 +931,44 @@ def _append_knowledge_context(messages: list[dict], context: str) -> list[dict]:
     return updated
 
 
-def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None):
+def _summarize_turn_process(provider, model: str, tool_records: list[dict], cancel_event, supports_vision: bool) -> str:
+    """Compress current-turn exploration for the next inner model step only."""
+    if not tool_records or cancel_event.is_set():
+        return ""
+    source = json.dumps(tool_records, ensure_ascii=False, default=str)
+    prompt = (
+        "Summarize this current-turn tool exploration for the next agent step. "
+        "Record only concrete findings, changed files, failures, unresolved questions, and the next useful action. "
+        "Do not expose hidden reasoning and do not add facts. Return concise plain text.\n\n" + source[-30000:]
+    )
+    summary = ""
+    try:
+        stream = provider.chat_stream(
+            model,
+            [{"role": "system", "content": "You create short-lived factual agent handoff notes."},
+             {"role": "user", "content": prompt}],
+            tool_defs=None,
+            supports_vision=supports_vision,
+            cancel_event=cancel_event,
+        )
+        for kind, chunk in _iter_stream_with_cancel(stream, cancel_event):
+            if kind == "content":
+                summary += str(chunk)
+            elif kind in ("error", "cancelled"):
+                return ""
+    except Exception:
+        return ""
+    return summary.strip()[:6000]
+
+
+def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None, fallback_mode: bool = False):
     sd = state.get(session_id)
     if sd is None or sd.cancel.is_set():
         return
 
     model_config = model_config or {}
-    native_tools = _is_native(provider, model_config)
-    turn_tools = _turn_tools(available_tools, sd.messages)
+    native_tools = _is_native(provider, model_config) and not fallback_mode
+    turn_tools = _turn_tools(available_tools, sd.messages) if not fallback_mode else {}
     tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
     # Refresh on every turn so model switches, reloads, and legacy sessions use
     # the protocol and tool catalog for the active model.
@@ -954,6 +988,8 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
         max_tool_calls=_MAX_TOOL_CALLS,
     )
     runtime.active = True
+    turn_tool_records: list[dict] = []
+    turn_process_summary = ""
 
     def persist_runtime_snapshot() -> None:
         sd.runtime_snapshot = runtime.snapshot()
@@ -1035,10 +1071,15 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             stream_error = None
 
             request_messages = _build_request_messages(sd.messages)
+            if turn_process_summary:
+                request_messages.append({
+                    "role": "user",
+                    "content": "[TURN_PROCESS_SUMMARY]\n" + turn_process_summary + "\nThis note expires when the current user turn ends.",
+                })
             if kb_context:
                 request_messages = _append_knowledge_context(request_messages, kb_context)
 
-            stream_gen = provider.chat_stream(model, request_messages, tool_defs=tool_defs, supports_vision=supports_vision, cancel_event=sd.cancel)
+            stream_gen = provider.chat_stream(model, request_messages, tool_defs=tool_defs, supports_vision=supports_vision, cancel_event=sd.cancel, fallback_mode=fallback_mode)
             for kind, chunk in _iter_stream_with_cancel(stream_gen, sd.cancel):
                 if kind == "error":
                     stream_error = chunk
@@ -1174,15 +1215,22 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         "content": outcome.for_model(),
                     }, supports_vision=supports_vision)
                     sd.messages.append(tool_msg)
+                    turn_tool_records.append({
+                        "tool": tc["action"],
+                        "arguments": tc["arguments"],
+                        "ok": outcome.ok,
+                        "result": visible_result[:8000],
+                    })
 
                 if stop_reason:
                     message = f"Agent stopped safely: {stop_reason}"
                     sd.messages.append({"role": "assistant", "content": message})
                     _emit("agent_done", message, session_id=session_id)
                     return
+                turn_process_summary = _summarize_turn_process(
+                    provider, model, turn_tool_records, sd.cancel, supports_vision
+                )
                 continue
-
-            # ── FINAL ANSWER ──
             if runtime.can_request_verification():
                 runtime.mark_verification_reminder()
                 sd.messages.append({
@@ -1344,6 +1392,26 @@ class WebAPI:
     def get_theme(self):
         return {"theme": state.theme}
 
+    def get_settings(self):
+        return {
+            "fallback_mode": state.fallback_mode,
+            "auto_install_dependencies": state.auto_install_dependencies,
+        }
+
+    def set_settings(self, fallback_mode: bool, auto_install_dependencies: bool):
+        try:
+            config_path = os.path.join(PROJECT_ROOT, "config.json")
+            config = load_config(config_path)
+            config["fallback_mode"] = bool(fallback_mode)
+            config["auto_install_dependencies"] = bool(auto_install_dependencies)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+            state.fallback_mode = bool(fallback_mode)
+            state.auto_install_dependencies = bool(auto_install_dependencies)
+            return {"status": "ok", **self.get_settings()}
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": f"Could not save settings: {exc}"}
+
     def get_parallel_tools(self):
         return {"parallel_tools": state.parallel_tools}
 
@@ -1496,12 +1564,14 @@ class WebAPI:
         turn_model = _provider_model
         turn_model_config = _get_provider_model_capabilities(_providers_cfg, turn_provider, turn_model)
 
+        turn_fallback_mode = state.fallback_mode
+
         def worker():
             completed = False
             sd._active_provider = turn_provider
             try:
                 sd.processing = True
-                process_agent_turn(turn_provider, turn_model, _available_tools, _tool_manager, session_id=sid, model_config=turn_model_config)
+                process_agent_turn(turn_provider, turn_model, _available_tools, _tool_manager, session_id=sid, model_config=turn_model_config, fallback_mode=turn_fallback_mode)
                 completed = True
             except Exception as e:
                 import traceback
@@ -1935,6 +2005,8 @@ def main():
     state.show_thinking = config.get("show_thinking", True)
     state.theme = config.get("theme", "day")
     state.parallel_tools = config.get("parallel_tools", False)
+    state.fallback_mode = config.get("fallback_mode", False)
+    state.auto_install_dependencies = config.get("auto_install_dependencies", False)
     if state.theme not in ("day", "night"):
         state.theme = "day"
     state.interface_mode = "web"

@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.4.0**
+**Version 0.4.2**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -11,12 +11,15 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - Local desktop chat interface powered by `pywebview`
 - Local Ollama and OpenAI-compatible model providers
 - Native function calling for all models — no text-based tool protocols
-- 11 discoverable tools: read (text, PDF, DOCX, images, code search), write, edit, bash, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
+- 13 discoverable tools: read (text, CSV, XLSX, PDF, DOCX, images, code search), write, edit, bash, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
 - SQLite FTS5 local knowledge base with user-managed search, ingest, list, and remove operations
 - Persistent conversations and generated media
 - Image generation through a configured image-capable model
 - PDF and DOCX reading with dual text/visual modes — vision models can see rendered pages
 - DOCX creation with Markdown-like formatting syntax
+- CSV/XLSX reading, creation, and exact-cell editing through the standard file tools
+- One-turn process summaries preserve factual exploration across inner tool loops and expire before the next user turn
+- User-controlled text-only fallback requests and optional automatic pip installation in Settings
 - Day and night themes
 - Optional parallel tool execution — run independent tools concurrently
 - **Qwen/Ollama thinking safety net**: when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native function calls (a known Ollama interaction), the provider automatically extracts and executes them — thinking stays on so the model keeps its full reasoning quality
@@ -129,6 +132,8 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
   "default_vision_model": "openai/gpt-5.6-sol",
   "default_image_model": "openai/gpt-image-2",
   "parallel_tools": false,
+  "fallback_mode": false,
+  "auto_install_dependencies": false,
   "show_thinking": true,
   "theme": "day"
 }
@@ -143,6 +148,8 @@ Chengsi reads `config.json` from the project root. The setup scripts create it f
 | `default_image_model` | string | `provider/model` identifier used by the `image_generator` tool. |
 | `show_thinking` | boolean | Shows model reasoning/status events in a collapsed UI section when available. |
 | `parallel_tools` | boolean | When true, independent tool calls from a single assistant response execute concurrently. Default: `false`. |
+| `fallback_mode` | boolean | Sends the request as one text-only JSON bundle and disables tools. Use manually after a provider rejects structured messages. Default: `false`. |
+| `auto_install_dependencies` | boolean | Allows optional features to run `python -m pip install` when their module is missing. Default: `false`. |
 | `theme` | string | Initial interface theme: `day` or `night`. |
 
 ### Provider Fields
@@ -224,9 +231,9 @@ WebView API and agent loop (main.py)
         +--> Tool manager (core/tool_manager.py)
         |      +--> 11 auto-discovered tools in tools/
         |      +--> image_generator, bash, python_executor
-        |      +--> read (text, PDF, DOCX, images, search)
-        |      +--> write (text + formatted DOCX)
-        |      +--> edit (surgical text + DOCX editing)
+        |      +--> read (text, CSV, XLSX, PDF, DOCX, images, search)
+        |      +--> write (text, CSV, XLSX + formatted DOCX)
+        |      +--> edit (surgical text/DOCX + exact spreadsheet cells)
         |
         +--> Knowledge base (core/knowledge_base.py -> SQLite FTS5)
         |
@@ -238,7 +245,7 @@ WebView API and agent loop (main.py)
 1. The WebUI sends a user message through the `pywebview` bridge in `main.py`.
 2. `main.py` selects the configured provider and builds the system prompt and tool definitions.
 3. The provider streams text, reasoning events, or structured tool calls via native function calling.
-4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. Results are returned to the model when another model step is needed.
+4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. After tool batches, a short-lived model summary records concrete exploration for the next inner step and is removed before the next user turn.
 5. Final responses and UI events are saved by `SessionManager`.
 6. Knowledge searches use the local SQLite FTS5 index and are explicitly invoked through the knowledge-base tool.
 7. Generated images are moved into a session-specific directory under `media/` and rendered directly in the WebUI.
@@ -266,7 +273,7 @@ Chengsi automatically discovers tools from Python files in the `tools/` director
 
 | Category | Tools |
 | --- | --- |
-| File I/O | `read` — text, PDF, DOCX, images, code search. `write` — create/overwrite files + formatted DOCX. `edit` — precise text replacement. `ls` — directory listing. |
+| File I/O | `read` — text, CSV, XLSX, PDF, DOCX, images, code search. `write` — create/overwrite text, CSV, XLSX, and formatted DOCX. `edit` — precise text/DOCX edits and exact-cell spreadsheet replacement. `ls` — directory listing. |
 | Execution | `bash` — shell commands (file ops, git, pip). `python_executor` — Python for multi-step logic and data processing. |
 | Web | `web_searcher` — DuckDuckGo search. `web_reader` — fetch and extract web page content. |
 | Project | `project_test` — syntax, import, and unittest checks. `system_cleaner` — preview/clean temp files and caches. |

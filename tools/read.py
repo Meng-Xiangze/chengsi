@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Unified file reader — text, images, code search. One tool, all inspection."""
+"""Unified file reader — text, spreadsheets, images, code search. One tool, all inspection."""
 import base64
 import mimetypes
 import os
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from tools._hashline import anchor
+from tools._spreadsheet import read_csv, read_xlsx
 from tools.base import BaseTool
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,7 +35,7 @@ class Read(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read file contents — text, PDF, images, or search code. "
+            "Read file contents — text, CSV, XLSX, PDF, DOCX, images, or search code. "
             "For text/PDF, use offset/limit to paginate. "
             "For images, returns metadata and auto-injects the image for visual analysis. "
             "For search, returns matching lines with file paths, line numbers, and context. "
@@ -46,7 +47,7 @@ class Read(BaseTool):
         return {
             "path": {
                 "type": "string",
-                "description": "File path to read (text or image). Required for text/image mode.",
+                "description": "File path to read (text, CSV, XLSX, PDF, DOCX, or image). Required for file mode.",
             },
             "query": {
                 "type": "string",
@@ -54,11 +55,11 @@ class Read(BaseTool):
             },
             "offset": {
                 "type": "integer",
-                "description": "For text: line number (1-indexed). For PDF: page number (1-indexed). For DOCX: paragraph number (1-indexed).",
+                "description": "Start line, spreadsheet row, PDF page, or DOCX paragraph (1-indexed).",
             },
             "limit": {
                 "type": "integer",
-                "description": "For text: max lines (default 200). For PDF: max pages (default 1). For DOCX: max paragraphs (default 50). For search: max results (default 20).",
+                "description": "Max lines/spreadsheet rows (default 200), PDF pages (1), DOCX paragraphs (50), or search results (20).",
             },
             "ext": {
                 "type": "string",
@@ -98,6 +99,10 @@ class Read(BaseTool):
             return f"Error: file not found: {raw_path}"
 
         ext = resolved.suffix.lower()
+        if ext == ".csv":
+            return read_csv(resolved, args.get("offset", 1), args.get("limit", 200))
+        if ext == ".xlsx":
+            return read_xlsx(resolved, args.get("offset", 1), args.get("limit", 200))
         if ext in _IMAGE_EXTS:
             return self._read_image(resolved, args)
         if ext == ".pdf":

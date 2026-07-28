@@ -1,4 +1,5 @@
 requests>=2.31,<3
+openpyxl>=3.1,<4
 PyYAML>=6.0,<7
 pywebview>=5.0,<7
 Pillow>=10.0,<12

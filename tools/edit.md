@@ -1,6 +1,6 @@
 ---
 name: edit
-description: "Precise surgical edits — replace, insert, delete, prepend, append with exact-text anchors"
+description: "Precise surgical edits for text/DOCX plus exact-cell replacement in CSV/XLSX"
 parameters:
   path: {type: string, description: "File path to edit"}
   edits:
@@ -28,7 +28,7 @@ usage_notes:
 
 # edit
 
-Precise file editing with exact-text anchors. Supports replace, insert, delete, prepend, append operations on both text files and .docx.
+Precise file editing with exact-text anchors. Supports replace, insert, delete, prepend, append operations on text and DOCX files. For CSV/XLSX, `oldText` must match exactly one complete cell and `replace`/`delete` are supported.
 
 ## Text file operations
 

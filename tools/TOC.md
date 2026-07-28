@@ -1,9 +1,9 @@
 # Available Tools
 
 ## File I/O
-- `read`: Read text, PDF, DOCX, images, or search code — unified inspector.
-- `write`: Create/overwrite text files or formatted DOCX (Markdown-like syntax).
-- `edit`: Precise text replacement (oldText→newText) with insert/delete/prepend/append ops.
+- `read`: Read text, CSV, XLSX, PDF, DOCX, images, or search code — unified inspector.
+- `write`: Create/overwrite text, CSV, XLSX, or formatted DOCX files.
+- `edit`: Precise text/DOCX edits plus exact-cell CSV/XLSX replacement.
 - `ls`: List directory contents with file sizes and types.
 
 ## Execution

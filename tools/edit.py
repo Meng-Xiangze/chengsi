@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool
+from tools._spreadsheet import edit_csv, edit_xlsx
 
 _VALID_OPS = {"replace", "delete", "insert_before", "insert_after", "prepend", "append"}
 _OP_ALIASES = {"add_before": "insert_before", "add_after": "insert_after", "remove": "delete"}
@@ -28,6 +29,7 @@ class Edit(BaseTool):
             "Precise file editing with exact-text anchors. "
             "Operations: replace (default), insert_before, insert_after, delete, prepend, append. "
             "Aliases: remove=delete, add_before=insert_before, add_after=insert_after. "
+            "For CSV/XLSX: oldText must match one complete cell and replace/delete edits are supported. "
             "For .docx: matches paragraph text; newText supports **bold** *italic* ^super^ _sub_ "
             "{size:N} {color:...} markers. "
             "Multiple edits applied atomically; overlapping edits rejected."
@@ -47,6 +49,7 @@ class Edit(BaseTool):
                     "op defaults to 'replace'. prepend/append need no oldText. "
                     "delete needs no newText. "
                     "oldText must be unique and non-overlapping. "
+                    "For CSV/XLSX: oldText matches one complete cell; use replace or delete. "
                     "For .docx: oldText matches paragraph text."
                 ),
                 "items": {
@@ -117,8 +120,11 @@ class Edit(BaseTool):
         try:
             if ext == ".docx":
                 return self._edit_docx(path, edits)
-            else:
-                return self._edit_text(path, edits, rev)
+            if ext == ".csv":
+                return edit_csv(path, edits)
+            if ext == ".xlsx":
+                return edit_xlsx(path, edits)
+            return self._edit_text(path, edits, rev)
         except Exception as exc:
             return f"Error editing {path}: {exc}"
 

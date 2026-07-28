@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool
+from tools._spreadsheet import write_csv, write_xlsx
 
 
 class Write(BaseTool):
@@ -19,7 +20,8 @@ class Write(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Create a new file or overwrite an existing file. "
+            "Create a new file or overwrite an existing file. CSV content uses standard comma-separated rows; "
+            "XLSX content uses CSV rows and optional [Sheet: name] sections. "
             "For .docx files, uses a Markdown-like syntax supporting **bold**, "
             "*italic*, ^superscript^, _subscript_, {size:N}, {color:...}, "
             "headings, lists, images, and tables."
@@ -35,7 +37,8 @@ class Write(BaseTool):
             "content": {
                 "type": "string",
                 "description": (
-                    "Complete file content. For .docx: Markdown-like syntax — "
+                    "Complete file content. For CSV: comma-separated rows. For XLSX: CSV rows with optional "
+                    "[Sheet: name] sections. For .docx: Markdown-like syntax — "
                     "**bold** *italic* ^super^ _sub_  {size:18}big{/size}  {color:red}red{/color}  "
                     "#heading  -bullet  1.numbered  |table|rows|  ![](image)"
                 ),
@@ -62,8 +65,11 @@ class Write(BaseTool):
         try:
             if ext == ".docx":
                 return self._write_docx(path, content)
-            else:
-                return self._write_text(path, content)
+            if ext == ".csv":
+                return write_csv(path, content)
+            if ext == ".xlsx":
+                return write_xlsx(path, content)
+            return self._write_text(path, content)
         except Exception as e:
             return f"Error writing {path}: {e}"
 

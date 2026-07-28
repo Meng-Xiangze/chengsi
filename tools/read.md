@@ -1,8 +1,8 @@
 ---
 name: read
-description: "Read text files, PDFs, DOCX, view images, or search code — one unified inspector"
+description: "Read text, CSV, XLSX, PDF, DOCX, images, or search code — one unified inspector"
 parameters:
-  path: {type: string, description: "File path to read (text, PDF, DOCX, or image). For search: optional root directory."}
+  path: {type: string, description: "File path to read (text, CSV, XLSX, PDF, DOCX, or image). For search: optional root directory."}
   query: {type: string, description: "Search query — activates code search mode"}
   offset: {type: integer, description: "Start line/page/paragraph (1-indexed)"}
   limit: {type: integer, description: "Max lines(200)/pages(1)/paragraphs(50)/results(20)"}
@@ -13,6 +13,8 @@ parameters:
 examples:
   - {query: "def run", glob: "*.py", limit: 5, note: "Search with glob"}
   - {query: "TODO", path: "src/", case_sensitive: true, note: "Case-sensitive search in dir"}
+  - {path: data.xlsx, offset: 1, limit: 50, note: "Read spreadsheet rows from every sheet"}
+  - {path: data.csv, offset: 1, limit: 50, note: "Read CSV rows"}
   - {path: paper.pdf, offset: 1, note: "PDF page 1 as text"}
   - {path: report.docx, offset: 1, limit: 20, note: "DOCX paragraphs 1-20"}
 usage_notes:
@@ -33,6 +35,7 @@ One tool for all file inspection and code search.
 |--------|-----------|
 | Read text | `path` |
 | Read image | `path` (jpg/png/gif/webp/bmp) |
+| Read CSV/XLSX | `path` ± `offset`/`limit` rows |
 | Read PDF | `path` ± `offset`/`limit` pages |
 | Read DOCX | `path` ± `offset`/`limit` paragraphs |
 | Search code | `query` ± `glob`/`ext`/`case_sensitive` |

@@ -6,6 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-28
+
+### Added
+
+- **CSV/XLSX file tools**: `read`, `write`, and `edit` now support `.csv` and `.xlsx`. Reads paginate spreadsheet rows and label worksheets; writes accept CSV-style rows plus optional `[Sheet: name]` sections; edits replace or delete a value only when `oldText` identifies exactly one complete cell.
+- **One-turn process summaries**: after each tool batch, Chengsi can call the active model to produce a concise factual handoff containing findings, changed files, failures, unresolved questions, and the next action. The note is available only to subsequent inner steps of the same user turn and is filtered before the next user message, so it does not become permanent context.
+- **Manual fallback request mode**: Settings now provides a fallback switch for provider compatibility incidents. While enabled, the current request disables tools and sends the prepared conversation as one JSON bundle inside a single text-only user message; no provider-error text parsing is performed.
+- **Dependency installation preference**: Settings and `config.json` now expose `auto_install_dependencies` (default `false`). Optional spreadsheet support may run `python -m pip install openpyxl` when enabled; otherwise the tool returns an explicit installation instruction.
+- Added `openpyxl` to standard requirements for first-party XLSX support.
+
+### Changed
+
+- Updated the WebUI settings dialog, example configuration, README architecture/configuration/tool tables, and tool Markdown catalog for the new modes.
+
+### Files changed
+
+- `main.py` — settings state/API, one-turn summary lifecycle, fallback-mode routing.
+- `core/index.html` — Settings dialog and fallback/dependency toggles.
+- `core/openai_provider.py` — text-only JSON-bundle fallback payload.
+- `core/ollama_provider.py` — text-only JSON-bundle fallback payload.
+- `tools/_spreadsheet.py` — shared CSV/XLSX read, write, edit, and optional dependency helpers.
+- `tools/read.py`, `tools/write.py`, `tools/edit.py` — spreadsheet dispatch and schemas.
+- `tools/read.md`, `tools/write.md`, `tools/edit.md`, `tools/TOC.md` — tool documentation.
+- `requirements.txt`, `config.example.json`, `README.md`, `CHANGELOG.md` — dependency, settings, user documentation, and release notes.
+
 ## [0.4.1] - 2026-07-27
 
 ### Changed

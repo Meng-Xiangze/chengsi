@@ -116,8 +116,15 @@ class OllamaProvider(BaseProvider):
     def chat_stream(self, model: str, messages: list[dict], tool_defs=None, **kwargs):
         base_url = self.config.get("base_url", "http://localhost:11434/api")
         url = f"{base_url.rstrip('/')}/chat"
-        payload = {"model": model, "messages": self.prepare_messages(messages), "stream": True}
-        if tool_defs:
+        fallback_mode = bool(kwargs.get("fallback_mode", False))
+        prepared_messages = self.prepare_messages(messages)
+        if fallback_mode:
+            prepared_messages = [{
+                "role": "user",
+                "content": json.dumps({"messages": prepared_messages}, ensure_ascii=False, default=str),
+            }]
+        payload = {"model": model, "messages": prepared_messages, "stream": True}
+        if tool_defs and not fallback_mode:
             payload["tools"] = self._convert_tool_defs(tool_defs)
         # Explicitly enable thinking — Ollama defaults to true for Qwen but being
         # explicit avoids any version-specific default changes.

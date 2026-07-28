@@ -58,6 +58,8 @@
   "default_vision_model": "",
   "default_image_model": "",
   "parallel_tools": false,
+  "fallback_mode": false,
+  "auto_install_dependencies": false,
   "show_thinking": true,
   "theme": "day"
 }

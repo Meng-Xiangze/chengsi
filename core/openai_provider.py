@@ -171,13 +171,20 @@ class OpenAIProvider(BaseProvider):
             yield "".join(fragments)
 
     def chat_stream(self, model: str, messages: list[dict], tool_defs=None, **kwargs):
+        fallback_mode = bool(kwargs.get("fallback_mode", False))
+        prepared_messages = self.prepare_messages(messages, kwargs.get("supports_vision", True))
+        if fallback_mode:
+            prepared_messages = [{
+                "role": "user",
+                "content": json.dumps({"messages": prepared_messages}, ensure_ascii=False, default=str),
+            }]
         payload: dict[str, Any] = {
             "model": model,
-            "messages": self.prepare_messages(messages, kwargs.get("supports_vision", True)),
+            "messages": prepared_messages,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if tool_defs:
+        if tool_defs and not fallback_mode:
             payload["tools"] = tool_defs
             payload["tool_choice"] = "auto"
 
