@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unified file reader — text, spreadsheets, images, code search. One tool, all inspection."""
+import ast
 import base64
 import mimetypes
 import os
@@ -8,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from tools._hashline import anchor
+from tools._hashline import anchor, format_lines, revision
 from tools._spreadsheet import read_csv, read_xlsx
 from tools.base import BaseTool
 
@@ -36,6 +37,8 @@ class Read(BaseTool):
     def description(self) -> str:
         return (
             "Read file contents — text, CSV, XLSX, PDF, DOCX, images, or search code. "
+            "For Python code, mode=outline lists symbols and mode=symbol returns one complete symbol. "
+            "Text output includes a revision and stable LINE:HASH anchors for edit operations. "
             "For text/PDF, use offset/limit to paginate. "
             "For images, returns metadata and auto-injects the image for visual analysis. "
             "For search, returns matching lines with file paths, line numbers, and context. "
@@ -75,7 +78,12 @@ class Read(BaseTool):
             },
             "mode": {
                 "type": "string",
-                "description": "For PDF/DOCX: 'text' (default, extract characters) or 'visual' (render as image — use with vision models to read tables, formulas, figures).",
+                "enum": ["text", "visual", "outline", "symbol"],
+                "description": "text (default); visual for PDF/DOCX; outline or symbol for Python source.",
+            },
+            "symbol": {
+                "type": "string",
+                "description": "Qualified Python symbol for mode=symbol, e.g. AgentRuntime.observe.",
             },
         }
 
@@ -109,6 +117,11 @@ class Read(BaseTool):
             return self._read_pdf(resolved, args)
         if ext == ".docx":
             return self._read_docx(resolved, args)
+        mode = str(args.get("mode", "text")).strip().lower()
+        if mode in ("outline", "symbol"):
+            if ext != ".py":
+                return f"Error: mode={mode} currently supports Python (.py) files only."
+            return self._read_python(resolved, args, mode)
         return self._read_text(resolved, args)
 
     # ------------------------------------------------------------------ #
@@ -840,17 +853,75 @@ class Read(BaseTool):
         return result
 
     # ------------------------------------------------------------------ #
+    #  Read: Python structure
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _python_symbols(tree: ast.AST) -> list[tuple[str, ast.AST]]:
+        symbols: list[tuple[str, ast.AST]] = []
+
+        def visit(body: list[ast.stmt], prefix: str = "") -> None:
+            for node in body:
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = f"{prefix}.{node.name}" if prefix else node.name
+                    symbols.append((name, node))
+                    if isinstance(node, ast.ClassDef):
+                        visit(node.body, name)
+
+        visit(getattr(tree, "body", []))
+        return symbols
+
+    @staticmethod
+    def _read_python(filepath: Path, args: dict[str, Any], mode: str) -> str:
+        try:
+            with open(filepath, encoding="utf-8-sig", newline="") as handle:
+                text = handle.read()
+            tree = ast.parse(text, filename=str(filepath))
+        except (OSError, UnicodeError, SyntaxError) as exc:
+            return f"Error parsing Python file {filepath}: {exc}"
+
+        symbols = Read._python_symbols(tree)
+        rel = Read._relpath(filepath)
+        if mode == "outline":
+            output = [f"[python outline: {rel} rev: {revision(text)}]"]
+            for name, node in symbols:
+                kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                if isinstance(node, ast.AsyncFunctionDef):
+                    kind = "async function"
+                output.append(
+                    f"{kind} {name} lines {node.lineno}-{getattr(node, 'end_lineno', node.lineno)}"
+                )
+            if len(output) == 1:
+                output.append("[no classes or functions]")
+            return "\n".join(output)
+
+        requested = str(args.get("symbol", "")).strip()
+        if not requested:
+            return "Error: symbol is required when mode=symbol."
+        matches = [(name, node) for name, node in symbols if name == requested]
+        if not matches and "." not in requested:
+            matches = [(name, node) for name, node in symbols if name.rsplit(".", 1)[-1] == requested]
+        if len(matches) != 1:
+            candidates = ", ".join(name for name, _ in matches[:10]) or "none"
+            return f"Error: symbol {requested!r} matched {len(matches)} definitions ({candidates})."
+        name, node = matches[0]
+        start = node.lineno
+        end = getattr(node, "end_lineno", start)
+        return f"[python symbol: {name}]\n" + format_lines(text, rel, start, end - start + 1)
+
+    # ------------------------------------------------------------------ #
     #  Read: text
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def _read_text(filepath: Path, args: dict[str, Any]) -> str:
         try:
-            with open(filepath, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            with open(filepath, encoding="utf-8-sig", errors="replace", newline="") as handle:
+                text = handle.read()
         except OSError as e:
             return f"Error reading {filepath}: {e}"
 
+        lines = text.splitlines(keepends=True)
         total = len(lines)
         offset_raw = args.get("offset")
         if offset_raw is not None:
@@ -874,15 +945,8 @@ class Read(BaseTool):
         if start >= total:
             return f"Error: offset {offset} exceeds file length ({total} lines)."
 
-        out_lines: list[str] = []
         rel = Read._relpath(filepath)
-        out_lines.append(f"📄 {rel}  (lines {start + 1}–{end} of {total})")
-
-        for i in range(start, end):
-            line = lines[i]
-            out_lines.append(f"{anchor(i + 1, line.rstrip())}|{line.rstrip()}")
-
-        result = "\n".join(out_lines)
+        result = format_lines(text, rel, start + 1, end - start)
 
         # Truncate if too large (pi-style: 50KB cap)
         if len(result.encode("utf-8")) > 50_000:

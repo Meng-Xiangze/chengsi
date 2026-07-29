@@ -12,7 +12,8 @@ env/
 # Private runtime data
 config.json
 sessions/
-knowledge/
+knowledge/*
+!knowledge/.gitkeep
 media/
 
 # IDE

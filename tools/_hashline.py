@@ -7,7 +7,11 @@ import re
 from dataclasses import dataclass
 
 
-_REF_PATTERN = re.compile(r"^(?:(\d+):)?([0-9a-fA-F]{4})$")
+LINE_HASH_HEX_LENGTH = 16
+REVISION_HEX_LENGTH = 24
+_REF_PATTERN = re.compile(
+    rf"^(?:(\d+):)?([0-9a-fA-F]{{{LINE_HASH_HEX_LENGTH}}})$"
+)
 
 
 @dataclass(frozen=True)
@@ -18,11 +22,11 @@ class TextLayout:
 
 
 def line_hash(content: str) -> str:
-    return hashlib.blake2s(content.encode("utf-8"), digest_size=2).hexdigest()
+    return hashlib.blake2s(content.encode("utf-8"), digest_size=8).hexdigest()
 
 
 def revision(text: str) -> str:
-    return hashlib.blake2s(text.encode("utf-8"), digest_size=6).hexdigest()
+    return hashlib.blake2s(text.encode("utf-8"), digest_size=12).hexdigest()
 
 
 def anchor(line_number: int, content: str) -> str:
@@ -33,7 +37,11 @@ def parse_anchor(value: object) -> tuple[int | None, str]:
     """Parse anchor. Accepts 'LINE:HASH' or just 'HASH'."""
     match = _REF_PATTERN.fullmatch(str(value or "").strip())
     if not match:
-        raise ValueError(f"invalid anchor {value!r}; expected LINE:HASH or HASH, for example 12:a4f0 or a4f0")
+        example_hash = "a4f0c281b7169e2d"
+        raise ValueError(
+            f"invalid anchor {value!r}; expected LINE:HASH or HASH, "
+            f"for example 12:{example_hash} or {example_hash}"
+        )
     line_str = match.group(1)
     line_number = int(line_str) if line_str else None
     return line_number, match.group(2).lower()
@@ -54,11 +62,14 @@ def validate_anchor(lines: list[str], value: object) -> int:
             )
         return line_number - 1
 
-    # No line number: search by hash
-    for idx, line in enumerate(lines):
-        if line_hash(line) == expected_hash:
-            return idx
-
+    # A hash-only reference is accepted when it identifies exactly one line.
+    matches = [idx for idx, line in enumerate(lines) if line_hash(line) == expected_hash]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            f"hash {expected_hash} matches {len(matches)} lines; use the full LINE:HASH anchor"
+        )
     raise ValueError(
         f"hash {expected_hash} not found in file. Content may have changed. Re-read the file."
     )

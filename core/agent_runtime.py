@@ -159,6 +159,16 @@ class AgentRuntime:
         self.tool_calls += len(calls)
         return True, ""
 
+    def allow_each(self, calls: list[tuple[str, dict]]) -> list[tuple[bool, str]]:
+        """Admit each call independently so one duplicate does not reject its peers.
+
+        A rejected call is intentionally left out of the signature count. The
+        caller must return the rejection as a failed tool result and pass it to
+        ``observe``. This gives the model a chance to change approach while the
+        consecutive-failure guard still prevents an infinite retry loop.
+        """
+        return [self.allow(action, arguments) for action, arguments in calls]
+
     def observe(self, action: str, arguments: dict, outcome: ToolOutcome, tool=None) -> tuple[bool, str]:
         if outcome.ok:
             self.consecutive_failures = 0

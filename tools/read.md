@@ -1,42 +1,41 @@
 ---
 name: read
-description: "Read text, CSV, XLSX, PDF, DOCX, images, or search code — one unified inspector"
+description: "Read files, inspect Python symbols, or search code with stable edit anchors"
 parameters:
-  path: {type: string, description: "File path to read (text, CSV, XLSX, PDF, DOCX, or image). For search: optional root directory."}
-  query: {type: string, description: "Search query — activates code search mode"}
+  path: {type: string, description: "File path to read. For search: optional root directory."}
+  query: {type: string, description: "Search query or regex; activates search mode"}
   offset: {type: integer, description: "Start line/page/paragraph (1-indexed)"}
-  limit: {type: integer, description: "Max lines(200)/pages(1)/paragraphs(50)/results(20)"}
-  ext: {type: string, description: "File extension filter (e.g. .py)"}
-  glob: {type: string, description: "Glob pattern for search, overrides ext"}
+  limit: {type: integer, description: "Maximum lines/pages/paragraphs/results"}
+  ext: {type: string, description: "File extension filter for search"}
+  glob: {type: string, description: "File name glob for search; overrides ext"}
   case_sensitive: {type: boolean, description: "Case-sensitive search (default false)"}
-  mode: {type: string, description: "'text' (default) or 'visual' for PDF/DOCX"}
+  mode: {type: string, enum: [text, visual, outline, symbol], description: "Read mode"}
+  symbol: {type: string, description: "Qualified Python symbol for mode=symbol"}
 examples:
-  - {query: "def run", glob: "*.py", limit: 5, note: "Search with glob"}
-  - {query: "TODO", path: "src/", case_sensitive: true, note: "Case-sensitive search in dir"}
-  - {path: data.xlsx, offset: 1, limit: 50, note: "Read spreadsheet rows from every sheet"}
-  - {path: data.csv, offset: 1, limit: 50, note: "Read CSV rows"}
-  - {path: paper.pdf, offset: 1, note: "PDF page 1 as text"}
-  - {path: report.docx, offset: 1, limit: 20, note: "DOCX paragraphs 1-20"}
+  - {path: core/agent_runtime.py, mode: outline}
+  - {path: core/agent_runtime.py, mode: symbol, symbol: AgentRuntime.observe}
+  - {path: main.py, offset: 1000, limit: 120}
+  - {query: "def run", glob: "*.py", limit: 5}
+  - {path: paper.pdf, mode: visual, offset: 1}
 usage_notes:
-  - "Search: set query to activate. Use glob for file name filter, ext for extension, case_sensitive for exact case."
-  - "PDF text: PyMuPDF preferred; falls back to pypdf"
-  - "PDF/DOCX visual: renders at 200 DPI → vision models read tables/figures/formulas"
-  - "DOCX text: paragraphs + tables (pipe-delimited), embedded image count, formatting markers"
-  - "Auto-truncates at 50KB; use offset to paginate"
+  - "Text and symbol output includes a file revision and LINE:HASH anchors"
+  - "Use mode=outline before mode=symbol when the exact qualified name is unknown"
+  - "Copy revision and anchors exactly into edit; stale content is rejected"
+  - "PDF/DOCX visual mode renders pages for vision models"
 ---
 
 # read
 
-One tool for all file inspection and code search.
+Use `mode=outline` to inspect Python classes and functions without reading the whole file. Use
+`mode=symbol` with a qualified name such as `AgentRuntime.observe` to return one complete definition.
 
-## Modes
+Text output follows this protocol:
 
-| Action | Parameters |
-|--------|-----------|
-| Read text | `path` |
-| Read image | `path` (jpg/png/gif/webp/bmp) |
-| Read CSV/XLSX | `path` ± `offset`/`limit` rows |
-| Read PDF | `path` ± `offset`/`limit` pages |
-| Read DOCX | `path` ± `offset`/`limit` paragraphs |
-| Search code | `query` ± `glob`/`ext`/`case_sensitive` |
-| Search in dir | `query` + `path` + `glob` |
+```text
+[file: path rev: CONTENT_HASH lines: 100 showing: 20-30]
+[format: LINE:HASH|content; copy anchors exactly for edit operations]
+20:0123456789abcdef|def example():
+```
+
+The revision guards the complete file. Each line anchor guards the exact line content. Prefer these
+values for multiline edits instead of reproducing a large `oldText` string.

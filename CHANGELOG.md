@@ -4,6 +4,28 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
+## [0.4.6] - 2026-07-29
+
+### Added
+
+- **Python structure inspection**: `read` now supports `mode=outline` for a compact class/function map and `mode=symbol` for complete qualified definitions such as `AgentRuntime.observe`.
+- **Stable code edit operations**: `edit` now supports Python symbol replacement/deletion, inclusive hash-anchored ranges, and line-relative anchor insertion while retaining exact-text compatibility.
+- Deterministic tests for runtime duplicate-call recovery, circuit breaking, stale revisions and anchors, atomic edits, syntax rejection, duplicate symbols, UTF-8 BOM, and CRLF preservation.
+
+### Changed
+
+- Duplicate tool calls are returned to the model as structured failures instead of directly producing a fixed user-facing stop message. Independent calls in the same batch remain eligible to run.
+- Repeated failures still disable tools for the turn, but the model receives the complete blocker context and produces the final explanation without further tool access.
+- Text reads and edits now share one BLAKE2s revision/anchor protocol: 96-bit file revisions and 64-bit line hashes. Hash-only anchors must identify exactly one line.
+- Text edits validate all spans before an atomic replacement, preserve UTF-8 BOM and the dominant newline style, and parse Python output before writing.
+
+### Files changed
+
+- `core/agent_runtime.py`, `main.py` - per-call admission, model-visible failure recovery, and final no-tool blocker response.
+- `tools/_hashline.py`, `tools/read.py`, `tools/edit.py` - shared revisions, structural reads, stable edit operations, and atomic validation.
+- `tools/read.md`, `tools/edit.md`, `README.md` - updated model-facing and user-facing contracts.
+- `tests/test_agent_runtime.py`, `tests/test_code_tools.py` - runtime and code-tool regression coverage.
+
 ## [0.4.5] - 2026-07-28
 
 ### Changed

@@ -1,71 +1,42 @@
 ---
 name: edit
-description: "Precise surgical edits for text/DOCX plus exact-cell replacement in CSV/XLSX"
+description: "Atomically edit text with Python symbols, hash ranges, or short exact-text anchors"
 parameters:
   path: {type: string, description: "File path to edit"}
   edits:
     type: array
-    description: "List of {op, oldText, newText} objects."
+    description: "Non-overlapping edit operations applied atomically"
     items:
       properties:
-        op: {type: string, enum: [replace, insert_before, insert_after, delete, prepend, append], description: "Operation (default replace)"}
-        oldText: {type: string, description: "Unique anchor text (skip for prepend/append)"}
-        newText: {type: string, description: "Replacement or insert text (skip for delete)"}
-  revision: {type: string, description: "Optional content hash guard"}
+        op: {type: string, enum: [replace_symbol, delete_symbol, replace_range, delete_range, insert_before_anchor, insert_after_anchor, replace, delete, insert_before, insert_after, prepend, append]}
+        symbol: {type: string, description: "Qualified Python symbol for symbol operations"}
+        start: {type: string, description: "Inclusive start LINE:HASH anchor for range operations"}
+        end: {type: string, description: "Inclusive end LINE:HASH anchor for range operations"}
+        anchor: {type: string, description: "LINE:HASH anchor for anchored insertion"}
+        oldText: {type: string, description: "Short unique text for legacy text operations"}
+        newText: {type: string, description: "Replacement or inserted text"}
+  revision: {type: string, description: "Optional file revision from read; rejects stale edits"}
 examples:
+  - {path: app.py, revision: 0123456789abcdef01234567, edits: [{op: replace_symbol, symbol: App.run, newText: "    def run(self):\n        return True\n"}]}
+  - {path: app.py, revision: 0123456789abcdef01234567, edits: [{op: replace_range, start: "20:0123456789abcdef", end: "24:fedcba9876543210", newText: "replacement\n"}]}
   - {path: config.py, edits: [{oldText: "DEBUG = True", newText: "DEBUG = False"}]}
-  - {path: app.py, edits: [{op: insert_after, oldText: "import sys\n", newText: "import os\n"}]}
-  - {path: README.md, edits: [{op: prepend, newText: "# My Project\n\n"}]}
-  - {path: report.docx, edits: [{oldText: "Abstract", newText: "{size:14,bold}Abstract{/size}"}]}
 usage_notes:
-  - "Operations: replace(默认), insert_before, insert_after, delete, prepend, append"
-  - "Aliases: remove=delete, add_before=insert_before, add_after=insert_after"
-  - "oldText must be unique (exact character match) and edits must not overlap"
-  - "Applied atomically from bottom to top (safe line-number-wise)"
-  - "DOCX: oldText matches paragraph text; newText supports inline formatting markers"
-  - "revision: sha256[:12]; use to prevent editing a stale file"
+  - "Prefer replace_symbol for a complete Python function, method, or class"
+  - "Prefer hash range operations for multiline code not represented by one symbol"
+  - "Range start and end anchors are inclusive whole lines"
+  - "Use oldText only for short text known to be unique"
+  - "All edits are validated before an atomic write; overlapping edits are rejected"
+  - "Python files are parsed after editing and invalid syntax is never written"
 ---
 
 # edit
 
-Precise file editing with exact-text anchors. Supports replace, insert, delete, prepend, append operations on text and DOCX files. For CSV/XLSX, `oldText` must match exactly one complete cell and `replace`/`delete` are supported.
+Editing priority:
 
-## Text file operations
+1. `replace_symbol` or `delete_symbol` for complete Python definitions.
+2. `replace_range` or `delete_range` with anchors copied from `read` for multiline changes.
+3. `insert_before_anchor` or `insert_after_anchor` for stable line-relative insertion.
+4. Exact `oldText` operations for short unique values.
 
-| op | oldText | newText | 效果 |
-|----|---------|---------|------|
-| `replace` | 原文（唯一） | 新文本 | 替换 |
-| `delete` | 原文（唯一） | — | 删除 |
-| `insert_before` | 锚文本 | 插入内容 | 在锚前插入 |
-| `insert_after` | 锚文本 | 插入内容 | 在锚后插入 |
-| `prepend` | — | 内容 | 文件开头插入 |
-| `append` | — | 内容 | 文件末尾追加 |
-
-## Example
-
-```json
-{
-  "path": "app.py",
-  "edits": [
-    {"op": "prepend", "newText": "# coding: utf-8\n"},
-    {"op": "insert_after", "oldText": "import sys\n", "newText": "import os\nimport json\n"},
-    {"oldText": "debug = True", "newText": "debug = False"},
-    {"op": "delete", "oldText": "# TODO: remove this"}
-  ],
-  "revision": "a1b2c3d4e5f6"
-}
-```
-
-## DOCX mode
-
-Same operations; `oldText` matches paragraph text:
-
-```json
-{
-  "path": "report.docx",
-  "edits": [
-    {"oldText": "Introduction", "newText": "{size:16,bold}1. Introduction{/size}"},
-    {"op": "insert_after", "oldText": "Methods", "newText": "{color:red}⚠ Experimental{/color}"}
-  ]
-}
-```
+A supplied `revision` must match the current file. Hash anchors also validate their line contents, so
+stale model context produces an error instead of changing the wrong location.

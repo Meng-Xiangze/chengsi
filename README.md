@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.4.5**
+**Version 0.4.6**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -11,7 +11,7 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - Local desktop chat interface powered by `pywebview`
 - Local Ollama and OpenAI-compatible model providers
 - Native function calling for all models — no text-based tool protocols
-- 14 discoverable tools: read (text, CSV, XLSX, PDF, DOCX, images, code search), write, edit, bash, job, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
+- 14 discoverable tools: read (text, CSV, XLSX, PDF, DOCX, images, code search, Python outlines/symbols), write, edit (symbol, hash-range, and exact-text operations), bash, job, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
 - SQLite FTS5 local knowledge base with user-managed search, ingest, list, and remove operations
 - Persistent conversations and generated media
 - Image generation through a configured image-capable model
@@ -22,6 +22,8 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - User-controlled text-only fallback requests and optional automatic pip installation in Settings
 - Per-model Chat Completions or Responses API selection for OpenAI-compatible aggregators
 - Persistent background jobs for commands that run for minutes or hours, with status, log, list, and cancel operations
+- Tool failures and duplicate-call limits are returned to the model for recovery; independent calls in the same batch continue, while repeated failures still trigger a tool-execution circuit breaker
+- Stable code editing with file revisions, 64-bit line anchors, atomic writes, Python symbol replacement, and syntax validation
 - Progress-based model-stream protection: five minutes without an event stops a stalled request, but active turns have no total duration limit
 - Day and night themes
 - Optional parallel tool execution — run independent tools concurrently

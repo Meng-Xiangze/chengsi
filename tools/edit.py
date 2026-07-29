@@ -4,20 +4,26 @@
 For text files: replace, insert, delete, prepend, append.
 For .docx: find paragraph by text, replace with formatting markers."""
 
+import ast
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool
+from tools._hashline import revision, split_text, validate_anchor
 from tools._spreadsheet import edit_csv, edit_xlsx
 
-_VALID_OPS = {"replace", "delete", "insert_before", "insert_after", "prepend", "append"}
+_VALID_OPS = {
+    "replace", "delete", "insert_before", "insert_after", "prepend", "append",
+    "replace_range", "delete_range", "insert_before_anchor", "insert_after_anchor",
+    "replace_symbol", "delete_symbol",
+}
 _OP_ALIASES = {"add_before": "insert_before", "add_after": "insert_after", "remove": "delete"}
 
 
 class Edit(BaseTool):
-    """Surgical file editing with exact-text anchors."""
+    """Atomic text editing with hash, symbol, and exact-text anchors."""
 
     @property
     def tool_name(self) -> str:
@@ -26,8 +32,9 @@ class Edit(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Precise file editing with exact-text anchors. "
-            "Operations: replace (default), insert_before, insert_after, delete, prepend, append. "
+            "Atomic file editing. Prefer replace_symbol for complete Python definitions and "
+            "replace_range with LINE:HASH anchors for multiline code; use oldText for short unique text. "
+            "Operations also include delete_range and anchor-based insertion. "
             "Aliases: remove=delete, add_before=insert_before, add_after=insert_after. "
             "For CSV/XLSX: oldText must match one complete cell and replace/delete edits are supported. "
             "For .docx: matches paragraph text; newText supports **bold** *italic* ^super^ _sub_ "
@@ -45,10 +52,9 @@ class Edit(BaseTool):
             "edits": {
                 "type": "array",
                 "description": (
-                    "List of edits. Each: {oldText: 'anchor text', newText: 'replacement', op: 'replace'}. "
-                    "op defaults to 'replace'. prepend/append need no oldText. "
-                    "delete needs no newText. "
-                    "oldText must be unique and non-overlapping. "
+                    "Atomic edits. replace_symbol uses symbol; replace_range/delete_range use start/end "
+                    "LINE:HASH anchors; insert_*_anchor uses anchor. oldText operations remain supported "
+                    "for short unique text. op defaults to replace. "
                     "For CSV/XLSX: oldText matches one complete cell; use replace or delete. "
                     "For .docx: oldText matches paragraph text."
                 ),
@@ -68,6 +74,10 @@ class Edit(BaseTool):
                             "enum": sorted(_VALID_OPS),
                             "description": "Operation. Default: replace.",
                         },
+                        "start": {"type": "string", "description": "Inclusive start LINE:HASH anchor."},
+                        "end": {"type": "string", "description": "Inclusive end LINE:HASH anchor."},
+                        "anchor": {"type": "string", "description": "LINE:HASH insertion anchor."},
+                        "symbol": {"type": "string", "description": "Qualified Python symbol, e.g. AgentRuntime.observe."},
                     },
                 },
             },
@@ -107,13 +117,23 @@ class Edit(BaseTool):
                 return f"Error: edits[{ei}] invalid op {op!r}. Valid: {', '.join(sorted(_VALID_OPS))}."
             old = str(e.get("oldText", ""))
             new = str(e.get("newText", ""))
-            if op not in ("prepend", "append") and not old:
+            if op in ("replace", "delete", "insert_before", "insert_after") and not old:
                 return f"Error: edits[{ei}] ({op}) requires oldText as anchor."
-            if op == "delete":
+            if op in ("replace_range", "delete_range") and (not e.get("start") or not e.get("end")):
+                return f"Error: edits[{ei}] ({op}) requires start and end anchors."
+            if op in ("insert_before_anchor", "insert_after_anchor") and not e.get("anchor"):
+                return f"Error: edits[{ei}] ({op}) requires anchor."
+            if op in ("replace_symbol", "delete_symbol") and not e.get("symbol"):
+                return f"Error: edits[{ei}] ({op}) requires symbol."
+            if op.startswith("delete"):
                 new = ""
-            if op != "delete" and op not in ("prepend", "append") and not new:
-                return f"Error: edits[{ei}] (replace) requires newText."
-            edits.append({"op": op, "oldText": old, "newText": new})
+            if op not in ("delete", "delete_range", "delete_symbol") and not new:
+                return f"Error: edits[{ei}] ({op}) requires newText."
+            edits.append({
+                "op": op, "oldText": old, "newText": new,
+                "start": e.get("start"), "end": e.get("end"),
+                "anchor": e.get("anchor"), "symbol": e.get("symbol"),
+            })
 
         ext = path.suffix.lower()
 
@@ -136,106 +156,145 @@ class Edit(BaseTool):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _revision(text: str) -> str:
-        """Short content hash for stale-file detection."""
-        import hashlib
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    def _python_symbols(text: str, path: Path) -> list[tuple[str, tuple[int, int]]]:
+        tree = ast.parse(text, filename=str(path))
+        symbols: list[tuple[str, tuple[int, int]]] = []
+
+        def visit(body: list[ast.stmt], prefix: str = "") -> None:
+            for node in body:
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = f"{prefix}.{node.name}" if prefix else node.name
+                    decorator_lines = [item.lineno for item in getattr(node, "decorator_list", [])]
+                    start = min([node.lineno, *decorator_lines])
+                    symbols.append((name, (start, getattr(node, "end_lineno", node.lineno))))
+                    if isinstance(node, ast.ClassDef):
+                        visit(node.body, name)
+
+        visit(tree.body)
+        return symbols
 
     @staticmethod
     def _edit_text(path: Path, edits: list[dict], rev: str | None) -> str:
-        original = path.read_text(encoding="utf-8")
-        text = original
-
-        # Revision guard
-        if rev and Edit._revision(original) != rev:
+        raw = path.read_bytes()
+        has_bom = raw.startswith(b"\xef\xbb\xbf")
+        original = raw.decode("utf-8-sig" if has_bom else "utf-8")
+        current_revision = revision(original)
+        if rev and current_revision != rev:
             return (
-                f"Error: stale revision. File has changed since revision {rev}. "
-                f"Re-read the file to get the current revision."
+                f"Error: stale revision {rev}; current revision is {current_revision}. "
+                "Re-read the file and retry with current anchors."
             )
 
-        # Validate anchors: each oldText must exist exactly once
-        # Track which edits need anchor validation
-        anchors: list[tuple[int, str]] = []  # (edit_index, oldText)
-        for ei, edit in enumerate(edits):
-            if edit["op"] in ("prepend", "append"):
-                continue
-            old = edit["oldText"]
-            count = text.count(old)
-            if count == 0:
-                return (
-                    f"Error: edits[{ei}] oldText not found: {old[:120]!r}"
-                )
-            if count > 1:
-                return (
-                    f"Error: edits[{ei}] oldText appears {count} times — must be unique. "
-                    f"Add more context."
-                )
+        raw_lines = original.splitlines(keepends=True)
+        layout = split_text(original)
+        starts: list[int] = []
+        position = 0
+        for raw_line in raw_lines:
+            starts.append(position)
+            position += len(raw_line)
+        if layout.lines and len(starts) < len(layout.lines):
+            starts.append(position)
 
-        # Compute spans for replace/delete/insert operations
-        # Insert ops don't consume text, they just need a position
-        spans: list[dict] = []  # {start, end, edit_index}
+        def line_span(start_index: int, end_index: int) -> tuple[int, int]:
+            start_pos = starts[start_index]
+            end_pos = starts[end_index + 1] if end_index + 1 < len(starts) else len(original)
+            return start_pos, end_pos
+
+        python_symbols = None
+        spans: list[dict[str, Any]] = []
         for ei, edit in enumerate(edits):
             op = edit["op"]
-            if op in ("prepend", "append"):
-                continue
-            old = edit["oldText"]
-            start = text.index(old)
-            if op == "delete":
-                end = start + len(old)
-            elif op == "replace":
-                end = start + len(old)
-            elif op == "insert_before":
-                end = start  # insert at start position
-            elif op == "insert_after":
-                start = start + len(old)
-                end = start
-            spans.append({"start": start, "end": end, "ei": ei, "op": op})
+            start_pos = end_pos = 0
+            if op == "prepend":
+                start_pos = end_pos = 0
+            elif op == "append":
+                start_pos = end_pos = len(original)
+            elif op in ("replace", "delete", "insert_before", "insert_after"):
+                old = edit["oldText"]
+                count = original.count(old)
+                if count != 1:
+                    return f"Error: edits[{ei}] oldText matched {count} locations; expected exactly one."
+                start_pos = original.index(old)
+                end_pos = start_pos + len(old)
+                if op == "insert_before":
+                    end_pos = start_pos
+                elif op == "insert_after":
+                    start_pos = end_pos
+            elif op in ("replace_range", "delete_range"):
+                try:
+                    start_line = validate_anchor(layout.lines, edit["start"])
+                    end_line = validate_anchor(layout.lines, edit["end"])
+                except ValueError as exc:
+                    return f"Error: edits[{ei}] {exc}"
+                if start_line > end_line:
+                    return f"Error: edits[{ei}] start anchor is after end anchor."
+                start_pos, end_pos = line_span(start_line, end_line)
+            elif op in ("insert_before_anchor", "insert_after_anchor"):
+                try:
+                    line_index = validate_anchor(layout.lines, edit["anchor"])
+                except ValueError as exc:
+                    return f"Error: edits[{ei}] {exc}"
+                line_start, line_end = line_span(line_index, line_index)
+                start_pos = end_pos = line_start if op == "insert_before_anchor" else line_end
+            elif op in ("replace_symbol", "delete_symbol"):
+                if path.suffix.lower() != ".py":
+                    return f"Error: edits[{ei}] {op} supports Python files only."
+                try:
+                    python_symbols = python_symbols or Edit._python_symbols(original, path)
+                except SyntaxError as exc:
+                    return f"Error: cannot locate Python symbols because the file does not parse: {exc}"
+                requested = str(edit["symbol"])
+                matches = [(name, value) for name, value in python_symbols if name == requested]
+                if not matches and "." not in requested:
+                    matches = [(name, value) for name, value in python_symbols if name.rsplit(".", 1)[-1] == requested]
+                if len(matches) != 1:
+                    return f"Error: edits[{ei}] symbol {requested!r} matched {len(matches)} definitions."
+                start_line, end_line = matches[0][1]
+                start_pos, end_pos = line_span(start_line - 1, end_line - 1)
+            spans.append({"start": start_pos, "end": end_pos, "ei": ei})
 
-        # Check for overlapping *consuming* edits (replace/delete)
-        consuming = [s for s in spans if s["op"] in ("replace", "delete")]
-        for i in range(len(consuming)):
-            for j in range(i + 1, len(consuming)):
-                a, b = consuming[i], consuming[j]
-                if not (a["end"] <= b["start"] or b["end"] <= a["start"]):
-                    return (
-                        f"Error: edits[{a['ei']}] and edits[{b['ei']}] overlap. "
-                        f"Merge them into a single edit."
-                    )
+        for i, first in enumerate(spans):
+            for second in spans[i + 1:]:
+                first_consumes = first["start"] != first["end"]
+                second_consumes = second["start"] != second["end"]
+                overlaps = first["start"] < second["end"] and second["start"] < first["end"]
+                insertion_inside = (
+                    first_consumes and first["start"] < second["start"] < first["end"]
+                ) or (
+                    second_consumes and second["start"] < first["start"] < second["end"]
+                )
+                if overlaps or insertion_inside or (not first_consumes and not second_consumes and first["start"] == second["start"]):
+                    return f"Error: edits[{first['ei']}] and edits[{second['ei']}] overlap; merge them."
 
-        # Apply in reverse order (end-to-start) to preserve positions
-        ordered = sorted(spans, key=lambda s: s["start"], reverse=True)
-        changed = 0
+        text = original
+        newline = layout.newline
+        for span in sorted(spans, key=lambda item: item["start"], reverse=True):
+            new = edits[span["ei"]]["newText"]
+            if newline != "\n":
+                new = new.replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
+            text = text[:span["start"]] + new + text[span["end"]:]
 
-        for s in ordered:
-            edit = edits[s["ei"]]
-            op = edit["op"]
-            new = edit["newText"]
-            if op == "replace":
-                text = text[: s["start"]] + new + text[s["end"] :]
-            elif op == "delete":
-                text = text[: s["start"]] + text[s["end"] :]
-            elif op == "insert_before":
-                text = text[: s["start"]] + new + text[s["start"] :]
-            elif op == "insert_after":
-                text = text[: s["start"]] + new + text[s["start"] :]
-            changed += 1
+        if path.suffix.lower() == ".py":
+            try:
+                ast.parse(text, filename=str(path))
+            except SyntaxError as exc:
+                return f"Error: edit would produce invalid Python: {exc}. No changes written."
 
-        # prepend / append
-        for ei, edit in enumerate(edits):
-            if edit["op"] == "prepend":
-                text = edit["newText"] + text
-                changed += 1
-            elif edit["op"] == "append":
-                text = text + edit["newText"]
-                changed += 1
-
-        path.write_text(text, encoding="utf-8")
-        old_lines = original.count("\n") + 1
-        new_lines = text.count("\n") + 1
+        encoded = text.encode("utf-8")
+        if has_bom:
+            encoded = b"\xef\xbb\xbf" + encoded
+        temp_path = path.with_name(f".{path.name}.chengsi-edit-{os.getpid()}.tmp")
+        try:
+            temp_path.write_bytes(encoded)
+            os.replace(temp_path, path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
+        old_lines = len(layout.lines)
+        new_lines = len(split_text(text).lines)
         return (
-            f"Edited {path}: {changed} operation(s). "
-            f"Lines: {old_lines} → {new_lines}"
-            + ("" if not rev else f" rev={Edit._revision(text)}")
+            f"Edited {path}: {len(edits)} operation(s). Lines: {old_lines} -> {new_lines}; "
+            f"rev={revision(text)}"
         )
 
     # ------------------------------------------------------------------ #

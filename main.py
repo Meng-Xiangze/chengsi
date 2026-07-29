@@ -1051,6 +1051,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
     runtime.active = True
     turn_tool_records: list[dict] = []
     turn_process_summary = ""
+    terminal_tool_blocker = ""
 
     def persist_runtime_snapshot() -> None:
         sd.runtime_snapshot = runtime.snapshot()
@@ -1143,7 +1144,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             stream_gen = provider.chat_stream(
                 model,
                 request_messages,
-                tool_defs=tool_defs,
+                tool_defs=None if terminal_tool_blocker else tool_defs,
                 supports_vision=supports_vision,
                 cancel_event=sd.cancel,
                 fallback_mode=fallback_mode,
@@ -1233,13 +1234,15 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 assistant_msg = {"role": "assistant", "content": full_content or None, "tool_calls": native_tc_list}
                 sd.messages.append(assistant_msg)
 
-                # ── Preflight the whole batch atomically ──
-                allowed_batch, batch_reason = runtime.allow_batch([
+                # Admit calls independently. A duplicate is returned to the model
+                # as a failed tool result, while unrelated calls in the same batch
+                # can still run.
+                admissions = runtime.allow_each([
                     (tc["action"], tc["arguments"]) for tc in stream_tool_calls
                 ])
                 preflight: list[tuple[dict, bool, str]] = [
-                    (tc, allowed_batch, "" if allowed_batch else batch_reason)
-                    for tc in stream_tool_calls
+                    (tc, allowed, reason)
+                    for tc, (allowed, reason) in zip(stream_tool_calls, admissions)
                 ]
 
                 # ── Execute (parallel or sequential) ──
@@ -1268,19 +1271,17 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 stop_reason = ""
                 for tc, allowed, reason in preflight:
                     if not allowed:
-                        outcome = classify_tool_outcome("Error: " + reason)
-                        stop_reason = reason
+                        outcome = ToolOutcome(False, reason, "duplicate_call")
                     else:
                         outcome = outcomes.get(tc["id"])
                         if outcome is None:
-                            outcome = classify_tool_outcome("Error: tool execution skipped")
-                        else:
-                            should_continue, obs_reason = runtime.observe(
-                                tc["action"], tc["arguments"], outcome, turn_tools.get(tc["action"])
-                            )
-                            persist_runtime_snapshot()
-                            if not should_continue:
-                                stop_reason = obs_reason
+                            outcome = ToolOutcome(False, "Tool execution was skipped.", "tool_skipped")
+                    should_continue, obs_reason = runtime.observe(
+                        tc["action"], tc["arguments"], outcome, turn_tools.get(tc["action"])
+                    )
+                    persist_runtime_snapshot()
+                    if not should_continue:
+                        stop_reason = obs_reason
                     visible_result = re.sub(rf"\n?{re.escape(_IMAGE_MARKER)}.*$", "", outcome.content, flags=re.DOTALL).strip()
                     _emit("tool_result", visible_result, session_id=session_id)
                     tool_msg = _inject_image_content({
@@ -1297,11 +1298,19 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     })
 
                 if stop_reason:
-                    message = f"Agent stopped safely: {stop_reason}"
-                    _append_persistent_turn_summary(sd, turn_tool_records, stop_reason)
-                    sd.messages.append({"role": "assistant", "content": message})
-                    _emit("agent_done", message, session_id=session_id)
-                    return
+                    # The runtime owns the safety boundary, not the user-facing
+                    # diagnosis. Disable further tools and let the model read the
+                    # failed tool results before deciding what to report or ask.
+                    terminal_tool_blocker = stop_reason
+                    sd.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[RUNTIME TOOL BLOCKER] Further tool execution is disabled for this turn: "
+                            f"{stop_reason}\nRead the tool errors above and respond to the user with the best "
+                            "next step, required clarification, or concrete blocker. Do not emit another tool call."
+                        ),
+                    })
+                    continue
                 _emit("thinking", "Summarizing tool progress...", session_id=session_id)
                 turn_process_summary = _summarize_turn_process(
                     provider, model, turn_tool_records, sd.cancel, supports_vision, request_api
@@ -1334,7 +1343,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             # Strip thinking/reasoning that leaked into content
             clean_response = _strip_thinking_prefix(clean_response)
             sd.messages.append({"role": "assistant", "content": clean_response})
-            _append_persistent_turn_summary(sd, turn_tool_records)
+            _append_persistent_turn_summary(sd, turn_tool_records, terminal_tool_blocker)
             _emit("agent_done", clean_response, session_id=session_id)
             return
 
