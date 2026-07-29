@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.4.6**
+**Version 0.5.0**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -22,9 +22,11 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - User-controlled text-only fallback requests and optional automatic pip installation in Settings
 - Per-model Chat Completions or Responses API selection for OpenAI-compatible aggregators
 - Persistent background jobs for commands that run for minutes or hours, with status, log, list, and cancel operations
+- **Background Job panel**: the WebUI right panel lists persisted jobs, shows live process state and elapsed time, opens log tails, and stops active jobs without leaving the chat
 - Tool failures and duplicate-call limits are returned to the model for recovery; independent calls in the same batch continue, while repeated failures still trigger a tool-execution circuit breaker
 - Stable code editing with file revisions, 64-bit line anchors, atomic writes, Python symbol replacement, and syntax validation
 - Progress-based model-stream protection: five minutes without an event stops a stalled request, but active turns have no total duration limit
+- Background job status includes runner/process liveness and structured metadata for recovery after application restarts
 - Day and night themes
 - Optional parallel tool execution — run independent tools concurrently
 - **Qwen/Ollama thinking safety net**: when Qwen-based models emit tool calls as raw text inside ` ` blocks instead of native function calls (a known Ollama interaction), the provider automatically extracts and executes them — thinking stays on so the model keeps its full reasoning quality
@@ -253,6 +255,14 @@ Provider model names and capabilities vary by service. The names above are examp
 Multiple providers and models can be configured in the same `providers` array. The Settings dialog can change `request_api` for the currently selected OpenAI-compatible model and writes the choice directly into that model object. Restart Chengsi after other manual edits to `config.json`.
 
 In `auto` mode, Chengsi bypasses desktop/VPN HTTP proxies first and falls back to the system proxy only when connection establishment fails before any HTTP response is received. It never retries after a response or streamed data begins. `direct` bypasses HTTP/SOCKS environment and Windows proxy settings, but a VPN using TUN or global routing may still intercept traffic at the operating-system route layer.
+
+## Background Jobs
+
+Use the `job` tool for commands that should continue independently of the current chat turn. The WebUI's right-side panel reads the same persisted job records, so status and log access remain available after restarting Chengsi.
+
+Each job records its command, working directory, timestamps, elapsed time, runner PID, command PID, exit status, and log path. On Windows, cancellation attempts to terminate the complete process tree. A job whose recorded processes disappear is reported as `interrupted` instead of remaining falsely marked as running.
+
+The panel is intentionally a monitoring surface, not a second chat: it shows compact status, provides a bounded log tail on demand, and keeps full logs outside the model context.
 
 ## Architecture
 

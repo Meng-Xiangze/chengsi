@@ -4,6 +4,26 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-07-29
+
+### Added
+
+- **Background Job panel**: WebUI right panel lists persisted jobs, shows status and elapsed time, opens bounded log tails, and stops active jobs.
+- Structured job list data for monitoring clients, including runner/process liveness, timestamps, exit information, and error state.
+- Regression tests for persistent job listing and elapsed-time reporting.
+
+### Changed
+
+- Background job recovery now distinguishes missing runner and command processes and marks stale records as `interrupted`.
+- Windows job cancellation continues to terminate the process tree, which is important for commands that launch child processes or external programs.
+- README documents the job monitoring contract and WebUI behavior.
+
+### Files changed
+
+- `tools/job.py`, `tools/_job_runner.py` - structured job monitoring and lifecycle metadata.
+- `main.py`, `core/index.html` - WebUI job API and right-side monitoring panel.
+- `tests/test_job.py`, `README.md`, `CHANGELOG.md` - regression coverage and release documentation.
+
 ## [0.4.6] - 2026-07-29
 
 ### Added

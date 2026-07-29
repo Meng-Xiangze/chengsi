@@ -53,12 +53,14 @@ def main() -> int:
                 "runner_pid": os.getpid(),
                 "command_pid": process.pid,
                 "started_at": _now(),
+                "last_activity_at": _now(),
             })
             return_code = process.wait()
         _write_metadata(metadata_path, {
             "status": "completed" if return_code == 0 else "failed",
             "exit_code": return_code,
             "finished_at": _now(),
+            "last_activity_at": _now(),
         })
         return return_code
     except BaseException as error:

@@ -50,8 +50,8 @@
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
-    .app { display: grid; grid-template-columns: var(--sidebar) 1fr; height: 100%; transition: grid-template-columns .2s ease; }
-    body.sidebar-collapsed .app { grid-template-columns: 0 1fr; }
+    .app { display: grid; grid-template-columns: var(--sidebar) minmax(0, 1fr) 270px; height: 100%; transition: grid-template-columns .2s ease; }
+    body.sidebar-collapsed .app { grid-template-columns: 0 minmax(0, 1fr) 270px; }
     body.sidebar-collapsed .sidebar { overflow: hidden; border-right: 0; }
     .sidebar {
       min-width: 0;
@@ -143,6 +143,33 @@
       font-size: 11px;
     }
     .main { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+    .job-panel {
+      width: 270px;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border-left: 1px solid var(--line);
+    }
+    .job-panel-header { padding: 14px 14px 8px; display: flex; align-items: center; justify-content: space-between; }
+    .job-panel-title { font-weight: 650; }
+    .job-count { color: var(--muted); font-size: 11px; }
+    .job-list { min-height: 0; overflow: auto; padding: 0 9px 12px; }
+    .job-empty { padding: 12px 5px; color: var(--muted); font-size: 12px; }
+    .job-item { padding: 9px 6px; border-top: 1px solid var(--line); }
+    .job-item:first-child { border-top: 0; }
+    .job-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .job-status { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .job-status.running, .job-status.starting { background: var(--accent); }
+    .job-status.failed, .job-status.interrupted, .job-status.timed_out { background: var(--danger); }
+    .job-command { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .job-meta { margin: 3px 0 0 14px; color: var(--muted); font-size: 11px; }
+    .job-actions { display: flex; gap: 4px; margin: 6px 0 0 14px; }
+    .job-actions button { padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font-size: 11px; }
+    .job-actions button:hover { color: var(--text); background: var(--panel-2); }
+    .job-log { max-height: 120px; margin: 6px 0 0 14px; padding: 6px; overflow: auto; white-space: pre-wrap; background: var(--panel-2); border-radius: 4px; font: 11px/1.35 Consolas, monospace; }
+    @media (max-width: 980px) { .job-panel { width: 230px; } }
+    @media (max-width: 760px) { .job-panel { display: none; } }
     .topbar {
       height: 58px;
       padding: 0 16px;
@@ -527,6 +554,10 @@
         </div>
       </div>
     </main>
+    <aside class="job-panel" aria-label="Background jobs">
+      <div class="job-panel-header"><span class="job-panel-title">Background jobs</span><span class="job-count" id="jobCount">0</span></div>
+      <div class="job-list" id="jobList"><div class="job-empty">No background jobs.</div></div>
+    </aside>
   </div>
   <div class="toast" id="toast" role="status"></div>
   <div class="settings-dialog" id="settingsDialog" hidden>
@@ -560,6 +591,7 @@
       currentThinking: null,
       typingNode: null,
       stats: { input: 0, output: 0, prompt: 0, eval: 0, ctx: 0 },
+      jobs: [],
     };
     const $ = (id) => document.getElementById(id);
 
@@ -928,7 +960,46 @@
 
     function schedulePolling() {
       clearInterval(app.pollTimer);
-      app.pollTimer = setInterval(pollEvents, 240);
+      app.pollTimer = setInterval(async () => { await pollEvents(); await refreshJobs(); }, 1000);
+      refreshJobs();
+    }
+
+    function formatJobElapsed(seconds) {
+      if (seconds == null) return "--";
+      const value = Math.max(0, Number(seconds));
+      if (value < 60) return `${value}s`;
+      if (value < 3600) return `${Math.floor(value / 60)}m`;
+      return `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`;
+    }
+
+    async function refreshJobs() {
+      if (!app.api?.get_jobs) return;
+      try {
+        const result = await app.api.get_jobs();
+        app.jobs = result?.jobs || [];
+        const list = $("jobList");
+        list.innerHTML = "";
+        $("jobCount").textContent = String(app.jobs.length);
+        if (!app.jobs.length) { list.innerHTML = '<div class="job-empty">No background jobs.</div>'; return; }
+        app.jobs.forEach((job) => {
+          const item = document.createElement("div");
+          item.className = "job-item";
+          const active = ["starting", "running"].includes(job.status);
+          item.innerHTML = `<div class="job-row"><span class="job-status ${escapeHtml(job.status)}"></span><span class="job-command" title="${escapeHtml(job.command)}">${escapeHtml(job.command)}</span></div><div class="job-meta">${escapeHtml(job.status)} · ${formatJobElapsed(job.elapsed_seconds)}${job.command_alive ? " · process alive" : ""}</div><div class="job-actions"><button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}</div>`;
+          item.querySelector('[data-action="logs"]').onclick = async () => {
+            const output = await app.api.get_job_logs(job.job_id, 80);
+            let log = item.querySelector(".job-log");
+            if (!log) { log = document.createElement("div"); log.className = "job-log"; item.appendChild(log); }
+            log.textContent = output?.content || output?.msg || "No log output.";
+          };
+          item.querySelector('[data-action="cancel"]')?.addEventListener("click", async () => {
+            const result = await app.api.cancel_job(job.job_id);
+            if (result?.status !== "ok") toast(result?.msg || "Could not stop job");
+            await refreshJobs();
+          });
+          list.appendChild(item);
+        });
+      } catch (error) { console.error(error); }
     }
 
     function sessionDate(value) {

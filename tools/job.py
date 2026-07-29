@@ -45,6 +45,23 @@ def _process_exists(pid: int) -> bool:
         return False
 
 
+def _process_tree_alive(metadata: dict) -> bool:
+    """Check the runner and command process separately for orphan detection."""
+    return _process_exists(int(metadata.get("runner_pid") or 0)) or _process_exists(int(metadata.get("command_pid") or 0))
+
+
+def _elapsed_seconds(metadata: dict) -> int | None:
+    started = metadata.get("started_at") or metadata.get("created_at")
+    if not started:
+        return None
+    try:
+        end = metadata.get("finished_at")
+        end_time = datetime.fromisoformat(end).timestamp() if end else time.time()
+        return max(0, int(end_time - datetime.fromisoformat(started).timestamp()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 class Job(BaseTool):
     @property
     def tool_name(self) -> str:
@@ -111,7 +128,7 @@ class Job(BaseTool):
                 started = 0
             startup_grace = metadata.get("status") == "starting" and time.time() - created < 10
             completion_grace = metadata.get("status") == "running" and time.time() - started < 10
-            if not startup_grace and not completion_grace and not _process_exists(runner_pid) and not _process_exists(command_pid):
+            if not startup_grace and not completion_grace and not _process_tree_alive(metadata):
                 metadata["status"] = "interrupted"
                 metadata["finished_at"] = metadata.get("finished_at") or _now()
                 metadata["error"] = metadata.get("error") or "Job process is no longer running; exit code is unavailable."
@@ -168,10 +185,15 @@ class Job(BaseTool):
 
     def _status(self, job_id: str) -> dict[str, Any]:
         _, metadata = self._load(job_id)
+        runner_alive = _process_exists(int(metadata.get("runner_pid") or 0))
+        command_alive = _process_exists(int(metadata.get("command_pid") or 0))
         fields = [
             f"job_id: {metadata['job_id']}", f"status: {metadata['status']}",
             f"command: {metadata['command']}", f"cwd: {metadata['cwd']}",
             f"created_at: {metadata.get('created_at', '')}",
+            f"elapsed_seconds: {_elapsed_seconds(metadata)}",
+            f"runner_alive: {str(runner_alive).lower()}",
+            f"command_alive: {str(command_alive).lower()}",
         ]
         if metadata.get("started_at"):
             fields.append(f"started_at: {metadata['started_at']}")
@@ -199,10 +221,29 @@ class Job(BaseTool):
         for path in sorted(_job_root().glob("*.json"), reverse=True)[:100]:
             try:
                 _, metadata = self._load(path.stem)
-                entries.append(f"{metadata['job_id']}  {metadata['status']}  {metadata['command'][:100]}")
+                elapsed = _elapsed_seconds(metadata)
+                entries.append({
+                    "job_id": metadata["job_id"],
+                    "status": metadata["status"],
+                    "command": metadata["command"],
+                    "cwd": metadata["cwd"],
+                    "created_at": metadata.get("created_at", ""),
+                    "started_at": metadata.get("started_at", ""),
+                    "finished_at": metadata.get("finished_at", ""),
+                    "elapsed_seconds": elapsed,
+                    "runner_alive": _process_exists(int(metadata.get("runner_pid") or 0)),
+                    "command_alive": _process_exists(int(metadata.get("command_pid") or 0)),
+                    "log_path": metadata.get("log_path", ""),
+                    "error": metadata.get("error", ""),
+                })
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
-        return {"ok": True, "content": "\n".join(entries) if entries else "No background jobs.", "error_code": "ok"}
+        return {
+            "ok": True,
+            "content": json.dumps(entries, ensure_ascii=False),
+            "jobs": entries,
+            "error_code": "ok",
+        }
 
     def _cancel(self, job_id: str) -> dict[str, Any]:
         path, metadata = self._load(job_id)

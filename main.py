@@ -1818,6 +1818,33 @@ class WebAPI:
         except OSError as exc:
             return {"status": "error", "msg": f"Could not open image: {exc}"}
 
+    def get_jobs(self):
+        """Return persisted background jobs for the WebUI control panel."""
+        try:
+            from tools.job import Job
+            result = Job().run({"action": "list"})
+            return {"status": "ok", "jobs": result.get("jobs", [])}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": f"Could not load jobs: {exc}", "jobs": []}
+
+    def cancel_job(self, job_id: str):
+        """Cancel a running background job from the WebUI."""
+        try:
+            from tools.job import Job
+            result = Job().run({"action": "cancel", "job_id": job_id})
+            return {"status": "ok" if result.get("ok") else "error", "msg": result.get("content", "")}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": str(exc)}
+
+    def get_job_logs(self, job_id: str, tail_lines: int = 80):
+        """Return a bounded log tail for an individual background job."""
+        try:
+            from tools.job import Job
+            result = Job().run({"action": "logs", "job_id": job_id, "tail_lines": tail_lines})
+            return {"status": "ok" if result.get("ok") else "error", "content": result.get("content", "")}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": str(exc)}
+
     def get_events(self, session_id: str):
         """Drain and return events from the given session's queue."""
         events = []
