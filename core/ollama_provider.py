@@ -133,7 +133,7 @@ class OllamaProvider(BaseProvider):
         external_cancel = kwargs.get("cancel_event")
         self._cancel_event.clear()
         try:
-            response = self.http.post(url, json=payload, timeout=(3, 300), stream=True)
+            response = self.http.post(url, json=payload, timeout=(3, 60), stream=True)
             response.raise_for_status()
             self._resp = response
 

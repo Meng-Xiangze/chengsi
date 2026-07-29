@@ -1,5 +1,14 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
+import os
+import sys
+
+# Keep every tool and child process on a predictable UTF-8 text boundary.
+os.environ.setdefault("PYTHONUTF8", "1")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 class BaseTool(ABC):
     """

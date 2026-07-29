@@ -17,12 +17,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Background job recovery now distinguishes missing runner and command processes and marks stale records as `interrupted`.
 - Windows job cancellation continues to terminate the process tree, which is important for commands that launch child processes or external programs.
 - README documents the job monitoring contract and WebUI behavior.
+- Agent-started jobs are hidden from the user job panel by default; failed jobs can be archived without deleting their logs.
+- Finished job results are delivered to the owning session through a non-invasive follow-up turn, while active jobs are handed off without status polling.
+- Windows normalizes common `sleep N && command` delays to `timeout /t N /nobreak`, and model stream failures now close the turn instead of leaving an active runtime snapshot.
 
 ### Files changed
 
 - `tools/job.py`, `tools/_job_runner.py` - structured job monitoring and lifecycle metadata.
 - `main.py`, `core/index.html` - WebUI job API and right-side monitoring panel.
-- `tests/test_job.py`, `README.md`, `CHANGELOG.md` - regression coverage and release documentation.
+- `tests/test_job.py`, `tests/test_agent_runtime.py`, `README.md`, `CHANGELOG.md` - regression coverage and release documentation.
 
 ## [0.4.6] - 2026-07-29
 

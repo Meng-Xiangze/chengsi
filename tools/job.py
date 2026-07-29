@@ -1,6 +1,7 @@
 """Start and manage persistent background shell jobs."""
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -50,6 +51,17 @@ def _process_tree_alive(metadata: dict) -> bool:
     return _process_exists(int(metadata.get("runner_pid") or 0)) or _process_exists(int(metadata.get("command_pid") or 0))
 
 
+def _normalize_windows_delay(command: str) -> str:
+    """Translate the common Unix sleep-and-continue form for Windows shells."""
+    if os.name != "nt":
+        return command
+    match = re.match(r"^\s*sleep\s+(\d+)\s*&&\s*(.+)$", command, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return command
+    seconds, remainder = match.groups()
+    return f"timeout /t {seconds} /nobreak >nul && {remainder.strip()}"
+
+
 def _elapsed_seconds(metadata: dict) -> int | None:
     started = metadata.get("started_at") or metadata.get("created_at")
     if not started:
@@ -79,7 +91,7 @@ class Job(BaseTool):
         return {
             "action": {
                 "type": "string",
-                "enum": ["start", "status", "logs", "list", "cancel"],
+                "enum": ["start", "status", "logs", "list", "cancel", "archive"],
                 "description": "Job operation.",
                 "required": True,
             },
@@ -98,6 +110,18 @@ class Job(BaseTool):
             "tail_lines": {
                 "type": "integer",
                 "description": "Number of trailing log lines to return. Default 100, maximum 1000.",
+            },
+            "include_history": {
+                "type": "boolean",
+                "description": "Include completed jobs in action=list. Failed, interrupted, and cancelled jobs are always included.",
+            },
+            "visible": {
+                "type": "boolean",
+                "description": "Show this job in the WebUI job panel. Defaults to false for agent-internal jobs.",
+            },
+            "_visible_only": {
+                "type": "boolean",
+                "description": "Internal WebUI filter; do not set this in normal agent requests.",
             },
         }
 
@@ -136,9 +160,10 @@ class Job(BaseTool):
         return path, metadata
 
     def _start(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        command = str(arguments.get("command", "")).strip()
-        if not command:
+        requested_command = str(arguments.get("command", "")).strip()
+        if not requested_command:
             return {"ok": False, "content": "command is required for action=start.", "error_code": "invalid_arguments"}
+        command = _normalize_windows_delay(requested_command)
         cwd = Path(str(arguments.get("cwd") or os.getcwd())).expanduser().resolve()
         if not cwd.is_dir():
             return {"ok": False, "content": f"Working directory not found: {cwd}", "error_code": "not_found"}
@@ -149,9 +174,13 @@ class Job(BaseTool):
         metadata = {
             "job_id": job_id,
             "command": command,
+            "requested_command": requested_command,
             "cwd": str(cwd),
             "status": "starting",
             "created_at": _now(),
+            "session_id": str(arguments.get("_session_id") or ""),
+            "visible": bool(arguments.get("visible", False)),
+            "origin": "agent",
             "runner_pid": None,
             "command_pid": None,
             "exit_code": None,
@@ -216,11 +245,18 @@ class Job(BaseTool):
             content = "\n".join(lines[-tail_lines:]) or "(no log output yet)"
         return {"ok": True, "content": f"job_id: {job_id}\nstatus: {metadata['status']}\n--- log tail ---\n{content}", "error_code": "ok"}
 
-    def _list(self) -> dict[str, Any]:
+    def _list(self, include_history: bool = False, visible_only: bool = False) -> dict[str, Any]:
         entries = []
+        visible_statuses = {"starting", "running", "failed", "interrupted", "cancelled", "timed_out"}
         for path in sorted(_job_root().glob("*.json"), reverse=True)[:100]:
             try:
                 _, metadata = self._load(path.stem)
+                if not include_history and metadata.get("archived_at"):
+                    continue
+                if visible_only and not metadata.get("visible", False):
+                    continue
+                if not include_history and metadata.get("status") not in visible_statuses:
+                    continue
                 elapsed = _elapsed_seconds(metadata)
                 entries.append({
                     "job_id": metadata["job_id"],
@@ -230,11 +266,16 @@ class Job(BaseTool):
                     "created_at": metadata.get("created_at", ""),
                     "started_at": metadata.get("started_at", ""),
                     "finished_at": metadata.get("finished_at", ""),
+                    "exit_code": metadata.get("exit_code"),
                     "elapsed_seconds": elapsed,
                     "runner_alive": _process_exists(int(metadata.get("runner_pid") or 0)),
                     "command_alive": _process_exists(int(metadata.get("command_pid") or 0)),
                     "log_path": metadata.get("log_path", ""),
                     "error": metadata.get("error", ""),
+                    "session_id": metadata.get("session_id", ""),
+                    "visible": bool(metadata.get("visible", False)),
+                    "origin": metadata.get("origin", "agent"),
+                    "agent_received_at": metadata.get("agent_received_at", ""),
                 })
             except (OSError, ValueError, json.JSONDecodeError):
                 continue
@@ -242,8 +283,19 @@ class Job(BaseTool):
             "ok": True,
             "content": json.dumps(entries, ensure_ascii=False),
             "jobs": entries,
+            "active": [entry for entry in entries if entry["status"] in {"starting", "running"}],
+            "attention": [entry for entry in entries if entry["status"] in {"failed", "interrupted", "cancelled", "timed_out"}],
             "error_code": "ok",
         }
+
+    def _archive(self, job_id: str) -> dict[str, Any]:
+        path, metadata = self._load(job_id)
+        if metadata.get("status") in {"starting", "running"}:
+            return {"ok": False, "content": "Running jobs cannot be archived; cancel them first.", "error_code": "still_running"}
+        metadata["visible"] = False
+        metadata["archived_at"] = _now()
+        path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "content": f"Archived background job: {job_id}", "error_code": "ok"}
 
     def _cancel(self, job_id: str) -> dict[str, Any]:
         path, metadata = self._load(job_id)
@@ -269,7 +321,10 @@ class Job(BaseTool):
             if action == "start":
                 return self._start(arguments)
             if action == "list":
-                return self._list()
+                return self._list(
+                    bool(arguments.get("include_history", False)),
+                    visible_only=bool(arguments.get("_visible_only", False)),
+                )
             job_id = str(arguments.get("job_id", "")).strip()
             if not job_id:
                 return {"ok": False, "content": "job_id is required for this action.", "error_code": "invalid_arguments"}
@@ -280,6 +335,8 @@ class Job(BaseTool):
                 return self._logs(job_id, tail_lines)
             if action == "cancel":
                 return self._cancel(job_id)
-            return {"ok": False, "content": "action must be start, status, logs, list, or cancel.", "error_code": "invalid_arguments"}
+            if action == "archive":
+                return self._archive(job_id)
+            return {"ok": False, "content": "action must be start, status, logs, list, cancel, or archive.", "error_code": "invalid_arguments"}
         except (OSError, ValueError, json.JSONDecodeError) as error:
             return {"ok": False, "content": str(error), "error_code": "job_error"}

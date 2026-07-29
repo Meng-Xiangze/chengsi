@@ -481,7 +481,7 @@ def _verification_tool_outcome(action: str, result: str) -> ToolOutcome | None:
 
 
 def _execute_tool(action: str, args: dict, available_tools: dict, session_id: str, tool_call_id: str | None = None):
-    if action == "system_cleaner" and isinstance(args, dict):
+    if action in {"system_cleaner", "job"} and isinstance(args, dict):
         args = dict(args)
         args["_session_id"] = session_id
     started = time.time()
@@ -936,10 +936,12 @@ def _iter_stream_with_cancel(gen, cancel_event, idle_timeout: float | None = Non
                 last_progress = time.monotonic()
                 yield msg[1]
     finally:
-        # Only wait for producer if NOT cancelled. When cancelled, the producer
-        # may be stuck on a blocking socket read and we must return immediately.
-        if not cancel_event.is_set():
-            done.wait(timeout=3)
+        # Producer cleanup must never delay the agent turn. A provider may leave
+        # a socket thread unwinding after it has already emitted its final event.
+        # Cancellation also returns immediately by design.
+        if not done.is_set():
+            # Leave the daemon producer to unwind in the background.
+            pass
 
 
 def _turn_tools(available_tools: dict, messages: list[dict]) -> dict:
@@ -965,6 +967,10 @@ def _summarize_turn_process(provider, model: str, tool_records: list[dict], canc
     if not tool_records or cancel_event.is_set():
         return ""
     source = json.dumps(tool_records, ensure_ascii=False, default=str)
+    # Small tool batches are already visible in the current request. Avoid an
+    # extra model round-trip until the handoff would materially reduce context.
+    if len(tool_records) < 3 and len(source) < 12000:
+        return ""
     prompt = (
         "Summarize this current-turn tool exploration for the next agent step. "
         "Record only concrete findings, changed files, failures, unresolved questions, and the next useful action. "
@@ -1021,7 +1027,7 @@ def _append_persistent_turn_summary(sd, records: list[dict], stop_reason: str = 
         sd.messages.append({"role": "assistant", "content": summary})
 
 
-def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None, fallback_mode: bool = False):
+def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None, fallback_mode: bool = False, transient_context: str = ""):
     sd = state.get(session_id)
     if sd is None or sd.cancel.is_set():
         return
@@ -1051,6 +1057,8 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
     runtime.active = True
     turn_tool_records: list[dict] = []
     turn_process_summary = ""
+    last_summary_record_count = 0
+    last_summary_source_size = 0
     terminal_tool_blocker = ""
 
     def persist_runtime_snapshot() -> None:
@@ -1133,6 +1141,11 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             stream_error = None
 
             request_messages = _build_request_messages(sd.messages)
+            if transient_context:
+                request_messages.append({
+                    "role": "user",
+                    "content": transient_context + "\nThis is transient background status. Decide how to communicate with the user; do not treat it as a new user request.",
+                })
             if turn_process_summary:
                 request_messages.append({
                     "role": "user",
@@ -1152,7 +1165,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             )
             try:
                 for kind, chunk in _iter_stream_with_cancel(
-                    stream_gen, sd.cancel, idle_timeout=300, on_idle_timeout=provider.cancel
+                    stream_gen, sd.cancel, idle_timeout=60, on_idle_timeout=provider.cancel
                 ):
                     if kind == "error":
                         stream_error = chunk
@@ -1201,9 +1214,14 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 stream_error = str(error)
 
             if stream_error:
-                # API failures are UI events, never synthetic user messages. Persisting
-                # SYSTEM_ERROR here causes every retry to resend the previous failure.
-                _emit("agent_done", stream_error, session_id=session_id)
+                # Close the turn explicitly. A provider failure must not leave a
+                # persisted tool call with runtime.active=true forever.
+                error_text = str(stream_error).strip() or "Model stream ended without a response."
+                runtime.active = False
+                sd.runtime_snapshot = runtime.snapshot()
+                message = f"后台模型请求未能完成：{error_text}"
+                sd.messages.append({"role": "assistant", "content": message})
+                _emit("agent_done", message, session_id=session_id)
                 return
 
             # Connection may have been closed externally by cancel_stream(); catch that here
@@ -1269,6 +1287,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
 
                 # ── Observe and build messages in original order ──
                 stop_reason = ""
+                background_job_started = False
                 for tc, allowed, reason in preflight:
                     if not allowed:
                         outcome = ToolOutcome(False, reason, "duplicate_call")
@@ -1296,6 +1315,25 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         "ok": outcome.ok,
                         "result": visible_result[:8000],
                     })
+                    if (
+                        tc["action"] == "job"
+                        and tc["arguments"].get("action") == "start"
+                        and outcome.ok
+                        and re.search(r"status:\s*(?:starting|running)", visible_result, re.IGNORECASE)
+                    ):
+                        background_job_started = True
+
+                if background_job_started and not stop_reason:
+                    # A started job is event-driven. Do not let the model poll
+                    # status/logs in the same turn; the watcher will provide the
+                    # terminal result in a separate follow-up turn.
+                    terminal_tool_blocker = (
+                        "A background job was started successfully. Do not call job status, logs, or list "
+                        "for it now. End this turn with a concise confirmation and wait for the background "
+                        "result event."
+                    )
+                    sd.messages.append({"role": "user", "content": "[BACKGROUND JOB HANDOFF] " + terminal_tool_blocker})
+                    continue
 
                 if stop_reason:
                     # The runtime owns the safety boundary, not the user-facing
@@ -1311,10 +1349,26 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         ),
                     })
                     continue
-                _emit("thinking", "Summarizing tool progress...", session_id=session_id)
-                turn_process_summary = _summarize_turn_process(
-                    provider, model, turn_tool_records, sd.cancel, supports_vision, request_api
+                source_size = len(json.dumps(turn_tool_records, ensure_ascii=False, default=str))
+                new_record_count = len(turn_tool_records) - last_summary_record_count
+                new_source_size = source_size - last_summary_source_size
+                should_summarize = (
+                    len(turn_tool_records) >= 3
+                    and (
+                        last_summary_record_count == 0
+                        or new_record_count >= 4
+                        or new_source_size >= 16000
+                    )
                 )
+                if should_summarize:
+                    _emit("thinking", "Summarizing tool progress...", session_id=session_id)
+                    candidate_summary = _summarize_turn_process(
+                        provider, model, turn_tool_records, sd.cancel, supports_vision, request_api
+                    )
+                    if candidate_summary:
+                        turn_process_summary = candidate_summary
+                    last_summary_record_count = len(turn_tool_records)
+                    last_summary_source_size = source_size
                 continue
             if runtime.can_request_verification():
                 runtime.mark_verification_reminder()
@@ -1367,6 +1421,141 @@ _default_vision_model = ""
 _available_tools: dict = {}
 _tool_manager: ToolManager | None = None
 _session_manager: SessionManager | None = None
+
+
+def _job_metadata_root():
+    from tools.job import _job_root
+    return _job_root()
+
+
+def _consume_job_notifications(session_id: str) -> list[dict]:
+    """Claim finished jobs for a session so the next user turn can process them."""
+    if not session_id:
+        return []
+    notifications = []
+    try:
+        root = _job_metadata_root()
+        for path in sorted(root.glob("*.json"), reverse=True):
+            try:
+                metadata = json.loads(path.read_text(encoding="utf-8"))
+                if metadata.get("session_id") != session_id:
+                    continue
+                if metadata.get("status") in {"starting", "running"} or metadata.get("agent_received_at"):
+                    continue
+                metadata["agent_received_at"] = datetime.now().astimezone().isoformat()
+                path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                notifications.append(metadata)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+    except OSError:
+        return []
+    return notifications
+
+
+def _format_job_notifications(jobs: list[dict]) -> str:
+    lines = ["[BACKGROUND_JOB_RESULTS]", "后台任务已有结果，请根据结果判断下一步，不要重复已经完成的工作。"]
+    for job in jobs:
+        status = job.get("status", "unknown")
+        lines.append(f"job_id: {job.get('job_id', '')}")
+        lines.append(f"status: {status}, exit_code: {job.get('exit_code', '')}, elapsed_seconds: {job.get('elapsed_seconds', '')}")
+        lines.append(f"command: {job.get('command', '')}")
+        if job.get("error"):
+            lines.append(f"error: {job['error']}")
+        lines.append("Use job action=logs if the output is needed before deciding what to do.")
+    return "\n".join(lines)
+
+
+def _start_session_worker(session_id: str, transient_context: str = ""):
+    """Run an agent turn for an already prepared session."""
+    sd = state.sessions.get(session_id)
+    if not sd or sd.processing or not _provider or not _tool_manager:
+        return {"status": "skipped"}
+    turn_provider = _provider
+    turn_model = _provider_model
+    turn_model_config = _get_provider_model_capabilities(_providers_cfg, turn_provider, turn_model)
+    turn_fallback_mode = state.fallback_mode
+
+    def worker():
+        completed = False
+        sd._active_provider = turn_provider
+        try:
+            sd.processing = True
+            process_agent_turn(turn_provider, turn_model, _available_tools, _tool_manager, session_id=session_id, model_config=turn_model_config, fallback_mode=turn_fallback_mode, transient_context=transient_context)
+            completed = True
+        except Exception as error:
+            _emit("agent_done", f"Agent Error: {error}", session_id=session_id)
+        finally:
+            sd._active_provider = None
+            sd.processing = False
+            if completed:
+                sd.runtime_snapshot = {}
+            _emit("processing_done", {"cancelled": sd.cancel.is_set()}, session_id=session_id)
+            sd.cancel.clear()
+            if _session_manager and session_id in state.sessions:
+                _session_manager.save(
+                    session_id, sd.messages, history=list(sd.history),
+                    token_stats={"input": sd.input_tokens, "output": sd.output_tokens,
+                                 "prompt": sd.prompt_tokens, "eval": sd.eval_tokens,
+                                 "ctx": sd.ctx_tokens, "runtime": sd.runtime_snapshot},
+                )
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"status": "ok", "session_id": session_id}
+
+
+def _start_background_followup(session_id: str):
+    """Give finished job results directly to one autonomous agent follow-up."""
+    sd = state.sessions.get(session_id)
+    if not sd or sd.processing:
+        return {"status": "skipped"}
+    pending = _consume_job_notifications(session_id)
+    if not pending:
+        return {"status": "skipped"}
+    return _start_session_worker(session_id, _format_job_notifications(pending))
+
+
+def _job_watcher_loop() -> None:
+    """Deliver newly finished internal jobs without interrupting user turns."""
+    seen: dict[str, str] = {}
+    try:
+        for path in _job_metadata_root().glob("*.json"):
+            try:
+                metadata = json.loads(path.read_text(encoding="utf-8"))
+                seen[str(metadata.get("job_id", path.stem))] = str(metadata.get("status", ""))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+    except OSError:
+        pass
+    while True:
+        try:
+            root = _job_metadata_root()
+            for path in root.glob("*.json"):
+                try:
+                    metadata = json.loads(path.read_text(encoding="utf-8"))
+                    job_id = str(metadata.get("job_id", path.stem))
+                    status = str(metadata.get("status", ""))
+                    session_id = str(metadata.get("session_id", ""))
+                    if not session_id or status in {"starting", "running"}:
+                        continue
+                    if seen.get(job_id) == status or metadata.get("agent_received_at"):
+                        continue
+                    sd = state.sessions.get(session_id)
+                    if not sd or sd.processing:
+                        # Leave the job unclaimed. The active user turn may still
+                        # be finishing; the next watcher pass will deliver it.
+                        continue
+                    seen[job_id] = status
+                    _emit("background_job_result", {
+                        "job_id": job_id,
+                        "status": status,
+                        "session_id": session_id,
+                    }, session_id=session_id)
+                    _start_background_followup(session_id)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+        except OSError:
+            pass
+        time.sleep(1.0)
 
 
 def _refresh_runtime_tools() -> dict:
@@ -1656,7 +1845,6 @@ class WebAPI:
             model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
             native = _is_native(_provider, model_config)
             sd.messages = [{"role": "system", "content": format_system_prompt(_available_tools, tool_manager=_tool_manager, native_tools=native)}]
-
         sd.messages.append({"role": "user", "content": message})
         _emit("user", message, session_id=sid)
 
@@ -1818,12 +2006,17 @@ class WebAPI:
         except OSError as exc:
             return {"status": "error", "msg": f"Could not open image: {exc}"}
 
-    def get_jobs(self):
-        """Return persisted background jobs for the WebUI control panel."""
+    def get_jobs(self, include_history: bool = False):
+        """Return active or explicitly requested historical jobs for the WebUI."""
         try:
             from tools.job import Job
-            result = Job().run({"action": "list"})
-            return {"status": "ok", "jobs": result.get("jobs", [])}
+            result = Job().run({"action": "list", "include_history": bool(include_history), "_visible_only": True})
+            return {
+                "status": "ok",
+                "jobs": result.get("jobs", []),
+                "active": result.get("active", []),
+                "attention": result.get("attention", []),
+            }
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return {"status": "error", "msg": f"Could not load jobs: {exc}", "jobs": []}
 
@@ -1832,6 +2025,15 @@ class WebAPI:
         try:
             from tools.job import Job
             result = Job().run({"action": "cancel", "job_id": job_id})
+            return {"status": "ok" if result.get("ok") else "error", "msg": result.get("content", "")}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": str(exc)}
+
+    def archive_job(self, job_id: str):
+        """Archive an obsolete failed job while retaining it in history."""
+        try:
+            from tools.job import Job
+            result = Job().run({"action": "archive", "job_id": job_id})
             return {"status": "ok" if result.get("ok") else "error", "msg": result.get("content", "")}
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             return {"status": "error", "msg": str(exc)}
@@ -2204,6 +2406,7 @@ def main():
             os.path.join(PROJECT_ROOT, "sessions"),
             os.path.join(PROJECT_ROOT, "media"),
         )
+        threading.Thread(target=_job_watcher_loop, name="chengsi-job-watcher", daemon=True).start()
 
         # Don't create session at startup — created on first message or loaded from sidebar
 

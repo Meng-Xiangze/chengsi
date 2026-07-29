@@ -1,9 +1,15 @@
 import unittest
+from unittest.mock import Mock
 
 from core.agent_runtime import AgentRuntime, ToolOutcome
+from main import _summarize_turn_process
 
 
 class AgentRuntimeTests(unittest.TestCase):
+    def test_small_tool_progress_does_not_require_summary_round_trip(self):
+        records = [{"tool": "read", "arguments": {}, "ok": True, "result": "small"}]
+        self.assertEqual(_summarize_turn_process(None, "model", records, Mock(), False), "")
+
     def test_duplicate_call_is_returned_for_model_recovery_before_circuit_breaker(self):
         runtime = AgentRuntime(max_identical_calls=2, max_consecutive_failures=4)
         call = ("read", {"path": "example.txt"})

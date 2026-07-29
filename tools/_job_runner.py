@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+
+os.environ.setdefault("PYTHONUTF8", "1")
 from datetime import datetime, timezone
 from pathlib import Path
 

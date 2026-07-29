@@ -274,7 +274,7 @@ class OpenAIProvider(BaseProvider):
                 f"{self._base_url}{endpoint}",
                 headers=self._headers,
                 json=payload,
-                timeout=(8, 300),
+                timeout=(8, 60),
                 stream=True,
             )
             response.raise_for_status()

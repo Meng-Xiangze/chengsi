@@ -32,13 +32,56 @@ class JobTests(unittest.TestCase):
         (self.root / "job_test.json").write_text(json.dumps(metadata), encoding="utf-8")
 
         with patch("tools.job._job_root", return_value=self.root):
-            result = self.job.run({"action": "list"})
+            active_result = self.job.run({"action": "list"})
+            result = self.job.run({"action": "list", "include_history": True})
 
+        self.assertTrue(active_result["ok"])
+        self.assertEqual(active_result["jobs"], [])
         self.assertTrue(result["ok"])
         self.assertEqual(result["jobs"][0]["job_id"], "job_test")
         self.assertEqual(result["jobs"][0]["status"], "completed")
         self.assertEqual(result["jobs"][0]["elapsed_seconds"], 2)
         self.assertFalse(result["jobs"][0]["command_alive"])
+
+    def test_list_keeps_failed_jobs_without_history_flag(self):
+        metadata = {
+            "job_id": "job_failed",
+            "command": "broken command",
+            "cwd": str(self.root),
+            "status": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": "2026-01-01T00:00:01+00:00",
+            "runner_pid": 0,
+            "command_pid": 0,
+            "log_path": str(self.root / "job_failed.log"),
+            "error": "failed",
+        }
+        (self.root / "job_failed.json").write_text(json.dumps(metadata), encoding="utf-8")
+        with patch("tools.job._job_root", return_value=self.root):
+            result = self.job.run({"action": "list"})
+        self.assertEqual(result["jobs"][0]["status"], "failed")
+        self.assertEqual(result["attention"][0]["job_id"], "job_failed")
+
+    def test_archive_hides_failed_job_but_keeps_history_record(self):
+        metadata = {
+            "job_id": "job_archive",
+            "command": "broken command",
+            "cwd": str(self.root),
+            "status": "failed",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "runner_pid": 0,
+            "command_pid": 0,
+            "log_path": str(self.root / "job_archive.log"),
+        }
+        path = self.root / "job_archive.json"
+        path.write_text(json.dumps(metadata), encoding="utf-8")
+        with patch("tools.job._job_root", return_value=self.root):
+            result = self.job.run({"action": "archive", "job_id": "job_archive"})
+            listing = self.job.run({"action": "list"})
+            history = self.job.run({"action": "list", "include_history": True})
+        self.assertTrue(result["ok"])
+        self.assertEqual(listing["jobs"], [])
+        self.assertEqual(history["jobs"][0]["job_id"], "job_archive")
 
     def test_elapsed_seconds_uses_finished_time(self):
         metadata = {

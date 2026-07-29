@@ -105,7 +105,7 @@
       font-weight: 650;
       text-transform: uppercase;
     }
-    .session-list { flex: 1; overflow: auto; padding: 0 7px 10px; }
+    .session-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 7px 10px; }
     .session-item {
       width: 100%;
       min-height: 44px;
@@ -151,17 +151,30 @@
       background: var(--panel);
       border-left: 1px solid var(--line);
     }
-    .job-panel-header { padding: 14px 14px 8px; display: flex; align-items: center; justify-content: space-between; }
+    .job-panel-header { height: 42px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto; }
     .job-panel-title { font-weight: 650; }
-    .job-count { color: var(--muted); font-size: 11px; }
-    .job-list { min-height: 0; overflow: auto; padding: 0 9px 12px; }
+    .job-count { color: var(--muted); font-size: 11px; margin-left: auto; }
+    .job-panel-toggle, .job-history-toggle { border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+    .job-panel-toggle { width: 24px; height: 24px; padding: 0; font-size: 16px; line-height: 1; }
+    body:not(.job-panel-collapsed) .job-panel-toggle { transform: none; }
+    body.job-panel-collapsed .job-panel-toggle { transform: none; }
+    .job-panel-toggle:hover, .job-history-toggle:hover { color: var(--text); }
+    .job-history { border-top: 1px solid var(--line); margin-top: 2px; padding-top: 8px; }
+    .job-history-toggle { display: flex; align-items: center; width: 100%; padding: 4px 6px 8px; text-align: left; font-size: 12px; }
+    .job-history-toggle::before { content: "›"; margin-right: 5px; font-size: 16px; transition: transform .15s ease; }
+    .job-history-toggle[aria-expanded="true"]::before { transform: rotate(90deg); }
+    .job-history-list[hidden] { display: none; }
+    .job-list, .job-history-list { min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 9px 12px; }
+    .job-list { flex: 1 1 auto; }
+    .job-history { flex: 0 1 45%; min-height: 0; overflow: hidden; }
+    .job-history-list { height: 100%; }
     .job-empty { padding: 12px 5px; color: var(--muted); font-size: 12px; }
     .job-item { padding: 9px 6px; border-top: 1px solid var(--line); }
     .job-item:first-child { border-top: 0; }
     .job-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
     .job-status { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
     .job-status.running, .job-status.starting { background: var(--accent); }
-    .job-status.failed, .job-status.interrupted, .job-status.timed_out { background: var(--danger); }
+    .job-status.failed, .job-status.interrupted, .job-status.cancelled, .job-status.timed_out { background: var(--danger); }
     .job-command { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
     .job-meta { margin: 3px 0 0 14px; color: var(--muted); font-size: 11px; }
     .job-actions { display: flex; gap: 4px; margin: 6px 0 0 14px; }
@@ -170,6 +183,12 @@
     .job-log { max-height: 120px; margin: 6px 0 0 14px; padding: 6px; overflow: auto; white-space: pre-wrap; background: var(--panel-2); border-radius: 4px; font: 11px/1.35 Consolas, monospace; }
     @media (max-width: 980px) { .job-panel { width: 230px; } }
     @media (max-width: 760px) { .job-panel { display: none; } }
+    body.job-panel-collapsed .app { grid-template-columns: var(--sidebar) minmax(0, 1fr) 42px; }
+    body.sidebar-collapsed.job-panel-collapsed .app { grid-template-columns: 0 minmax(0, 1fr) 42px; }
+    body.job-panel-collapsed .job-panel { width: 42px; }
+    body.job-panel-collapsed .job-panel > *:not(.job-panel-header) { display: none; }
+    body.job-panel-collapsed .job-panel-header { height: 42px; padding: 0 9px; }
+    body.job-panel-collapsed .job-panel-title, body.job-panel-collapsed .job-count { display: none; }
     .topbar {
       height: 58px;
       padding: 0 16px;
@@ -555,8 +574,12 @@
       </div>
     </main>
     <aside class="job-panel" aria-label="Background jobs">
-      <div class="job-panel-header"><span class="job-panel-title">Background jobs</span><span class="job-count" id="jobCount">0</span></div>
-      <div class="job-list" id="jobList"><div class="job-empty">No background jobs.</div></div>
+      <div class="job-panel-header"><span class="job-panel-title">Background jobs</span><span class="job-count" id="jobCount">0</span><button class="job-panel-toggle" id="jobPanelToggle" type="button" title="Collapse jobs" aria-label="Collapse jobs">&gt;</button></div>
+      <div class="job-list" id="jobList"><div class="job-empty">No active jobs.</div></div>
+      <div class="job-history">
+        <button class="job-history-toggle" id="jobHistoryToggle" type="button" aria-expanded="false">History</button>
+        <div class="job-history-list" id="jobHistoryList" hidden><div class="job-empty">Expand to load history.</div></div>
+      </div>
     </aside>
   </div>
   <div class="toast" id="toast" role="status"></div>
@@ -592,6 +615,8 @@
       typingNode: null,
       stats: { input: 0, output: 0, prompt: 0, eval: 0, ctx: 0 },
       jobs: [],
+      jobHistory: [],
+      showJobHistory: false,
     };
     const $ = (id) => document.getElementById(id);
 
@@ -878,6 +903,10 @@
         showTyping();
         return;
       }
+      if (type === "background_job_result") {
+        toast("后台任务已完成，已加入下一轮处理上下文");
+        return;
+      }
       if (type === "tool_result") {
         hideTyping();
         addToolEvent(type, data);
@@ -972,34 +1001,61 @@
       return `${Math.floor(value / 3600)}h ${Math.floor(value % 3600 / 60)}m`;
     }
 
+    function renderJobs(jobs, targetId, emptyText) {
+      const list = $(targetId);
+      list.innerHTML = "";
+      if (!jobs.length) { list.innerHTML = `<div class="job-empty">${emptyText}</div>`; return; }
+      jobs.forEach((job) => {
+        const item = document.createElement("div");
+        item.className = "job-item";
+        const active = ["starting", "running"].includes(job.status);
+        const attention = ["failed", "interrupted", "cancelled", "timed_out"].includes(job.status);
+        item.innerHTML = `<div class="job-row"><span class="job-status ${escapeHtml(job.status)}"></span><span class="job-command" title="${escapeHtml(job.command)}">${escapeHtml(job.command)}</span></div><div class="job-meta">${escapeHtml(job.status)} · ${formatJobElapsed(job.elapsed_seconds)}${job.command_alive ? " · process alive" : ""}</div><div class="job-actions"><button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}${attention ? '<button type="button" data-action="archive">Archive</button>' : ""}</div>`;
+        item.querySelector('[data-action="logs"]').onclick = async () => {
+          const output = await app.api.get_job_logs(job.job_id, 80);
+          let log = item.querySelector(".job-log");
+          if (!log) { log = document.createElement("div"); log.className = "job-log"; item.appendChild(log); }
+          log.textContent = output?.content || output?.msg || "No log output.";
+        };
+        item.querySelector('[data-action="cancel"]')?.addEventListener("click", async () => {
+          const result = await app.api.cancel_job(job.job_id);
+          if (result?.status !== "ok") toast(result?.msg || "Could not stop job");
+          await refreshJobs();
+        });
+        item.querySelector('[data-action="archive"]')?.addEventListener("click", async () => {
+          const result = await app.api.archive_job(job.job_id);
+          if (result?.status !== "ok") toast(result?.msg || "Could not archive job");
+          await refreshJobs();
+        });
+        list.appendChild(item);
+      });
+    }
+
     async function refreshJobs() {
       if (!app.api?.get_jobs) return;
       try {
-        const result = await app.api.get_jobs();
+        const result = await app.api.get_jobs(false);
         app.jobs = result?.jobs || [];
-        const list = $("jobList");
-        list.innerHTML = "";
-        $("jobCount").textContent = String(app.jobs.length);
-        if (!app.jobs.length) { list.innerHTML = '<div class="job-empty">No background jobs.</div>'; return; }
-        app.jobs.forEach((job) => {
-          const item = document.createElement("div");
-          item.className = "job-item";
-          const active = ["starting", "running"].includes(job.status);
-          item.innerHTML = `<div class="job-row"><span class="job-status ${escapeHtml(job.status)}"></span><span class="job-command" title="${escapeHtml(job.command)}">${escapeHtml(job.command)}</span></div><div class="job-meta">${escapeHtml(job.status)} · ${formatJobElapsed(job.elapsed_seconds)}${job.command_alive ? " · process alive" : ""}</div><div class="job-actions"><button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}</div>`;
-          item.querySelector('[data-action="logs"]').onclick = async () => {
-            const output = await app.api.get_job_logs(job.job_id, 80);
-            let log = item.querySelector(".job-log");
-            if (!log) { log = document.createElement("div"); log.className = "job-log"; item.appendChild(log); }
-            log.textContent = output?.content || output?.msg || "No log output.";
-          };
-          item.querySelector('[data-action="cancel"]')?.addEventListener("click", async () => {
-            const result = await app.api.cancel_job(job.job_id);
-            if (result?.status !== "ok") toast(result?.msg || "Could not stop job");
-            await refreshJobs();
-          });
-          list.appendChild(item);
-        });
+        const attention = result?.attention || app.jobs.filter((job) => ["failed", "interrupted", "cancelled", "timed_out"].includes(job.status));
+        $("jobCount").textContent = String(app.jobs.filter((job) => ["starting", "running"].includes(job.status)).length);
+        renderJobs([...app.jobs.filter((job) => ["starting", "running"].includes(job.status)), ...attention], "jobList", "No active jobs.");
+        if (app.showJobHistory) await refreshJobHistory();
       } catch (error) { console.error(error); }
+    }
+
+    async function refreshJobHistory() {
+      try {
+        const result = await app.api.get_jobs(true);
+        app.jobHistory = (result?.jobs || []).filter((job) => !["starting", "running"].includes(job.status));
+        renderJobs(app.jobHistory, "jobHistoryList", "No completed jobs.");
+      } catch (error) { console.error(error); }
+    }
+
+    function setJobHistoryExpanded(value) {
+      app.showJobHistory = value;
+      $("jobHistoryToggle").setAttribute("aria-expanded", String(value));
+      $("jobHistoryList").hidden = !value;
+      if (value) refreshJobHistory();
     }
 
     function sessionDate(value) {
@@ -1312,6 +1368,22 @@
     document.addEventListener("click", (event) => { if (!event.target.closest(".menu-popover") && !event.target.closest(".session-menu")) closeMenu(); });
     window.addEventListener("resize", updateNavigationLabel);
     updateNavigationLabel();
+    $("jobHistoryToggle").onclick = () => setJobHistoryExpanded(!app.showJobHistory);
+    $("jobPanelToggle").onclick = () => {
+      const collapsed = document.body.classList.toggle("job-panel-collapsed");
+      const button = $("jobPanelToggle");
+      button.textContent = collapsed ? "<" : ">";
+      button.title = collapsed ? "Expand jobs" : "Collapse jobs";
+      button.setAttribute("aria-label", button.title);
+      localStorage.setItem("chengsi-job-panel-collapsed", String(collapsed));
+    };
+    if (localStorage.getItem("chengsi-job-panel-collapsed") === "true") {
+      document.body.classList.add("job-panel-collapsed");
+      $("jobPanelToggle").textContent = "<";
+      $("jobPanelToggle").title = "Expand jobs";
+      $("jobPanelToggle").setAttribute("aria-label", "Expand jobs");
+    }
+
     window.addEventListener("pywebviewready", initialize);
     if (window.pywebview?.api) initialize();
   </script>
