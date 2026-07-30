@@ -9,9 +9,7 @@ from dataclasses import dataclass
 
 LINE_HASH_HEX_LENGTH = 16
 REVISION_HEX_LENGTH = 24
-_REF_PATTERN = re.compile(
-    rf"^(?:(\d+):)?([0-9a-fA-F]{{{LINE_HASH_HEX_LENGTH}}})$"
-)
+_REF_PATTERN = re.compile(r"^(?:(\d+):)?([0-9a-fA-F]{4,16})$")
 
 
 @dataclass(frozen=True)
@@ -31,6 +29,21 @@ def revision(text: str) -> str:
 
 def anchor(line_number: int, content: str) -> str:
     return f"{line_number}:{line_hash(content)}"
+
+
+def unique_line_hashes(lines: list[str]) -> list[str]:
+    """Return the shortest unambiguous hex prefix for every line hash."""
+    hashes = [line_hash(line) for line in lines]
+    result = []
+    for index, value in enumerate(hashes):
+        for length in range(4, LINE_HASH_HEX_LENGTH + 1, 2):
+            prefix = value[:length]
+            if sum(other.startswith(prefix) for other in hashes) == 1:
+                result.append(prefix)
+                break
+        else:
+            result.append(value)
+    return result
 
 
 def parse_anchor(value: object) -> tuple[int | None, str]:
@@ -56,14 +69,14 @@ def validate_anchor(lines: list[str], value: object) -> int:
         if line_number < 1 or line_number > len(lines):
             raise ValueError(f"anchor {value} is outside the current file")
         actual_hash = line_hash(lines[line_number - 1])
-        if actual_hash != expected_hash:
+        if not actual_hash.startswith(expected_hash):
             raise ValueError(
                 f"stale anchor {value}; current anchor is {line_number}:{actual_hash}. Re-read the file."
             )
         return line_number - 1
 
     # A hash-only reference is accepted when it identifies exactly one line.
-    matches = [idx for idx, line in enumerate(lines) if line_hash(line) == expected_hash]
+    matches = [idx for idx, line in enumerate(lines) if line_hash(line).startswith(expected_hash)]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -122,8 +135,9 @@ def format_lines(text: str, path: str, offset: int = 1, limit: int = 400) -> str
     end = min(total, start + max(1, limit) - 1)
     header = f"[file: {path} rev: {revision(text)} lines: {total} showing: {start}-{end}]"
     output = [header, "[format: LINE:HASH|content; copy anchors exactly for edit operations]"]
+    prefixes = unique_line_hashes(layout.lines)
     output.extend(
-        f"{anchor(index, layout.lines[index - 1])}|{layout.lines[index - 1]}"
+        f"{index}:{prefixes[index - 1]}|{layout.lines[index - 1]}"
         for index in range(start, end + 1)
     )
     if end < total:

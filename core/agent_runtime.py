@@ -194,12 +194,10 @@ class AgentRuntime:
                 (action == "edit" and bool(arguments.get("edits")))
                 or (action == "write" and bool(arguments.get("content")))
             )
-        if not verifying:
-            verifying = action == "project_test"
-
+        # Verification is opt-in. project_test remains available as an ordinary
+        # tool, but file changes never create a runtime requirement to call it.
         if mutating and outcome.ok:
             self.changed_files = True
-            self.verified_after_change = False
         elif verifying and outcome.ok:
             self.verified_after_change = True
 
@@ -208,11 +206,12 @@ class AgentRuntime:
         return True, ""
 
     def needs_verification(self) -> bool:
-        return self.changed_files and not self.verified_after_change
+        """Compatibility API; verification is never runtime-mandatory."""
+        return False
 
     def can_request_verification(self) -> bool:
-        return self.needs_verification() and not self.verification_reminder_sent
+        return False
 
     def mark_verification_reminder(self) -> None:
-        self.verification_reminder_sent = True
+        return None
 

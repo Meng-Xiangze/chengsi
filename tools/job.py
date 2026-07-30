@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core.process_utils import child_environment
 from tools.base import BaseTool
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -119,6 +120,10 @@ class Job(BaseTool):
                 "type": "boolean",
                 "description": "Show this job in the WebUI job panel. Defaults to false for agent-internal jobs.",
             },
+            "auto_followup": {
+                "type": "boolean",
+                "description": "After the job finishes, automatically let Chengsi inspect the result and continue only when the user's request explicitly asked for that follow-up. Default false.",
+            },
             "_visible_only": {
                 "type": "boolean",
                 "description": "Internal WebUI filter; do not set this in normal agent requests.",
@@ -180,6 +185,7 @@ class Job(BaseTool):
             "created_at": _now(),
             "session_id": str(arguments.get("_session_id") or ""),
             "visible": bool(arguments.get("visible", False)),
+            "auto_followup": bool(arguments.get("auto_followup", False)),
             "origin": "agent",
             "runner_pid": None,
             "command_pid": None,
@@ -199,11 +205,15 @@ class Job(BaseTool):
                 [sys.executable, str(runner), str(metadata_path)],
                 cwd=str(cwd), stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                close_fds=True, creationflags=creationflags, **kwargs,
+                close_fds=True, creationflags=creationflags,
+                env=child_environment(), **kwargs,
             )
             return {
                 "ok": True,
-                "content": f"Background job started.\njob_id: {job_id}\nstatus: starting\nlog: {log_path}",
+                "content": (
+                    f"Background job accepted and started; it is NOT finished yet.\n"
+                    f"job_id: {job_id}\nstatus: starting\nauto_followup: {str(metadata['auto_followup']).lower()}\nlog: {log_path}"
+                ),
                 "error_code": "ok",
                 "job_id": job_id,
             }

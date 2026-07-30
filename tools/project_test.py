@@ -20,8 +20,8 @@ class ProjectTest(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Run Python syntax checks (py_compile), import checks, and config file "
-            "validation on the project. Optionally discover and run a test suite."
+            "Optional project health checks: run this only when the user explicitly asks for "
+            "tests, syntax checks, imports, or configuration validation. It is not required after every edit."
         )
 
     def is_verification(self, arguments: Dict[str, Any]) -> bool:

@@ -575,7 +575,7 @@
     </main>
     <aside class="job-panel" aria-label="Background jobs">
       <div class="job-panel-header"><span class="job-panel-title">Background jobs</span><span class="job-count" id="jobCount">0</span><button class="job-panel-toggle" id="jobPanelToggle" type="button" title="Collapse jobs" aria-label="Collapse jobs">&gt;</button></div>
-      <div class="job-list" id="jobList"><div class="job-empty">No active jobs.</div></div>
+      <div class="job-list" id="jobList"><div class="job-empty">No active background jobs.</div></div>
       <div class="job-history">
         <button class="job-history-toggle" id="jobHistoryToggle" type="button" aria-expanded="false">History</button>
         <div class="job-history-list" id="jobHistoryList" hidden><div class="job-empty">Expand to load history.</div></div>
@@ -602,6 +602,10 @@
 
   <script>
     "use strict";
+    window.MathJax = {
+      tex: { inlineMath: [["$", "$"], ["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] },
+      options: { skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"] }
+    };
     const app = {
       api: null,
       sessionId: "",
@@ -617,6 +621,8 @@
       jobs: [],
       jobHistory: [],
       showJobHistory: false,
+      expandedJobLogs: new Map(),
+      schedules: [],
     };
     const $ = (id) => document.getElementById(id);
 
@@ -629,8 +635,7 @@
       const blocks = [];
       const token = (prefix, html) => { const value = `@@${prefix}${blocks.length}@@`; blocks.push(html); return value; };
       text = text.replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, lang, code) => token("CODE", `<pre><code>${code.replace(/\n$/, "")}</code></pre>`));
-      // Protect display math before inline formatting; this is deliberately dependency-free.
-      text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_, formula) => token("MATH", `<div class="math">${formula.trim()}</div>`));
+      // Preserve formula delimiters for MathJax after the message enters the DOM.
       text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>")
         .replace(/^## (.+)$/gm, "<h2>$1</h2>")
         .replace(/^# (.+)$/gm, "<h1>$1</h1>")
@@ -669,6 +674,13 @@
       // Restore protected blocks by their actual token, including mixed code/math order.
       text.match(/@@(?:CODE|MATH)\d+@@/g)?.forEach(marker => { const n = Number(marker.match(/\d+/)[0]); html = html.replace(marker, blocks[n]); });
       return html;
+    }
+
+    function renderRichContent(node, source) {
+      node.innerHTML = renderMarkdown(source);
+      if (window.MathJax?.typesetPromise) {
+        window.MathJax.typesetPromise([node]).catch(() => {});
+      }
     }
 
     function toast(message) {
@@ -740,7 +752,7 @@
           });
           body.appendChild(attachments);
         }
-      } else body.innerHTML = renderMarkdown(String(content ?? ""));
+      } else renderRichContent(body, String(content ?? ""));
       row.appendChild(body);
       addCopyAction(row, body, content);
       $("chat").appendChild(row);
@@ -904,7 +916,16 @@
         return;
       }
       if (type === "background_job_result") {
-        toast("后台任务已完成，已加入下一轮处理上下文");
+        const status = String(data?.status || "unknown");
+        const statusLabels = {
+          completed: "Background job completed",
+          failed: "Background job failed",
+          interrupted: "Background job interrupted",
+          cancelled: "Background job cancelled",
+          timed_out: "Background job timed out",
+        };
+        toast(statusLabels[status] || `Background job ${status}`);
+        refreshJobs(false);
         return;
       }
       if (type === "tool_result") {
@@ -920,7 +941,7 @@
           app.currentAgent = addMessage("agent", "");
         }
         app.currentAgentText += String(data ?? "");
-        app.currentAgent.innerHTML = renderMarkdown(app.currentAgentText);
+        renderRichContent(app.currentAgent, app.currentAgentText);
         app.currentAgent.dataset.copyContent = app.currentAgentText;
         scrollToBottom();
         return;
@@ -930,7 +951,7 @@
         app.currentThinking = null;
         if (app.currentAgent) {
           app.currentAgentText = String(data ?? "");
-          app.currentAgent.innerHTML = renderMarkdown(app.currentAgentText);
+          renderRichContent(app.currentAgent, app.currentAgentText);
           app.currentAgent.dataset.copyContent = app.currentAgentText;
           app.currentAgent = null;
         } else addMessage("agent", data);
@@ -1008,25 +1029,50 @@
       jobs.forEach((job) => {
         const item = document.createElement("div");
         item.className = "job-item";
-        const active = ["starting", "running"].includes(job.status);
+        const scheduled = job.kind === "schedule";
+        const active = scheduled ? job.status === "scheduled" : ["starting", "running"].includes(job.status);
         const attention = ["failed", "interrupted", "cancelled", "timed_out"].includes(job.status);
-        item.innerHTML = `<div class="job-row"><span class="job-status ${escapeHtml(job.status)}"></span><span class="job-command" title="${escapeHtml(job.command)}">${escapeHtml(job.command)}</span></div><div class="job-meta">${escapeHtml(job.status)} · ${formatJobElapsed(job.elapsed_seconds)}${job.command_alive ? " · process alive" : ""}</div><div class="job-actions"><button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}${attention ? '<button type="button" data-action="archive">Archive</button>' : ""}</div>`;
-        item.querySelector('[data-action="logs"]').onclick = async () => {
-          const output = await app.api.get_job_logs(job.job_id, 80);
-          let log = item.querySelector(".job-log");
-          if (!log) { log = document.createElement("div"); log.className = "job-log"; item.appendChild(log); }
-          log.textContent = output?.content || output?.msg || "No log output.";
-        };
-        item.querySelector('[data-action="cancel"]')?.addEventListener("click", async () => {
-          const result = await app.api.cancel_job(job.job_id);
-          if (result?.status !== "ok") toast(result?.msg || "Could not stop job");
-          await refreshJobs();
-        });
-        item.querySelector('[data-action="archive"]')?.addEventListener("click", async () => {
-          const result = await app.api.archive_job(job.job_id);
-          if (result?.status !== "ok") toast(result?.msg || "Could not archive job");
-          await refreshJobs();
-        });
+        const label = scheduled ? job.prompt : job.command;
+        const meta = scheduled
+          ? `${escapeHtml(job.status)} · next ${escapeHtml(job.run_at || "--")}${job.interval_seconds ? ` · every ${formatJobElapsed(job.interval_seconds)}` : " · one time"}`
+          : `${escapeHtml(job.status)} · ${formatJobElapsed(job.elapsed_seconds)}${job.command_alive ? " · process alive" : ""}`;
+        const actions = scheduled
+          ? (active ? '<button type="button" data-action="cancel">Cancel</button>' : "")
+          : `<button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}${attention ? '<button type="button" data-action="archive">Archive</button>' : ""}`;
+        item.innerHTML = `<div class="job-row"><span class="job-status ${escapeHtml(job.status)}"></span><span class="job-command" title="${escapeHtml(label)}">${escapeHtml(label)}</span></div><div class="job-meta">${meta}</div><div class="job-actions">${actions}</div>`;
+        if (scheduled) {
+          item.querySelector('[data-action="cancel"]')?.addEventListener("click", async () => {
+            const result = await app.api.cancel_schedule(job.schedule_id);
+            if (result?.status !== "ok") toast(result?.msg || "Could not cancel scheduled task");
+            await refreshJobs();
+          });
+        } else {
+          item.querySelector('[data-action="logs"]').onclick = async () => {
+            const output = await app.api.get_job_logs(job.job_id, 80);
+            const content = output?.content || output?.msg || "No log output.";
+            app.expandedJobLogs.set(job.job_id, content);
+            let log = item.querySelector(".job-log");
+            if (!log) { log = document.createElement("div"); log.className = "job-log"; item.appendChild(log); }
+            log.textContent = content;
+          };
+          item.querySelector('[data-action="cancel"]')?.addEventListener("click", async () => {
+            const result = await app.api.cancel_job(job.job_id);
+            if (result?.status !== "ok") toast(result?.msg || "Could not stop job");
+            await refreshJobs();
+          });
+          item.querySelector('[data-action="archive"]')?.addEventListener("click", async () => {
+            const result = await app.api.archive_job(job.job_id);
+            if (result?.status !== "ok") toast(result?.msg || "Could not archive job");
+            await refreshJobs();
+          });
+          const savedLog = app.expandedJobLogs.get(job.job_id);
+          if (savedLog !== undefined) {
+            const log = document.createElement("div");
+            log.className = "job-log";
+            log.textContent = savedLog;
+            item.appendChild(log);
+          }
+        }
         list.appendChild(item);
       });
     }
@@ -1036,9 +1082,14 @@
       try {
         const result = await app.api.get_jobs(false);
         app.jobs = result?.jobs || [];
+        const resultSchedules = app.api.get_schedules ? await app.api.get_schedules() : { schedules: [] };
+        app.schedules = resultSchedules?.schedules || [];
+        const scheduleJobs = app.schedules.map((schedule) => ({ ...schedule, kind: "schedule" }));
         const attention = result?.attention || app.jobs.filter((job) => ["failed", "interrupted", "cancelled", "timed_out"].includes(job.status));
-        $("jobCount").textContent = String(app.jobs.filter((job) => ["starting", "running"].includes(job.status)).length);
-        renderJobs([...app.jobs.filter((job) => ["starting", "running"].includes(job.status)), ...attention], "jobList", "No active jobs.");
+        const activeJobs = app.jobs.filter((job) => ["starting", "running"].includes(job.status));
+        const activeSchedules = scheduleJobs.filter((schedule) => schedule.status === "scheduled");
+        $("jobCount").textContent = String(activeJobs.length + activeSchedules.length);
+        renderJobs([...activeJobs, ...activeSchedules, ...attention], "jobList", "No active background jobs.");
         if (app.showJobHistory) await refreshJobHistory();
       } catch (error) { console.error(error); }
     }
@@ -1046,8 +1097,13 @@
     async function refreshJobHistory() {
       try {
         const result = await app.api.get_jobs(true);
-        app.jobHistory = (result?.jobs || []).filter((job) => !["starting", "running"].includes(job.status));
-        renderJobs(app.jobHistory, "jobHistoryList", "No completed jobs.");
+        const resultSchedules = app.api.get_schedules ? await app.api.get_schedules() : { schedules: [] };
+        const scheduleHistory = (resultSchedules?.schedules || []).filter((schedule) => schedule.status !== "scheduled").map((schedule) => ({ ...schedule, kind: "schedule" }));
+        app.jobHistory = [
+          ...(result?.jobs || []).filter((job) => !["starting", "running"].includes(job.status)),
+          ...scheduleHistory,
+        ];
+        renderJobs(app.jobHistory, "jobHistoryList", "No completed background jobs.");
       } catch (error) { console.error(error); }
     }
 
@@ -1387,5 +1443,6 @@
     window.addEventListener("pywebviewready", initialize);
     if (window.pywebview?.api) initialize();
   </script>
+  <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" onload="MathJax.typesetPromise?.()"></script>
 </body>
 </html>

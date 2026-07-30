@@ -6,7 +6,7 @@ parameters:
 examples:
   - {command: dir, note: "List files on Windows"}
   - {command: "find . -name '*.py' | head -5", note: "Find Python files on Linux"}
-  - {command: "pip install requests", note: "Install a Python package"}
+  - {command: "python -m pip install requests", note: "Install into Chengsi's active virtual environment"}
 usage_notes:
   - "Timeout is 60 seconds"
   - "Runs in the current working directory"
@@ -16,7 +16,8 @@ usage_notes:
 # bash
 
 Execute a shell command directly. Works like a terminal — `dir`/`ls` for listing,
-`find`/`grep` for searching, `mkdir`/`cp`/`mv` for file operations, `pip install` for
-packages, and anything else a command line can do.
+`find`/`grep` for searching, `mkdir`/`cp`/`mv` for file operations, and
+`python -m pip install` for packages. Python and pip commands are automatically bound to
+Chengsi's active virtual environment.
 
 Prefer this over `python_executor` for simple shell operations.

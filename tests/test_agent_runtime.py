@@ -61,6 +61,18 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertFalse(admissions[0][0])
         self.assertTrue(admissions[1][0])
 
+    def test_file_changes_do_not_require_project_test(self):
+        runtime = AgentRuntime()
+        allowed, reason = runtime.allow_each([("write", {"path": "report.txt", "content": "done"})])[0]
+        self.assertTrue(allowed, reason)
+        should_continue, stop_reason = runtime.observe(
+            "write", {"path": "report.txt", "content": "done"}, ToolOutcome(True, "written")
+        )
+        self.assertTrue(should_continue)
+        self.assertEqual(stop_reason, "")
+        self.assertFalse(runtime.needs_verification())
+        self.assertFalse(runtime.can_request_verification())
+
     def test_repeated_rejections_eventually_stop_the_turn(self):
         runtime = AgentRuntime(max_identical_calls=0, max_consecutive_failures=2)
         call = ("read", {"path": "example.txt"})

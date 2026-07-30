@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools._hashline import anchor, revision
+from tools._hashline import anchor, revision, unique_line_hashes
 from tools.edit import Edit
 from tools.read import Read
 
@@ -33,7 +33,8 @@ class CodeToolTests(unittest.TestCase):
             "symbol": "Example.second",
         })
         self.assertIn("[python symbol: Example.second]", symbol)
-        self.assertIn(f"5:{anchor(5, '    def second(self):').split(':')[1]}|", symbol)
+        expected_hash = unique_line_hashes(SOURCE.splitlines())[4]
+        self.assertIn(f"5:{expected_hash}|", symbol)
         self.assertNotIn("def first", symbol)
 
     def test_replace_range_uses_inclusive_hash_anchors(self):
@@ -107,6 +108,11 @@ class CodeToolTests(unittest.TestCase):
         })
         self.assertIn("invalid Python", result)
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_offset_beyond_file_returns_last_lines(self):
+        result = self.read.run({"path": str(self.path), "offset": 999, "limit": 2})
+        self.assertIn("return 2", result)
+        self.assertNotIn("exceeds file length", result)
 
     def test_preserves_utf8_bom_and_crlf(self):
         source = SOURCE.replace("\n", "\r\n")

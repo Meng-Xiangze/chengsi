@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """Execute a shell command and return stdout/stderr."""
+import os
+import shutil
 import subprocess
 from typing import Any
 
+from core.process_utils import child_environment, decode_output, prepare_shell_command
 from tools.base import BaseTool
 
 
@@ -14,9 +17,10 @@ class Bash(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Execute a shell command (cmd on Windows, bash on Linux/Mac). "
+            "Execute a shell command in the project's configured child environment "
+            "(cmd.exe on Windows, bash on Linux/Mac). Python commands use this project's .venv. "
             "Returns stdout and stderr. PREFERRED for: file ops (ls, cp, mv, rm, mkdir, find), "
-            "git (status, diff, log, commit), package installs (pip install), system info. "
+            "git (status, diff, log, commit), package installs (python -m pip), system info. "
             "Single-line commands are fastest — use bash for 1-shot terminal tasks. "
             "For multi-step logic, data processing, or complex scripting, use python_executor. "
             "For commands that may run longer than one minute, use job so they continue in the background. "
@@ -38,15 +42,15 @@ class Bash(BaseTool):
             return "Error: command is required."
 
         try:
+            shell = os.environ.get("COMSPEC", "cmd.exe") if os.name == "nt" else "/bin/bash"
             result = subprocess.run(
-                command,
+                prepare_shell_command(command),
                 shell=True,
+                executable=shell,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=60,
-                cwd=None,  # runs in the current working directory
+                cwd=None,
+                env=child_environment(),
             )
         except subprocess.TimeoutExpired:
             return {
@@ -62,10 +66,12 @@ class Bash(BaseTool):
             }
 
         parts = []
-        if result.stdout:
-            parts.append(result.stdout.rstrip())
-        if result.stderr:
-            parts.append(f"[stderr]\n{result.stderr.rstrip()}")
+        stdout = decode_output(result.stdout)
+        stderr = decode_output(result.stderr)
+        if stdout:
+            parts.append(stdout.rstrip())
+        if stderr:
+            parts.append(f"[stderr]\n{stderr.rstrip()}")
         if result.returncode != 0:
             parts.append(f"[exit code: {result.returncode}]")
 

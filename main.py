@@ -1,7 +1,7 @@
 import sys, os, json, time, threading, queue, re, signal, subprocess, base64, shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -239,7 +239,8 @@ def format_system_prompt(available_tools: dict = None, tool_manager=None,
                          failure_alert: str | None = None, native_tools: bool = False) -> str:
     p = """You are Chengsi (澄思), a pragmatic agent with local tools and a knowledge base.
 Complete the user's task. When asked to act, use an available tool instead of giving instructions.
-Inspect before editing and verify the end state afterward. Never claim success when tool output contains errors.
+Inspect before editing when needed. Validate results when the user asks for checks or when the task itself requires verification; do not run project_test by default. Never claim success when tool output contains errors.
+For background jobs, always report completion, failure, interruption, or cancellation when notified. Set job.start auto_followup=true only when the user's original request explicitly asks for work to continue automatically after completion (for example, generate a report from the finished scan); otherwise leave it false and only notify the user.
 If an attempt fails, change approach; never repeat the same call more than twice.
 Keep a concise task state and emit brief progress checkpoints when useful: what you found, what you are doing next, or what is blocked. Do not write a long preamble; act as soon as the next action is clear. Return only a tool call, a necessary clarification, or the final answer.
 Do not create a new tool unless the user explicitly asks for a reusable tool. Do not modify Chengsi's own core/ directory or main.py; other projects may be modified when requested.
@@ -481,7 +482,7 @@ def _verification_tool_outcome(action: str, result: str) -> ToolOutcome | None:
 
 
 def _execute_tool(action: str, args: dict, available_tools: dict, session_id: str, tool_call_id: str | None = None):
-    if action in {"system_cleaner", "job"} and isinstance(args, dict):
+    if action in {"system_cleaner", "job", "schedule"} and isinstance(args, dict):
         args = dict(args)
         args["_session_id"] = session_id
     started = time.time()
@@ -1328,9 +1329,11 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     # status/logs in the same turn; the watcher will provide the
                     # terminal result in a separate follow-up turn.
                     terminal_tool_blocker = (
-                        "A background job was started successfully. Do not call job status, logs, or list "
-                        "for it now. End this turn with a concise confirmation and wait for the background "
-                        "result event."
+                        "The background job was only accepted and started; it is NOT complete. "
+                        "Do not claim that the requested work is finished. Do not call job status, logs, "
+                        "or list in this turn. End with a concise statement that the job is running and "
+                        "wait for the explicit completion event. If that event reports failed, report failure "
+                        "and the exit code, never success."
                     )
                     sd.messages.append({"role": "user", "content": "[BACKGROUND JOB HANDOFF] " + terminal_tool_blocker})
                     continue
@@ -1370,17 +1373,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     last_summary_record_count = len(turn_tool_records)
                     last_summary_source_size = source_size
                 continue
-            if runtime.can_request_verification():
-                runtime.mark_verification_reminder()
-                sd.messages.append({
-                    "role": "user",
-                    "content": "[RUNTIME REQUIREMENT] Files changed successfully, but no successful project_test has run since the change. Run the most relevant project_test now. If verification cannot run, report that limitation explicitly.",
-                })
-                continue
-
             clean_response = re.sub(r"<tool_call>.*?</tool_call>", "", full_response, flags=re.DOTALL).strip()
-            if runtime.needs_verification():
-                clean_response = (clean_response + "\n\nVerification was not completed after the file changes.").strip()
             if not clean_response:
                 # Model produced nothing (no content, no tool calls). Inject a
                 # one-time nudge so the next iteration tries again instead of
@@ -1428,6 +1421,56 @@ def _job_metadata_root():
     return _job_root()
 
 
+def _schedule_metadata_root():
+    from tools.schedule import _schedule_root
+    return _schedule_root()
+
+
+def _run_due_schedules() -> None:
+    """Start due scheduled prompts when their target session is idle."""
+    now = datetime.now().astimezone()
+    try:
+        for path in _schedule_metadata_root().glob("*.json"):
+            try:
+                metadata = json.loads(path.read_text(encoding="utf-8"))
+                if metadata.get("status") != "scheduled":
+                    continue
+                run_at = datetime.fromisoformat(str(metadata.get("run_at", "")))
+                if run_at > now:
+                    continue
+                session_id = str(metadata.get("session_id", ""))
+                sd = state.sessions.get(session_id)
+                if not sd or sd.processing or not _provider or not _tool_manager:
+                    continue
+                interval = metadata.get("interval_seconds")
+                if interval:
+                    next_run = run_at
+                    while next_run <= now:
+                        next_run += timedelta(seconds=int(interval))
+                    metadata["run_at"] = next_run.isoformat()
+                else:
+                    metadata["status"] = "completed"
+                metadata["last_run_at"] = now.isoformat()
+                path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                context = (
+                    "[SCHEDULED_TASK]\n"
+                    "This is an explicitly scheduled user task. Perform the requested work now using normal tools. "
+                    "Report the actual result to the user. Do not create another schedule unless the prompt explicitly asks for it.\n"
+                    f"Scheduled prompt: {metadata.get('prompt', '')}"
+                )
+                _start_session_worker(session_id, context)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    except OSError:
+        pass
+
+
+def _schedule_watcher_loop() -> None:
+    while True:
+        _run_due_schedules()
+        time.sleep(1.0)
+
+
 def _consume_job_notifications(session_id: str) -> list[dict]:
     """Claim finished jobs for a session so the next user turn can process them."""
     if not session_id:
@@ -1453,7 +1496,10 @@ def _consume_job_notifications(session_id: str) -> list[dict]:
 
 
 def _format_job_notifications(jobs: list[dict]) -> str:
-    lines = ["[BACKGROUND_JOB_RESULTS]", "后台任务已有结果，请根据结果判断下一步，不要重复已经完成的工作。"]
+    lines = [
+        "[BACKGROUND_JOB_RESULTS]",
+        "A background job has a terminal result. First report its actual status to the user. Continue processing, generate a report, or perform a follow-up action only when the original request explicitly asked for it.",
+    ]
     for job in jobs:
         status = job.get("status", "unknown")
         lines.append(f"job_id: {job.get('job_id', '')}")
@@ -1549,8 +1595,13 @@ def _job_watcher_loop() -> None:
                         "job_id": job_id,
                         "status": status,
                         "session_id": session_id,
+                        "auto_followup": bool(metadata.get("auto_followup", False)),
                     }, session_id=session_id)
-                    _start_background_followup(session_id)
+                    # Every terminal job is first surfaced as a notification. Only
+                    # an explicit auto_followup decision made when the job was
+                    # started may trigger one autonomous result-processing turn.
+                    if metadata.get("auto_followup", False):
+                        _start_background_followup(session_id)
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
         except OSError:
@@ -2006,6 +2057,28 @@ class WebAPI:
         except OSError as exc:
             return {"status": "error", "msg": f"Could not open image: {exc}"}
 
+    def get_schedules(self):
+        """Return scheduled agent tasks for the current WebUI session."""
+        try:
+            from tools.schedule import Schedule
+            result = Schedule().run({"action": "list", "_session_id": state.current_session_id})
+            return {"status": "ok", "schedules": result.get("schedules", [])}
+        except Exception as exc:
+            return {"status": "error", "msg": f"Could not load schedules: {exc}", "schedules": []}
+
+    def cancel_schedule(self, schedule_id: str):
+        """Cancel a scheduled agent task from the WebUI."""
+        try:
+            from tools.schedule import Schedule
+            result = Schedule().run({
+                "action": "cancel",
+                "schedule_id": schedule_id,
+                "_session_id": state.current_session_id,
+            })
+            return {"status": "ok" if result.get("ok") else "error", "msg": result.get("content", "")}
+        except Exception as exc:
+            return {"status": "error", "msg": f"Could not cancel schedule: {exc}"}
+
     def get_jobs(self, include_history: bool = False):
         """Return active or explicitly requested historical jobs for the WebUI."""
         try:
@@ -2407,6 +2480,7 @@ def main():
             os.path.join(PROJECT_ROOT, "media"),
         )
         threading.Thread(target=_job_watcher_loop, name="chengsi-job-watcher", daemon=True).start()
+        threading.Thread(target=_schedule_watcher_loop, name="chengsi-schedule-watcher", daemon=True).start()
 
         # Don't create session at startup — created on first message or loaded from sidebar
 

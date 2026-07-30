@@ -5,6 +5,7 @@ import subprocess
 import sys
 import warnings
 from typing import Any, Dict
+from core.process_utils import child_environment, decode_output
 from tools.base import BaseTool
 
 # Suppress all warnings to prevent polluting Agent output with non-critical logs
@@ -85,21 +86,19 @@ class PythonExecutor(BaseTool):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=300,
                 check=False,
+                env=child_environment(),
             )
         except subprocess.TimeoutExpired as error:
-            stdout_res = error.stdout or ""
-            stderr_res = error.stderr or ""
+            stdout_res = decode_output(error.stdout)
+            stderr_res = decode_output(error.stderr)
             return self._format_result(stdout_res, stderr_res, "Execution timed out after 300 seconds.")
         except OSError as error:
             return f"Error: could not start isolated Python process: {error}"
 
-        stdout_res = completed.stdout or ""
-        stderr_res = completed.stderr or ""
+        stdout_res = decode_output(completed.stdout)
+        stderr_res = decode_output(completed.stderr)
         if completed.returncode:
             stderr_res = stderr_res or f"Execution failed with exit code {completed.returncode}."
         return self._format_result(stdout_res, stderr_res)

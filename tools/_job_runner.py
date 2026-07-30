@@ -5,7 +5,12 @@ import os
 import subprocess
 import sys
 
-os.environ.setdefault("PYTHONUTF8", "1")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+from core.process_utils import child_environment, prepare_shell_command
+
+os.environ.update(child_environment())
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,14 +46,14 @@ def main() -> int:
     try:
         with log_path.open("a", encoding="utf-8", errors="replace", buffering=1) as log:
             process = subprocess.Popen(
-                metadata["command"],
+                prepare_shell_command(metadata["command"]),
                 shell=True,
                 cwd=metadata["cwd"],
                 stdin=subprocess.DEVNULL,
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                text=True,
                 creationflags=creationflags,
+                env=child_environment(),
             )
             _write_metadata(metadata_path, {
                 "status": "running",
@@ -61,6 +66,7 @@ def main() -> int:
         _write_metadata(metadata_path, {
             "status": "completed" if return_code == 0 else "failed",
             "exit_code": return_code,
+            "error": "" if return_code == 0 else f"Command exited with code {return_code}.",
             "finished_at": _now(),
             "last_activity_at": _now(),
         })

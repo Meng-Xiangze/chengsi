@@ -274,7 +274,9 @@ class OpenAIProvider(BaseProvider):
                 f"{self._base_url}{endpoint}",
                 headers=self._headers,
                 json=payload,
-                timeout=(8, 60),
+                # Keep transport read timeout aligned with the runtime's
+                # five-minute idle guard; active streams reset that guard.
+                timeout=(8, 300),
                 stream=True,
             )
             response.raise_for_status()

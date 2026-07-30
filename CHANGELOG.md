@@ -4,6 +4,26 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-07-30
+
+### Changed
+
+- Read requests with an offset beyond the file or sheet now return the final available record.
+- Line anchors use the shortest unique hash prefix while accepting legacy 16-character anchors.
+- Removed the runtime's unconditional `project_test` injection after file changes; verification remains available when requested.
+- Background job completion now updates the UI without automatically starting an agent follow-up turn.
+- Unified assistant Markdown rendering with MathJax support for inline and display LaTeX delimiters.
+- OpenAI-compatible streaming transport read timeout now matches the five-minute runtime idle guard.
+- Job start/result semantics now distinguish accepted, completed, and failed states; failures expose exit codes and are never reported as successful completion.
+- Added persistent scheduled agent tasks with one-time and interval execution; scheduled turns can call normal tools and always receive the authoritative current time.
+- WebUI now displays scheduled tasks in the unified Background jobs panel, with consistent status, history, and cancellation controls; terminal notifications use English status text.
+- Bash, Python executor, and Job now use a shared child environment with the active virtual environment and explicit UTF-8 handling; Windows shell commands use UTF-8 code page 65001.
+- Shell commands invoking `python`, `python3`, or `pip` are normalized to the active Chengsi interpreter, eliminating accidental system-environment installs.
+
+### Tests
+
+- Added regression coverage for offset clamping, compact hash anchors, and optional verification behavior.
+
 ## [0.5.0] - 2026-07-29
 
 ### Added

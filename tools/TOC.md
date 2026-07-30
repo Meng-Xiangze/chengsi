@@ -7,16 +7,17 @@
 - `ls`: List directory contents with file sizes and types.
 
 ## Execution
-- `bash`: Run a bounded foreground shell command. Required: `command`. 60s timeout.
-- `python_executor`: Run bounded foreground Python code for calculations, file I/O, and OS operations. Required: `code`.
-- `job`: Start and manage persistent background shell jobs. Actions: start, status, logs, list, cancel.
+- `bash`: Run a bounded foreground command in the project child environment (cmd.exe on Windows, bash elsewhere); output is normalized to UTF-8. Required: `command`. 60s timeout.
+- `python_executor`: Run bounded foreground Python in the project's active virtual environment with UTF-8 output. Required: `code`.
+- `job`: Start and manage persistent background shell jobs in the same child environment. `start` means accepted/running, not completed. Actions: start, status, logs, list, cancel.
+- `schedule`: Create persistent one-time or repeating scheduled agent turns. Scheduled turns can call normal tools such as `web_searcher`. Actions: create, list, cancel.
 
 ## Web
 - `web_searcher`: Search the web via DuckDuckGo. Required: `query`.
 - `web_reader`: Fetch a URL and extract text, links, tables, code, or headers.
 
 ## Project
-- `project_test`: Check project health — syntax, imports, config, unittest. Optional: `scope`.
+- `project_test`: Optional project health checks for explicit user requests; never required after edits. Optional: `scope`.
 - `system_cleaner`: Preview/clean system temp, Python cache, recycle bin. `dry_run=false` to delete.
 
 ## Meta

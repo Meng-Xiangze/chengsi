@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.5.0**
+**Version 0.5.1**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -24,8 +24,12 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - Persistent background jobs for commands that run for minutes or hours, with status, log, list, and cancel operations
 - **Background Job panel**: the WebUI right panel lists persisted jobs, shows live process state and elapsed time, opens log tails, and stops active jobs without leaving the chat
 - Tool failures and duplicate-call limits are returned to the model for recovery; independent calls in the same batch continue, while repeated failures still trigger a tool-execution circuit breaker
-- Stable code editing with file revisions, 64-bit line anchors, atomic writes, Python symbol replacement, and syntax validation
-- Progress-based model-stream protection: five minutes without an event stops a stalled request, but active turns have no total duration limit
+- Stable code editing with file revisions, shortest unique line-hash anchors, atomic writes, Python symbol replacement, and syntax validation
+- Progress-based model-stream protection: five minutes without an event stops a stalled request, transport read timeout is aligned to that guard, and active turns have no total duration limit
+- Background job completion is always notified; autonomous follow-up is opt-in via the user's explicit request. Job start means accepted/running, not completed; failed jobs preserve exit codes and error details.
+- Persistent `schedule` tasks can trigger normal agent turns at a specified time or interval, allowing scheduled work to call tools such as `web_searcher` and report results to the creating session.
+- Text and spreadsheet reads clamp oversized offsets to the final available record instead of failing
+- Child tools share one environment contract: the active project virtual environment, explicit UTF-8 settings, Windows `cmd.exe`, and normalized Chinese command output; `python`, `python3`, and `pip` commands are bound to that environment
 - Background job status includes runner/process liveness and structured metadata for recovery after application restarts
 - Day and night themes
 - Optional parallel tool execution — run independent tools concurrently
@@ -48,7 +52,7 @@ Chengsi's default configuration uses Ollama with Qwen3 8B, a capable but resourc
 - **Go step by step.** Ask for one clear action at a time ("read README.md", "list the tools/ directory") rather than bundling multiple complex tasks into a single message.
 - **Break down complex tasks.** Instead of "build a complete Snake game and launch it," start with "create a snake.py file with the game loop" and iterate from there.
 - **Be specific about file paths.** Say "put it on my Desktop at C:\\Users\\...\\Desktop" rather than "put it on the desktop."
-- **Use `bash` for install commands directly.** "pip install pygame" is more effective than describing the need for pygame and hoping the model infers the command.
+- **Use `bash` for install commands directly.** Use `python -m pip install pygame`; Chengsi binds `python` and `pip` to the active project virtual environment instead of the system interpreter.
 - **Watch the token counter** in the top bar. When context exceeds ~20K tokens with small models, reasoning quality degrades noticeably. Use the ↧ compact button to reclaim space.
 - **Thinking stays on.** The Ollama provider keeps `think: true` so the model reasons before acting. If the model ever produces thinking text but fails to emit a tool call, Chengsi automatically scans the thinking buffer and extracts any tool calls it finds — this works around a known Ollama interaction with Qwen models.
 

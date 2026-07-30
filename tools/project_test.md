@@ -11,5 +11,6 @@ examples:
     arguments:
       scope: syntax
 usage_notes:
-  - Use syntax for a fast compile check, tests for the deterministic unittest suite, and all before declaring a change complete.
+  - This is an opt-in tool. Use it only when the user asks for project tests, health checks, syntax checks, imports, or configuration validation.
+  - Do not call it automatically after edits or ordinary file operations.
 ---

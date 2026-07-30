@@ -940,10 +940,13 @@ class Read(BaseTool):
             except (TypeError, ValueError):
                 pass
 
+        # An oversized offset means "read from the end". This keeps pagination
+        # idempotent when a previous response reports a stale continuation point.
+        if total == 0:
+            return format_lines(text, Read._relpath(filepath), 1, 1)
+        offset = min(offset, total)
         start = offset - 1
         end = min(start + limit, total)
-        if start >= total:
-            return f"Error: offset {offset} exceeds file length ({total} lines)."
 
         rel = Read._relpath(filepath)
         result = format_lines(text, rel, start + 1, end - start)

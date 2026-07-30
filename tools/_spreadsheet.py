@@ -63,6 +63,8 @@ def read_xlsx(path: Path, offset: int = 1, limit: int = 200) -> str:
 def render_rows(label: str, rows: list[list[str]], offset: int, limit: int) -> str:
     start = max(1, int(offset or 1))
     count = max(1, min(int(limit or 200), 1000))
+    if rows:
+        start = min(start, len(rows))
     selected = rows[start - 1:start - 1 + count]
     output = [f"# {label} ({len(rows)} rows)", "[format: ROW | comma-separated cells]"]
     for number, row in enumerate(selected, start=start):

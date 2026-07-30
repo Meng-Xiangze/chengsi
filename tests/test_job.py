@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from core.process_utils import child_environment, normalize_python_commands
 from tools.job import Job, _elapsed_seconds
 
 
@@ -82,6 +83,77 @@ class JobTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(listing["jobs"], [])
         self.assertEqual(history["jobs"][0]["job_id"], "job_archive")
+
+    def test_failed_status_exposes_exit_code_and_error(self):
+        metadata = {
+            "job_id": "job_failed_detail",
+            "command": "exit 7",
+            "cwd": str(self.root),
+            "status": "failed",
+            "exit_code": 7,
+            "error": "Command exited with code 7.",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "finished_at": "2026-01-01T00:00:01+00:00",
+            "runner_pid": 0,
+            "command_pid": 0,
+            "log_path": str(self.root / "job_failed_detail.log"),
+        }
+        (self.root / "job_failed_detail.json").write_text(json.dumps(metadata), encoding="utf-8")
+        with patch("tools.job._job_root", return_value=self.root):
+            result = self.job.run({"action": "status", "job_id": "job_failed_detail"})
+        self.assertTrue(result["ok"])
+        self.assertIn("status: failed", result["content"])
+        self.assertIn("exit_code: 7", result["content"])
+        self.assertIn("Command exited with code 7", result["content"])
+
+    def test_child_environment_is_utf8_and_uses_active_virtualenv(self):
+        environment = child_environment()
+        self.assertEqual(environment["PYTHONUTF8"], "1")
+        self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+        self.assertTrue(environment["CHENGSI_ROOT"].endswith("chengsi"))
+
+    def test_schedule_always_returns_current_time(self):
+        from tools.schedule import Schedule
+        result = Schedule().run({"action": "list"})
+        self.assertTrue(result["current_time"])
+        self.assertTrue(result["content"].startswith("current_time: "))
+
+    def test_schedule_rejects_intervals_shorter_than_one_minute(self):
+        from tools.schedule import Schedule
+        result = Schedule().run({
+            "action": "create",
+            "prompt": "check news",
+            "run_at": "2099-01-01T00:00:00",
+            "interval_seconds": 30,
+        })
+        self.assertFalse(result["ok"])
+        self.assertIn("at least 60", result["content"])
+
+    def test_job_start_metadata_preserves_auto_followup_decision(self):
+        from tools.job import Job
+        from unittest.mock import patch
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tools.job._job_root", return_value=root), patch("tools.job.subprocess.Popen"):
+                result = Job()._start({
+                    "command": "echo done",
+                    "cwd": str(root),
+                    "session_id": "session-1",
+                    "auto_followup": True,
+                })
+                self.assertTrue(result["ok"])
+                metadata = next(root.glob("*.json")).read_text(encoding="utf-8")
+                self.assertIn('"auto_followup": true', metadata)
+
+    def test_python_and_pip_commands_bind_to_active_interpreter(self):
+        command = normalize_python_commands("pip install demo && python -m pip --version && python3 script.py")
+        executable = f'"{__import__("sys").executable}"'
+        self.assertIn(f"{executable} -m pip install demo", command)
+        self.assertIn(f"{executable} -m pip --version", command)
+        self.assertIn(f"{executable} script.py", command)
 
     def test_elapsed_seconds_uses_finished_time(self):
         metadata = {
