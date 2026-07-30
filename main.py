@@ -245,7 +245,15 @@ If an attempt fails, change approach; never repeat the same call more than twice
 Keep a concise task state and emit brief progress checkpoints when useful: what you found, what you are doing next, or what is blocked. Do not write a long preamble; act as soon as the next action is clear. Return only a tool call, a necessary clarification, or the final answer.
 Do not create a new tool unless the user explicitly asks for a reusable tool. Do not modify Chengsi's own core/ directory or main.py; other projects may be modified when requested.
 Use the knowledge base or web only when the answer needs external facts, freshness, or citations; do not browse for routine local work.
-When multiple independent operations can proceed simultaneously (e.g., reading several files, searching several paths), issue them as a batch of tool calls in a single response."""
+When multiple independent operations can proceed simultaneously (e.g., reading several files, searching several paths), issue them as a batch of tool calls in a single response.
+
+Important: To get the current date/time, use get_current_time() instead of 'bash date' (which hangs on Windows). Use bash only for actual shell operations.
+
+For scheduled/delayed tasks: When the user mentions a specific time (e.g., "17:30打开记事本", "明天9点提醒我", "10分钟后..."), use schedule() to create a timed task. Do NOT execute immediately unless the user explicitly says "现在" or "立即".
+
+For long or complex sub-tasks: Use delegate(action='start', prompt='...') to spawn a background sub-agent that has full tool access (bash, read, write, edit, web_searcher, python_executor, etc.). The sub-agent runs autonomously and reports results back. This is ideal for multi-step research, large data processing, code audits, or any task that would take many turns. Check sub-agent status with delegate(action='status', delegate_id='...') or list all with delegate(action='list'). You (the main agent) stay available for the user while the sub-agent works.
+
+For task tracking: Use plan(action='show') to read current progress and plan(action='update', goal='...', next='...', done=[...]) to keep your plan current. This prevents you from losing context across many turns. The plan is compact — just goal, completed items, and next step."""
     if failure_alert:
         p += f"\nExecution alert: {failure_alert}. Stop retrying and report the blocker or choose a materially different approach."
 
@@ -482,7 +490,7 @@ def _verification_tool_outcome(action: str, result: str) -> ToolOutcome | None:
 
 
 def _execute_tool(action: str, args: dict, available_tools: dict, session_id: str, tool_call_id: str | None = None):
-    if action in {"system_cleaner", "job", "schedule"} and isinstance(args, dict):
+    if action in {"system_cleaner", "job", "schedule", "delegate", "plan"} and isinstance(args, dict):
         args = dict(args)
         args["_session_id"] = session_id
     started = time.time()
@@ -841,7 +849,8 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
     Within one agent turn (inner loop), tool calls and their results must
     be visible so the model can continue. When a new user message starts
     the next turn (outer loop), previous-turn tool intermediates are noise
-    and are removed — only user messages and assistant text responses remain.
+    and are removed — but a compact [TOOL_TRACE] is appended to the system
+    prompt so the model never forgets that tool calling is normal.
     """
     if not messages:
         return messages
@@ -862,6 +871,26 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
     previous = messages[len(system):last_user_idx]   # completed turns
     current = messages[last_user_idx:]                # current turn onwards
 
+    # Collect tool traces from completed turns
+    turn_tools: list[list[str]] = []  # one list per turn
+    pending_tools: list[str] = []
+    for msg in previous:
+        role = msg.get("role")
+        if role == "user":
+            content = str(msg.get("content", ""))
+            if not content.startswith("["):
+                # Real user message: flush previous turn's tools
+                if pending_tools:
+                    turn_tools.append(pending_tools)
+                    pending_tools = []
+        elif role == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                name = tc.get("function", {}).get("name", "")
+                if name and name not in pending_tools:
+                    pending_tools.append(name)
+    if pending_tools:
+        turn_tools.append(pending_tools)
+
     cleaned = list(system)
     for msg in previous:
         role = msg.get("role")
@@ -871,15 +900,24 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
                 cleaned.append(msg)
         elif role == "assistant":
             if msg.get("tool_calls"):
-                # The entire message belongs to the completed tool exchange. Some
-                # models include a progress preamble alongside tool_calls; keeping
-                # that text after removing the call/result leaves an orphaned
-                # assistant continuation that can derail the next user turn.
                 continue
             cleaned.append(msg)
         # tool messages are skipped
 
     cleaned.extend(current)
+
+    # Inject compact tool trace into system prompt so the model remembers
+    # that calling tools is the expected behavior.
+    if turn_tools and cleaned and cleaned[0].get("role") == "system":
+        traces = [", ".join(tools[:8]) for tools in turn_tools[-5:]]
+        trace_block = "\n\n[TOOL_TRACE: " + " | ".join(traces) + "]"
+        base = cleaned[0]["content"]
+        # Strip any previous tool trace
+        idx = base.find("\n\n[TOOL_TRACE:")
+        if idx >= 0:
+            base = base[:idx]
+        cleaned[0]["content"] = base + trace_block
+
     return cleaned
 
 
@@ -1000,32 +1038,76 @@ def _summarize_turn_process(provider, model: str, tool_records: list[dict], canc
     return summary.strip()[:6000]
 
 
-def _format_persistent_turn_summary(records: list[dict], stop_reason: str = "") -> str:
-    """Create a compact durable handoff for the next user turn.
-
-    A user turn includes every model/tool exchange after one user message. The
-    summary is retained after that turn ends because completed tool messages are
-    intentionally removed from later provider requests.
-    """
-    if not records and not stop_reason:
+def _build_plan_summary(records: list[dict]) -> str:
+    """Build a compact plan entry from the current turn's tool calls, suitable for
+    the PLAN_MARKER block that persists across turns."""
+    if not records:
         return ""
-    lines = ["[TURN_TOOL_SUMMARY]", "Completed work from the previous user turn:"]
-    for index, record in enumerate(records, 1):
-        arguments = json.dumps(record.get("arguments", {}), ensure_ascii=False, sort_keys=True, default=str)
-        status = "succeeded" if record.get("ok") else "failed"
-        result = str(record.get("result", "")).strip() or "(no output)"
-        lines.append(f"{index}. {record.get('tool', 'unknown')}({arguments}) -> {status}")
-        lines.append(f"   Result: {result[:3000]}")
-    if stop_reason:
-        lines.append(f"Turn ended with a blocker: {stop_reason}")
-    lines.append("Treat this as factual prior-turn state. Continue from it when the next user request depends on that work; do not repeat completed calls without a reason.")
+    lines = ["## Recent"]
+    seen = set()
+    for r in records[-5:]:  # last 5 tool calls only
+        tool = r.get('tool', '?')
+        args = r.get('arguments', {})
+        ok = "ok" if r.get('ok') else "FAIL"
+        # One-line summary per tool
+        if tool == 'bash':
+            cmd = str(args.get('command', '')).strip().replace('\n', '; ')[:60]
+            lines.append(f"- bash({cmd}): {ok}")
+        elif tool == 'read':
+            p = str(args.get('path', '?'))[:60]
+            lines.append(f"- read({p}): {ok}")
+        elif tool == 'write':
+            p = str(args.get('path', '?'))[:60]
+            lines.append(f"- write({p}): {ok}")
+        elif tool == 'edit':
+            p = str(args.get('path', '?'))[:60]
+            lines.append(f"- edit({p}): {ok}")
+        elif tool == 'delegate':
+            a = str(args.get('action', '?'))
+            p = str(args.get('prompt', ''))[:40]
+            lines.append(f"- delegate({a} {p}): {ok}")
+        elif tool == 'web_search':
+            q = str(args.get('query', ''))[:50]
+            lines.append(f"- search({q}): {ok}")
+        else:
+            lines.append(f"- {tool}: {ok}")
+    # Total stats
+    ok_count = sum(1 for r in records if r.get('ok'))
+    if len(records) > 5:
+        lines.insert(1, f"({ok_count}/{len(records)} tools ok, showing last 5)")
+    else:
+        lines.insert(1, f"({ok_count}/{len(records)} tools ok)")
     return "\n".join(lines)
 
 
-def _append_persistent_turn_summary(sd, records: list[dict], stop_reason: str = "") -> None:
-    summary = _format_persistent_turn_summary(records, stop_reason)
-    if summary:
-        sd.messages.append({"role": "assistant", "content": summary})
+def _sync_plan_marker(sd, records: list[dict]) -> None:
+    """Replace any existing TURN_SUMMARY message with an updated one.
+
+    Uses [TURN_SUMMARY] prefix (NOT [PLAN_MARKER]) to avoid nuking
+    the JSON plan that the model sets via plan(action='update').
+    """
+    new_plan = _build_plan_summary(records)
+    # Only delete our own [TURN_SUMMARY] markers, never [PLAN_MARKER]
+    sd.messages = [
+        m for m in sd.messages
+        if not str(m.get("content", "")).startswith("[TURN_SUMMARY]")
+    ]
+    # Also clean up legacy [TURN_TOOL_SUMMARY] markers
+    sd.messages = [
+        m for m in sd.messages
+        if not str(m.get("content", "")).startswith("[TURN_TOOL_SUMMARY]")
+    ]
+    if new_plan:
+        # Insert right after the plan marker (if any), or after system prompt
+        insert_at = 2 if (
+            len(sd.messages) >= 2
+            and sd.messages[1].get("content", "").startswith("[PLAN_MARKER]")
+        ) else (1 if sd.messages and sd.messages[0].get("role") == "system" else 0)
+        marker = "[TURN_SUMMARY]\n" + new_plan + "\n[/TURN_SUMMARY]"
+        sd.messages.insert(insert_at, {"role": "user", "content": marker})
+
+
+# ─── (Removed: _format_persistent_turn_summary / _append_persistent_turn_summary) ───
 
 
 def process_agent_turn(provider, model: str, available_tools: dict, tool_manager: ToolManager, session_id: str = "", model_config: dict | None = None, fallback_mode: bool = False, transient_context: str = ""):
@@ -1166,7 +1248,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             )
             try:
                 for kind, chunk in _iter_stream_with_cancel(
-                    stream_gen, sd.cancel, idle_timeout=60, on_idle_timeout=provider.cancel
+                    stream_gen, sd.cancel, idle_timeout=300, on_idle_timeout=provider.cancel
                 ):
                     if kind == "error":
                         stream_error = chunk
@@ -1215,13 +1297,26 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 stream_error = str(error)
 
             if stream_error:
-                # Close the turn explicitly. A provider failure must not leave a
-                # persisted tool call with runtime.active=true forever.
+                # For idle timeouts during long thinking, preserve runtime state so the
+                # user can prompt the agent to continue. For genuine connection failures,
+                # still close the turn to prevent infinite retry loops.
                 error_text = str(stream_error).strip() or "Model stream ended without a response."
-                runtime.active = False
-                sd.runtime_snapshot = runtime.snapshot()
+                is_timeout = "made no progress" in error_text
+                
+                if not is_timeout:
+                    # Real connection error - close the turn
+                    runtime.active = False
+                    sd.runtime_snapshot = runtime.snapshot()
+                
                 message = f"后台模型请求未能完成：{error_text}"
-                sd.messages.append({"role": "assistant", "content": message})
+                if is_timeout:
+                    # Add timeout as system context, not assistant message,
+                    # so the model can resume when user prompts "continue".
+                    _emit("thinking", f"⚠️ {message}", session_id=session_id)
+                else:
+                    # Real error - add as assistant message to close the turn
+                    sd.messages.append({"role": "assistant", "content": message})
+                
                 _emit("agent_done", message, session_id=session_id)
                 return
 
@@ -1380,7 +1475,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 # silently exiting — prevents "no response" dead-ends mid-task.
                 if not getattr(runtime, "_no_response_retried", False):
                     runtime._no_response_retried = True
-                    sd.messages.append({"role": "assistant", "content": None})
+                    # Do NOT append assistant message with content=None - violates OpenAI API spec
                     sd.messages.append({
                         "role": "user",
                         "content": "[RUNTIME] No response was produced. Please continue with the current task — use a tool call or provide an answer.",
@@ -1390,7 +1485,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             # Strip thinking/reasoning that leaked into content
             clean_response = _strip_thinking_prefix(clean_response)
             sd.messages.append({"role": "assistant", "content": clean_response})
-            _append_persistent_turn_summary(sd, turn_tool_records, terminal_tool_blocker)
+            _sync_plan_marker(sd, turn_tool_records)
             _emit("agent_done", clean_response, session_id=session_id)
             return
 
@@ -1409,6 +1504,8 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
 # Global refs set at startup; used by WebAPI
 _provider = None
 _provider_model = ""
+_provider_name = ""
+_current_provider_cfg: dict = {}
 _providers_cfg: list[dict] = []
 _default_vision_model = ""
 _available_tools: dict = {}
@@ -1471,6 +1568,112 @@ def _schedule_watcher_loop() -> None:
         time.sleep(1.0)
 
 
+def _delegate_metadata_root():
+    from tools.delegate import _delegate_root
+    return _delegate_root()
+
+
+def _run_queued_delegates() -> None:
+    """Pick up queued delegate tasks and spawn subprocess runners."""
+    import subprocess as sp
+    try:
+        root = _delegate_metadata_root()
+        if not root.exists():
+            return
+        for session_dir in root.iterdir():
+            if not session_dir.is_dir():
+                continue
+            for path in session_dir.glob("*.json"):
+                try:
+                    metadata = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if metadata.get("status") != "queued":
+                    continue
+                # Write "starting" FIRST to prevent duplicate spawns by later
+                # watcher iterations, then spawn the subprocess.
+                metadata["status"] = "starting"
+                # Pass active provider/model so the runner uses the same backend
+                metadata["__provider"] = _provider_name
+                metadata["__model"] = _provider_model
+                metadata["__provider_cfg"] = _current_provider_cfg
+                metadata["__provider_type"] = _current_provider_cfg.get("type", "ollama")
+                path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                runner = os.path.join(PROJECT_ROOT, "tools", "_delegate_runner.py")
+                sp.Popen(
+                    [sys.executable, runner, str(path)],
+                    creationflags=sp.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+    except OSError:
+        pass
+
+
+def _delegate_watcher_loop() -> None:
+    """Watch for queued delegates (spawn), stuck starters (timeout), and finished delegates (notify)."""
+    import datetime as dt
+    seen: dict[str, str] = {}
+    while True:
+        _run_queued_delegates()
+        try:
+            root = _delegate_metadata_root()
+            now = dt.datetime.now(dt.timezone.utc)
+            for session_dir in root.iterdir():
+                if not session_dir.is_dir():
+                    continue
+                for path in session_dir.glob("*.json"):
+                    try:
+                        metadata = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    delegate_id = str(metadata.get("delegate_id", path.stem))
+                    status = str(metadata.get("status", ""))
+                    session_id = str(metadata.get("session_id", ""))
+
+                    # Timeout stuck "starting" delegates (runner crashed silently)
+                    if status == "starting":
+                        created = metadata.get("created_at", "")
+                        if created:
+                            try:
+                                created_dt = dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                                if (now - created_dt).total_seconds() > 120:
+                                    metadata["status"] = "failed"
+                                    metadata["error"] = "Sub-agent runner did not start within 2 minutes (possible import error or crash)."
+                                    metadata["finished_at"] = now.isoformat()
+                                    path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                                    status = "failed"
+                            except (ValueError, TypeError):
+                                pass
+
+                    if not session_id or status in {"queued", "starting", "running"}:
+                        continue
+                    if seen.get(delegate_id) == status or metadata.get("agent_received_at"):
+                        continue
+                    sd = state.sessions.get(session_id)
+                    if not sd:
+                        continue
+                    # Only deliver once the agent is idle. If busy, retry next pass.
+                    if sd.processing:
+                        continue
+                    # Mark seen only AFTER we confirm delivery will happen.
+                    # Avoids the bug where seen is set but followup is skipped
+                    # because the agent was processing — losing the notification forever.
+                    seen[delegate_id] = status
+                    _emit("delegate_result", {
+                        "delegate_id": delegate_id,
+                        "status": status,
+                        "session_id": session_id,
+                        "summary": metadata.get("summary", "")[:300],
+                        "prompt": metadata.get("prompt", "")[:200],
+                        "tool_call_count": metadata.get("tool_call_count", 0),
+                        "input_tokens": metadata.get("input_tokens", 0),
+                        "output_tokens": metadata.get("output_tokens", 0),
+                    }, session_id=session_id)
+                    _start_delegate_followup(session_id)
+        except OSError:
+            pass
+        time.sleep(1.5)
+
+
 def _consume_job_notifications(session_id: str) -> list[dict]:
     """Claim finished jobs for a session so the next user turn can process them."""
     if not session_id:
@@ -1509,6 +1712,62 @@ def _format_job_notifications(jobs: list[dict]) -> str:
             lines.append(f"error: {job['error']}")
         lines.append("Use job action=logs if the output is needed before deciding what to do.")
     return "\n".join(lines)
+
+
+def _consume_delegate_notifications(session_id: str) -> list[dict]:
+    """Claim completed delegates for a session so the next turn can process them."""
+    if not session_id:
+        return []
+    notifications = []
+    try:
+        root = _delegate_metadata_root()
+        session_dir = root / session_id
+        if not session_dir.exists():
+            return []
+        for path in sorted(session_dir.glob("*.json"), reverse=True):
+            try:
+                metadata = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if metadata.get("status") in {"queued", "starting", "running"}:
+                continue
+            if metadata.get("agent_received_at"):
+                continue
+            metadata["agent_received_at"] = datetime.now().astimezone().isoformat()
+            path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            notifications.append(metadata)
+    except OSError:
+        return []
+    return notifications
+
+
+def _format_delegate_notifications(delegates: list[dict]) -> str:
+    lines = [
+        "[SUBAGENT_RESULTS]",
+        "A delegated sub-agent has finished. Summarize its result to the user in your own words. Only continue processing or perform follow-up actions if the original request explicitly asked for it.",
+    ]
+    for d in delegates:
+        lines.append(f"delegate_id: {d.get('delegate_id', '')}")
+        lines.append(f"status: {d.get('status', 'unknown')}")
+        lines.append(f"task: {d.get('prompt', '')}")
+        lines.append(f"tool_calls: {d.get('tool_call_count', 0)}")
+        if d.get("summary"):
+            lines.append(f"summary: {d['summary']}")
+        if d.get("error"):
+            lines.append(f"error: {d['error']}")
+        lines.append(f"Use delegate(action='status', delegate_id='{d.get('delegate_id', '')}') to check details.")
+    return "\n".join(lines)
+
+
+def _start_delegate_followup(session_id: str):
+    """Give finished delegate results to one autonomous agent follow-up turn."""
+    sd = state.sessions.get(session_id)
+    if not sd or sd.processing or not _provider or not _tool_manager:
+        return {"status": "skipped"}
+    pending = _consume_delegate_notifications(session_id)
+    if not pending:
+        return {"status": "skipped"}
+    return _start_session_worker(session_id, _format_delegate_notifications(pending))
 
 
 def _start_session_worker(session_id: str, transient_context: str = ""):
@@ -1803,8 +2062,27 @@ class WebAPI:
         provider_cls = PROVIDER_MAP.get(pcfg.get("type"))
         if not provider_cls:
             return {"status": "error", "msg": f"Unsupported provider type: {pcfg.get('type', '')}"}
+        
+        # Cancel any pending requests from the old provider before switching
+        if _provider and hasattr(_provider, 'cancel'):
+            try:
+                _provider.cancel()
+            except Exception:
+                pass
+        
+        # Create fresh provider instance with clean state
         _provider = provider_cls.from_config(pcfg)
         _provider_model = model_name
+        _provider_name = pcfg.get("name", "")
+        _current_provider_cfg = dict(pcfg)
+        
+        # Clear error states in all idle sessions to allow retries with new provider
+        for session_id, sd in state.sessions.items():
+            if not sd.processing:
+                # Reset runtime error flags so sessions can retry with the new model
+                if hasattr(sd, 'runtime_snapshot') and sd.runtime_snapshot:
+                    sd.runtime_snapshot = {}
+        
         return {"status": "ok", "provider": _provider.name, "model": model_name}
 
     def choose_attachments(self, kind: str = "files"):
@@ -2118,6 +2396,71 @@ class WebAPI:
             result = Job().run({"action": "logs", "job_id": job_id, "tail_lines": tail_lines})
             return {"status": "ok" if result.get("ok") else "error", "content": result.get("content", "")}
         except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return {"status": "error", "msg": str(exc)}
+
+    # ── Delegate (sub-agent) management ─────────────────────────
+
+    def get_delegates(self, session_id: str):
+        """Return all delegate tasks for a session."""
+        try:
+            from tools.delegate import Delegate
+            result = Delegate().run({"action": "list", "_session_id": session_id})
+            return {"status": "ok" if result.get("ok") else "error", "delegates": result.get("delegates", [])}
+        except Exception as exc:
+            return {"status": "error", "msg": str(exc), "delegates": []}
+
+    def get_delegate_detail(self, delegate_id: str, session_id: str):
+        """Return full detail for a delegate, including conversation messages."""
+        try:
+            from tools.delegate import Delegate, _delegate_root
+            tool = Delegate()
+            metadata_path = tool._find_path(delegate_id, session_id)
+            if metadata_path is None:
+                return {"status": "error", "msg": "Delegate not found."}
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            return {
+                "status": "ok",
+                "delegate_id": metadata.get("delegate_id"),
+                "prompt": metadata.get("prompt", ""),
+                "delegate_status": metadata.get("status", "unknown"),
+                "created_at": metadata.get("created_at", ""),
+                "started_at": metadata.get("started_at", ""),
+                "finished_at": metadata.get("finished_at", ""),
+                "error": metadata.get("error", ""),
+                "summary": metadata.get("summary", ""),
+                "tool_call_count": metadata.get("tool_call_count", 0),
+                "input_tokens": metadata.get("input_tokens", 0),
+                "output_tokens": metadata.get("output_tokens", 0),
+                "messages": metadata.get("messages", []),
+            }
+        except Exception as exc:
+            return {"status": "error", "msg": str(exc)}
+
+    def cancel_delegate(self, delegate_id: str, session_id: str):
+        """Cancel a running or queued delegate."""
+        try:
+            from tools.delegate import Delegate
+            result = Delegate().run({"action": "cancel", "delegate_id": delegate_id, "_session_id": session_id})
+            return {"status": "ok" if result.get("ok") else "error", "msg": result.get("content", "")}
+        except Exception as exc:
+            return {"status": "error", "msg": str(exc)}
+
+    def export_delegate(self, delegate_id: str, session_id: str, fmt: str = "html"):
+        """Export a delegate's conversation as HTML or Markdown."""
+        try:
+            from tools.delegate import Delegate
+            result = Delegate().run({
+                "action": "export",
+                "delegate_id": delegate_id,
+                "format": fmt,
+                "_session_id": session_id,
+            })
+            return {
+                "status": "ok" if result.get("ok") else "error",
+                "msg": result.get("content", ""),
+                "export_path": result.get("export_path", ""),
+            }
+        except Exception as exc:
             return {"status": "error", "msg": str(exc)}
 
     def get_events(self, session_id: str):
@@ -2481,6 +2824,7 @@ def main():
         )
         threading.Thread(target=_job_watcher_loop, name="chengsi-job-watcher", daemon=True).start()
         threading.Thread(target=_schedule_watcher_loop, name="chengsi-schedule-watcher", daemon=True).start()
+        threading.Thread(target=_delegate_watcher_loop, name="chengsi-delegate-watcher", daemon=True).start()
 
         # Don't create session at startup — created on first message or loaded from sidebar
 

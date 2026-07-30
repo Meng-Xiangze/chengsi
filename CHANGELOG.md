@@ -6,23 +6,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-### Fixed
-
-- **WebUI session list overflow**: Fixed sidebar layout where many sessions would push the brand header and "New chat" button out of view. Session list now properly scrolls within its container while keeping top controls visible.
-
-- **Empty response causing API errors**: Removed invalid `content: null` assistant message that violated OpenAI API specification and caused "Invalid assistant message: content or tool_calls must be set" errors.
-- **Model switching state persistence**: Switching models now properly cancels the old provider and clears runtime snapshots from idle sessions, preventing error state carryover (e.g., `insufficient_quota` persisting after switching providers).
-- **Claude false completion issue**: Changed `TURN_TOOL_SUMMARY` messages from `role: assistant` to `role: user` to prevent models (especially Claude variants) from misinterpreting their own tool execution summaries as completion declarations, which caused premature task termination without calling necessary tools.
-- **LaTeX formula rendering in WebUI**: Protected all LaTeX math delimiters (`\[...\]`, `$$...$$`, `\(...)`, `$...$`) before Markdown processing, enabling proper MathJax rendering of mathematical expressions.
-- **Windows `bash date` timeout**: Added `get_current_time` tool that returns timestamps without invoking shell commands, avoiding the 60-second timeout caused by Windows' interactive `date` command prompt.
-
 ### Added
 
-- **get_current_time tool**: Dedicated tool for retrieving current date/time in various formats (ISO, datetime, date, time, unix) with local or UTC timezone support. Replaces unreliable `bash date` calls on Windows.
+- **Delegate (sub-agent) tool**: Main agent spawns background sub-agents with full tool access. Sub-agents run autonomously via subprocess using the same provider classes as the main agent. Results are read-only conversation logs with HTML/Markdown export. Actions: `start`, `status`, `list`, `cancel`, `export`.
+- **Plan tool**: Light-weight task planning and progress tracking across turns. Model maintains a JSON plan (goal, completed items, next step) via `plan(action='update')`. Survives context compaction.
+- **WebUI modal component**: Reusable modal dialog for viewing sub-agent conversations and job logs in a larger overlay. Lazy DOM initialization avoids timing issues with pywebview.
+- **Tool trace in system prompt**: Each request appends `[TOOL_TRACE: bash, read | delegate | ...]` so the model never forgets it can call tools, even when completed-turn tool exchanges are stripped from history.
+- **Background delegate watcher**: Monitor loop spawns queued sub-agents, times out stuck starters (2 min), and delivers terminal results back to the agent via follow-up turns.
+- **Delegate test suite**: `tests/test_delegate_delivery.py` covers notification delivery, duplicate prevention, and busy-agent retry behavior.
+
+### Fixed
+
+- **Stream timeout causing state loss**: Idle timeout increased 60→300s. Timeouts preserve runtime state without injecting assistant messages; users can prompt "continue" without restarting tasks.
+- **WebUI session list overflow**: Sidebar session list scrolls within its container; header and "New chat" button stay visible.
+- **Model hallucination (refusing tool calls)**: Stripped history made completed turns look like pure text chat, teaching the model to stop calling tools. Fixed by injecting `[TOOL_TRACE]` into system prompt.
+- **Sub-agent runner crashes**: Runner used raw HTTP calls with hardcoded `/chat/completions` endpoint, breaking under Ollama. Rewritten to use `OllamaProvider`/`OpenAIProvider` classes directly. Provider info now injected via watcher metadata.
+- **Sub-agent failed notification lost**: Watcher marked delegate as "seen" before checking whether the agent was idle. If the agent was processing, the notification was permanently dropped. Fixed to match job watcher pattern.
+- **Plan JSON nuked by turn summary**: `_sync_plan_marker` deleted all `[PLAN_MARKER]` messages, including the JSON plan set by the model. Split into `[TURN_SUMMARY]` (auto) and `[PLAN_MARKER]` (model-controlled).
+- **TURN_TOOL_SUMMARY accumulation**: Old summaries accumulated as user messages (5+ blocks, ~15K chars), confusing the model. Replaced with single `[TURN_SUMMARY]` message that is replaced each turn.
+- **Empty `content: null` assistant message**: Removed invalid message that caused "content or tool_calls must be set" API errors.
+- **Model switching state persistence**: Old provider cancelled on switch; idle-session runtime snapshots cleared.
+- **Windows `bash date` timeout**: Added `get_current_time` tool that returns timestamps without invoking shell.
 
 ### Changed
 
-- System prompt now explicitly instructs the model to use `get_current_time()` instead of `bash date` and to recognize time-related keywords for creating scheduled tasks rather than executing immediately.
+- System prompt: explicit instructions for `get_current_time()`, scheduled tasks, sub-agents, and plan tracking.
 - Improved scheduled task detection: When users mention specific times (e.g., "17:30打开记事本", "明天9点提醒我"), the agent now uses `schedule()` unless explicitly told to act immediately with keywords like "现在" or "立即".
 
 ## [0.5.1] - 2026-07-30
