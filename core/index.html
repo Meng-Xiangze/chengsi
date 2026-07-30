@@ -105,7 +105,13 @@
       font-weight: 650;
       text-transform: uppercase;
     }
-    .session-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 7px 10px; }
+    .session-list { 
+      flex: 1 1 0;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 0 7px 10px;
+    }
     .session-item {
       width: 100%;
       min-height: 44px;
@@ -635,14 +641,19 @@
       const blocks = [];
       const token = (prefix, html) => { const value = `@@${prefix}${blocks.length}@@`; blocks.push(html); return value; };
       text = text.replace(/```([^\n]*)\n([\s\S]*?)```/g, (_, lang, code) => token("CODE", `<pre><code>${code.replace(/\n$/, "")}</code></pre>`));
-      // Preserve formula delimiters for MathJax after the message enters the DOM.
+      // Preserve formula delimiters for MathJax: protect display math \[...\] and $$...$$ first
+      text = text.replace(/\\\[([\s\S]*?)\\\]/g, (match) => token("MATH", match));
+      text = text.replace(/\$\$([\s\S]*?)\$\$/g, (match) => token("MATH", match));
+      // Then protect inline math \(...\) and $...$
+      text = text.replace(/\\\(([^\n]+?)\\\)/g, (match) => token("MATH", match));
+      text = text.replace(/\$([^$\n]+?)\$/g, (match) => token("MATH", match));
+      // Now process other markdown
       text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>")
         .replace(/^## (.+)$/gm, "<h2>$1</h2>")
         .replace(/^# (.+)$/gm, "<h1>$1</h1>")
         .replace(/^&gt; (.+)$/gm, "<blockquote>$1</blockquote>")
         .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
         .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-        .replace(/\$([^$\n]+)\$/g, '<span class="math-inline">$1</span>')
         .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
       const lines = text.split("\n");
       let html = "", list = "";

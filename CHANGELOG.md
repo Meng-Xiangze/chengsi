@@ -4,6 +4,27 @@ All notable changes to Chengsi will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project intends to use [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **WebUI session list overflow**: Fixed sidebar layout where many sessions would push the brand header and "New chat" button out of view. Session list now properly scrolls within its container while keeping top controls visible.
+
+- **Empty response causing API errors**: Removed invalid `content: null` assistant message that violated OpenAI API specification and caused "Invalid assistant message: content or tool_calls must be set" errors.
+- **Model switching state persistence**: Switching models now properly cancels the old provider and clears runtime snapshots from idle sessions, preventing error state carryover (e.g., `insufficient_quota` persisting after switching providers).
+- **Claude false completion issue**: Changed `TURN_TOOL_SUMMARY` messages from `role: assistant` to `role: user` to prevent models (especially Claude variants) from misinterpreting their own tool execution summaries as completion declarations, which caused premature task termination without calling necessary tools.
+- **LaTeX formula rendering in WebUI**: Protected all LaTeX math delimiters (`\[...\]`, `$$...$$`, `\(...)`, `$...$`) before Markdown processing, enabling proper MathJax rendering of mathematical expressions.
+- **Windows `bash date` timeout**: Added `get_current_time` tool that returns timestamps without invoking shell commands, avoiding the 60-second timeout caused by Windows' interactive `date` command prompt.
+
+### Added
+
+- **get_current_time tool**: Dedicated tool for retrieving current date/time in various formats (ISO, datetime, date, time, unix) with local or UTC timezone support. Replaces unreliable `bash date` calls on Windows.
+
+### Changed
+
+- System prompt now explicitly instructs the model to use `get_current_time()` instead of `bash date` and to recognize time-related keywords for creating scheduled tasks rather than executing immediately.
+- Improved scheduled task detection: When users mention specific times (e.g., "17:30打开记事本", "明天9点提醒我"), the agent now uses `schedule()` unless explicitly told to act immediately with keywords like "现在" or "立即".
+
 ## [0.5.1] - 2026-07-30
 
 ### Changed
