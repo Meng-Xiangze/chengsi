@@ -1590,14 +1590,18 @@ def _run_queued_delegates() -> None:
                     continue
                 if metadata.get("status") != "queued":
                     continue
-                # Write "starting" FIRST to prevent duplicate spawns by later
-                # watcher iterations, then spawn the subprocess.
+                # Write "starting" FIRST to prevent duplicate spawns.
+                # Only inject provider info if not already set at creation time
+                # (delegate.py captures the model at spawn, not at pickup).
                 metadata["status"] = "starting"
-                # Pass active provider/model so the runner uses the same backend
-                metadata["__provider"] = _provider_name
-                metadata["__model"] = _provider_model
-                metadata["__provider_cfg"] = _current_provider_cfg
-                metadata["__provider_type"] = _current_provider_cfg.get("type", "ollama")
+                for key, val in (
+                    ("__provider", _provider_name),
+                    ("__model", _provider_model),
+                    ("__provider_cfg", _current_provider_cfg),
+                    ("__provider_type", _current_provider_cfg.get("type", "ollama")),
+                ):
+                    if not metadata.get(key):
+                        metadata[key] = val
                 path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
                 runner = os.path.join(PROJECT_ROOT, "tools", "_delegate_runner.py")
                 sp.Popen(

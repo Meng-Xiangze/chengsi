@@ -98,6 +98,9 @@ class Delegate(BaseTool):
         session_dir.mkdir(parents=True, exist_ok=True)
         metadata_path = session_dir / f"{delegate_id}.json"
 
+        # Capture the active provider/model NOW so the sub-agent uses
+        # the same backend the user was on when they issued the command.
+        from main import _provider_name, _provider_model, _current_provider_cfg
         metadata = {
             "delegate_id": delegate_id,
             "session_id": session_id,
@@ -112,6 +115,11 @@ class Delegate(BaseTool):
             "tool_call_count": 0,
             "input_tokens": 0,
             "output_tokens": 0,
+            # Provider snapshot — frozen at creation time
+            "__provider": _provider_name,
+            "__model": _provider_model,
+            "__provider_cfg": dict(_current_provider_cfg) if _current_provider_cfg else {},
+            "__provider_type": _current_provider_cfg.get("type", "ollama") if _current_provider_cfg else "ollama",
         }
 
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
