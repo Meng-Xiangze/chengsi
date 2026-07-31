@@ -83,7 +83,10 @@ class Plan(BaseTool):
         from main import state
         sd = state.sessions.get(session_id)
         if sd is None:
-            return f"Session {session_id} not found."
+            # Session not in memory - ensure it exists (will load from disk or create)
+            sd = state.ensure(session_id)
+            if not sd.messages:
+                return f"Session {session_id} has no messages. Plan cannot be read or updated."
 
         if action == "show":
             plan = self._read_plan(sd)
