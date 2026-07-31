@@ -647,6 +647,7 @@
       jobHistory: [],
       showJobHistory: false,
       expandedJobLogs: new Map(),
+      activeToolEvents: new Map(),
       schedules: [],
     };
     const $ = (id) => document.getElementById(id);
@@ -837,6 +838,30 @@
       scrollToBottom();
     }
 
+    function appendToolProgress(data) {
+      const callId = String(data?.tool_call_id || "");
+      if (!callId) return;
+      let node = app.activeToolEvents.get(callId);
+      if (!node) {
+        removeEmpty();
+        node = document.createElement("details");
+        node.className = "tool-event";
+        node.open = true;
+        node.dataset.content = "";
+        node.innerHTML = `<summary><span class="tool-event-label">${escapeHtml(data?.tool_name || "Tool")}</span><span class="tool-event-preview">Running...</span></summary><div class="tool-event-content"></div>`;
+        $("chat").appendChild(node);
+        app.activeToolEvents.set(callId, node);
+      }
+      node.dataset.content += String(data?.content || "");
+      if (node.dataset.content.length > 12000) node.dataset.content = `[Earlier output omitted]\n${node.dataset.content.slice(-10000)}`;
+      const body = node.querySelector(".tool-event-content");
+      const preview = node.querySelector(".tool-event-preview");
+      body.textContent = node.dataset.content || "Running...";
+      preview.textContent = (node.dataset.content.replace(/\s+/g, " ").trim().slice(-180) || "Running...");
+      body.scrollTop = body.scrollHeight;
+      scrollToBottom();
+    }
+
     function showTyping() {
       if (app.typingNode) return;
       removeEmpty();
@@ -967,6 +992,22 @@
         };
         toast(statusLabels[status] || `Sub-agent ${status}`);
         refreshJobs();
+        return;
+      }
+      if (type === "tool_progress") {
+        hideTyping();
+        appendToolProgress(data);
+        return;
+      }
+      if (type === "tool_execution_end") {
+        const callId = String(data?.tool_call_id || "");
+        const node = app.activeToolEvents.get(callId);
+        if (node) {
+          node.open = false;
+          node.classList.toggle("is-error", !data?.ok);
+          node.querySelector(".tool-event-label").textContent = data?.ok ? data?.tool_name || "Tool" : `${data?.tool_name || "Tool"} failed`;
+          app.activeToolEvents.delete(callId);
+        }
         return;
       }
       if (type === "tool_result") {

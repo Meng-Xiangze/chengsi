@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 
 
-LINE_HASH_HEX_LENGTH = 16
+LINE_HASH_HEX_LENGTH = 16  # max length; actual length is adaptive
 REVISION_HEX_LENGTH = 24
 _REF_PATTERN = re.compile(r"^(?:(\d+):)?([0-9a-fA-F]{4,16})$")
 
@@ -32,11 +32,27 @@ def anchor(line_number: int, content: str) -> str:
 
 
 def unique_line_hashes(lines: list[str]) -> list[str]:
-    """Return the shortest unambiguous hex prefix for every line hash."""
+    """Return the shortest unambiguous hex prefix for every line hash.
+    
+    Minimum prefix length scales with file size:
+    - 1-16 lines: 1 hex char
+    - 17-256 lines: 2 hex chars
+    - 257-4096 lines: 3 hex chars
+    - 4097-65536 lines: 4 hex chars
+    - >65536 lines: full 16 hex chars
+    """
+    import math
+    total = len(lines)
+    if total == 0:
+        return []
+    # Minimum hex digits needed to address all lines: ceil(log16(total))
+    min_length = max(1, math.ceil(math.log(total, 16))) if total > 1 else 1
+    min_length = min(min_length, LINE_HASH_HEX_LENGTH)
+    
     hashes = [line_hash(line) for line in lines]
     result = []
     for index, value in enumerate(hashes):
-        for length in range(4, LINE_HASH_HEX_LENGTH + 1, 2):
+        for length in range(min_length, LINE_HASH_HEX_LENGTH + 1, 1):
             prefix = value[:length]
             if sum(other.startswith(prefix) for other in hashes) == 1:
                 result.append(prefix)

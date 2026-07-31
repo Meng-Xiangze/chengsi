@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -62,7 +63,23 @@ def main() -> int:
                 "started_at": _now(),
                 "last_activity_at": _now(),
             })
-            return_code = process.wait()
+            log_bytes_prev = 0
+            while True:
+                rc = process.poll()
+                if rc is not None:
+                    return_code = rc
+                    break
+                try:
+                    cur = log_path.stat().st_size
+                    if cur != log_bytes_prev:
+                        log_bytes_prev = cur
+                        _write_metadata(metadata_path, {
+                            "last_activity_at": _now(),
+                            "log_bytes": cur,
+                        })
+                except OSError:
+                    pass
+                time.sleep(5)
         _write_metadata(metadata_path, {
             "status": "completed" if return_code == 0 else "failed",
             "exit_code": return_code,

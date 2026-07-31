@@ -184,7 +184,7 @@ class Job(BaseTool):
             "status": "starting",
             "created_at": _now(),
             "session_id": str(arguments.get("_session_id") or ""),
-            "visible": bool(arguments.get("visible", False)),
+            "visible": bool(arguments.get("visible", True)),
             "auto_followup": bool(arguments.get("auto_followup", False)),
             "origin": "agent",
             "runner_pid": None,
@@ -212,7 +212,7 @@ class Job(BaseTool):
                 "ok": True,
                 "content": (
                     f"Background job accepted and started; it is NOT finished yet.\n"
-                    f"job_id: {job_id}\nstatus: starting\nauto_followup: {str(metadata['auto_followup']).lower()}\nlog: {log_path}"
+                    f"job_id: {job_id}\nstatus: starting\nauto_followup: {str(metadata['auto_followup']).lower()}\nvisible: {str(metadata['visible']).lower()}\nlog: {log_path}"
                 ),
                 "error_code": "ok",
                 "job_id": job_id,

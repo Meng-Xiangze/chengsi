@@ -1,12 +1,26 @@
 # -*- coding: utf-8 -*-
 """Execute a shell command and return stdout/stderr."""
 import os
-import shutil
+import signal
 import subprocess
+import threading
+import time
 from typing import Any
 
 from core.process_utils import child_environment, decode_output, prepare_shell_command
 from tools.base import BaseTool
+
+
+def _read_stream(stream, buffer: list[str], lock: threading.Lock, on_output=None):
+    """Read a stream line by line into a shared buffer."""
+    try:
+        for line in iter(stream.readline, ""):
+            with lock:
+                buffer.append(line)
+            if callable(on_output):
+                on_output(line)
+    except (ValueError, OSError):
+        pass
 
 
 class Bash(BaseTool):
@@ -23,8 +37,9 @@ class Bash(BaseTool):
             "git (status, diff, log, commit), package installs (python -m pip), system info. "
             "Single-line commands are fastest — use bash for 1-shot terminal tasks. "
             "For multi-step logic, data processing, or complex scripting, use python_executor. "
-            "For commands that may run longer than one minute, use job so they continue in the background. "
-            "Timeout: 60s."
+            "For commands that may run longer than 5 minutes, use job so they continue in the background. "
+            "The model should set an appropriate timeout based on the command: fast ops 5-15s, moderate 30-60s, slow (installs/builds) 120-300s. "
+            "Default timeout: 30s. Max: 600s (10 min). Partial output is returned on timeout."
         )
 
     @property
@@ -33,7 +48,11 @@ class Bash(BaseTool):
             "command": {
                 "type": "string",
                 "description": "Shell command to execute.",
-            }
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Max seconds to wait for the command. Default 30. Use 5-15 for fast ops (ls, cat, echo), 30-60 for moderate ops (git, find, grep), 120-300 for slow ops (pip install, npm install, large builds).",
+            },
         }
 
     def run(self, arguments: dict[str, Any]) -> str | dict[str, Any]:
@@ -42,43 +61,125 @@ class Bash(BaseTool):
             return "Error: command is required."
 
         try:
-            shell = os.environ.get("COMSPEC", "cmd.exe") if os.name == "nt" else "/bin/bash"
-            result = subprocess.run(
+            timeout = max(5, min(int(arguments.get("timeout", 30)), 600))
+        except (TypeError, ValueError):
+            return {"ok": False, "content": "timeout must be an integer between 5 and 600 seconds.", "error_code": "invalid_arguments"}
+        progress = arguments.get("_progress")
+        progress_lock = threading.Lock()
+        pending_progress: list[str] = []
+        pending_chars = 0
+        last_progress_at = 0.0
+
+        def report_progress(chunk: str, force: bool = False) -> None:
+            nonlocal pending_chars, last_progress_at
+            if not callable(progress):
+                return
+            with progress_lock:
+                pending_progress.append(chunk)
+                pending_chars += len(chunk)
+                now = time.monotonic()
+                if not force and pending_chars < 4096 and now - last_progress_at < 0.25:
+                    return
+                text = "".join(pending_progress)
+                pending_progress.clear()
+                pending_chars = 0
+                last_progress_at = now
+            progress(text)
+
+        creationflags = 0
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            creationflags = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        shell = os.environ.get("COMSPEC", "cmd.exe") if os.name == "nt" else "/bin/bash"
+
+        try:
+            proc = subprocess.Popen(
                 prepare_shell_command(command),
                 shell=True,
                 executable=shell,
-                capture_output=True,
-                timeout=60,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
                 cwd=None,
                 env=child_environment(),
+                creationflags=creationflags,
+                **popen_kwargs,
             )
+        except OSError as e:
+            return {"ok": False, "content": f"Could not start command: {e}", "error_code": "tool_error"}
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        lock = threading.Lock()
+        t_out = threading.Thread(target=_read_stream, args=(proc.stdout, stdout_lines, lock, report_progress), daemon=True)
+        t_err = threading.Thread(target=_read_stream, args=(proc.stderr, stderr_lines, lock, report_progress), daemon=True)
+        t_out.start()
+        t_err.start()
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "content": "Command timed out after 60s.",
-                "error_code": "timeout",
-            }
-        except Exception as e:
-            return {
-                "ok": False,
-                "content": str(e),
-                "error_code": "tool_error",
-            }
+            timed_out = True
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        capture_output=True,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        timeout=5,
+                    )
+                else:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+        t_out.join(timeout=1)
+        t_err.join(timeout=1)
+        report_progress("", force=True)
+
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+        return_code = proc.poll()
+
+        if timed_out:
+            if stdout.strip() or stderr.strip():
+                # Show partial output captured before timeout
+                parts = []
+                if stdout.strip():
+                    parts.append(stdout.rstrip())
+                if stderr.strip():
+                    parts.append(f"[stderr]\n{stderr.rstrip()}")
+                parts.append(f"[TIMEOUT after {timeout}s — partial output above; use job for long-running commands]")
+                return {"ok": False, "content": "\n".join(parts), "error_code": "timeout", "exit_code": return_code}
+            return {"ok": False, "content": f"Command timed out after {timeout}s with no output.", "error_code": "timeout"}
 
         parts = []
-        stdout = decode_output(result.stdout)
-        stderr = decode_output(result.stderr)
-        if stdout:
-            parts.append(stdout.rstrip())
-        if stderr:
-            parts.append(f"[stderr]\n{stderr.rstrip()}")
-        if result.returncode != 0:
-            parts.append(f"[exit code: {result.returncode}]")
+        stdout_decoded = decode_output(stdout) if not isinstance(stdout, str) else stdout
+        stderr_decoded = decode_output(stderr) if not isinstance(stderr, str) else stderr
+        if stdout_decoded:
+            parts.append(stdout_decoded.rstrip())
+        if stderr_decoded:
+            parts.append(f"[stderr]\n{stderr_decoded.rstrip()}")
+        if return_code != 0:
+            parts.append(f"[exit code: {return_code}]")
 
         content = "\n".join(parts) if parts else "(no output)"
         return {
-            "ok": result.returncode == 0,
+            "ok": return_code == 0,
             "content": content,
-            "error_code": "ok" if result.returncode == 0 else "nonzero_exit",
-            "exit_code": result.returncode,
+            "error_code": "ok" if return_code == 0 else "nonzero_exit",
+            "exit_code": return_code,
         }

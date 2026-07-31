@@ -512,7 +512,15 @@ def _execute_tool(action: str, args: dict, available_tools: dict, session_id: st
         return outcome
     _emit("thinking", f"Executing {action}...", session_id=session_id)
     try:
-        result = available_tools[action].run(args)
+        execution_args = args
+        if action == "bash":
+            execution_args = dict(args)
+            execution_args["_progress"] = lambda chunk: _emit(
+                "tool_progress",
+                {"tool_call_id": call_id, "tool_name": action, "content": chunk},
+                session_id=session_id,
+            )
+        result = available_tools[action].run(execution_args)
         structured = classify_tool_outcome(result)
         if isinstance(result, (dict, ToolOutcome)):
             truncated = _truncate_output(structured.content, session_id)
@@ -1210,6 +1218,16 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
         if isinstance(user_text, str):
             kb_context = state.knowledge_base.context(user_text)
 
+    # ── Pending background job and delegate notifications ──────────
+    # Consume once per turn so the model always sees terminal results,
+    # even when auto_followup was not requested.
+    job_notices = _consume_job_notifications(session_id)
+    delegate_notices = _consume_delegate_notifications(session_id)
+    if job_notices:
+        transient_context = _format_job_notifications(job_notices) + ("\n\n" + transient_context if transient_context else "")
+    if delegate_notices:
+        transient_context = _format_delegate_notifications(delegate_notices) + ("\n\n" + transient_context if transient_context else "")
+
     try:
         while True:
             if sd.cancel.is_set():
@@ -1702,19 +1720,61 @@ def _consume_job_notifications(session_id: str) -> list[dict]:
     return notifications
 
 
+def _job_log_tail(log_path_str: str, max_chars: int = 2000) -> str:
+    """Return the last max_chars of a job log file, or empty string."""
+    try:
+        from pathlib import Path as _Path
+        p = _Path(log_path_str)
+        if not p.exists():
+            return ""
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > max_chars:
+                f.seek(-max_chars, 2)
+            raw = f.read(max_chars)
+        return raw.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _format_job_notifications(jobs: list[dict]) -> str:
     lines = [
         "[BACKGROUND_JOB_RESULTS]",
-        "A background job has a terminal result. First report its actual status to the user. Continue processing, generate a report, or perform a follow-up action only when the original request explicitly asked for it.",
+        "One or more background jobs have reached a terminal state. Report the result to the user first. Only continue with follow-up work (report, next step, retry) when the original request explicitly asked for it.",
     ]
     for job in jobs:
         status = job.get("status", "unknown")
-        lines.append(f"job_id: {job.get('job_id', '')}")
-        lines.append(f"status: {status}, exit_code: {job.get('exit_code', '')}, elapsed_seconds: {job.get('elapsed_seconds', '')}")
+        lines.append(f"\njob_id: {job.get('job_id', '')}")
+        lines.append(f"status: {status}  exit_code: {job.get('exit_code', '')}  elapsed_seconds: {job.get('elapsed_seconds', '')}")
         lines.append(f"command: {job.get('command', '')}")
         if job.get("error"):
             lines.append(f"error: {job['error']}")
-        lines.append("Use job action=logs if the output is needed before deciding what to do.")
+        tail = _job_log_tail(str(job.get("log_path", "")))
+        if tail.strip():
+            lines.append("log_tail:")
+            lines.append(tail.rstrip())
+        else:
+            lines.append("(no log output — use job action=logs for full output)")
+    return "\n".join(lines)
+
+
+def _format_job_stall_alert(metadata: dict, idle_seconds: int) -> str:
+    """Transient context injected when a running job has produced no output for a long time."""
+    tail = _job_log_tail(str(metadata.get("log_path", "")))
+    lines = [
+        "[BACKGROUND_JOB_STALL_ALERT]",
+        f"Job {metadata.get('job_id', '?')} has been running for {idle_seconds // 60} minutes with no new log output.",
+        f"command: {metadata.get('command', '')}",
+        f"started_at: {metadata.get('started_at', '')}",
+        f"last_activity_at: {metadata.get('last_activity_at', '')}",
+    ]
+    if tail.strip():
+        lines.append("last log output:")
+        lines.append(tail.rstrip())
+    else:
+        lines.append("(no log output yet)")
+    lines.append("")
+    lines.append("Decide whether to: (a) wait longer, (b) use job action=cancel then retry, or (c) report to the user. Do not cancel silently without notifying the user.")
     return "\n".join(lines)
 
 
@@ -1823,9 +1883,16 @@ def _start_background_followup(session_id: str):
     return _start_session_worker(session_id, _format_job_notifications(pending))
 
 
+# Stall = no log growth for this many seconds while status is still "running".
+_JOB_STALL_SECONDS = 900  # 15 minutes
+# Minimum gap between successive stall wake-ups for the same job (avoid spam).
+_JOB_STALL_COOLDOWN = 300  # 5 minutes
+
+
 def _job_watcher_loop() -> None:
-    """Deliver newly finished internal jobs without interrupting user turns."""
+    """Deliver finished jobs and stall alerts to the model as soon as the session is idle."""
     seen: dict[str, str] = {}
+    stall_last_alerted: dict[str, float] = {}  # job_id -> monotonic time of last stall alert
     try:
         for path in _job_metadata_root().glob("*.json"):
             try:
@@ -1835,36 +1902,66 @@ def _job_watcher_loop() -> None:
                 continue
     except OSError:
         pass
+
     while True:
         try:
             root = _job_metadata_root()
+            now_mono = time.monotonic()
             for path in root.glob("*.json"):
                 try:
                     metadata = json.loads(path.read_text(encoding="utf-8"))
                     job_id = str(metadata.get("job_id", path.stem))
                     status = str(metadata.get("status", ""))
                     session_id = str(metadata.get("session_id", ""))
-                    if not session_id or status in {"starting", "running"}:
-                        continue
-                    if seen.get(job_id) == status or metadata.get("agent_received_at"):
+                    if not session_id:
                         continue
                     sd = state.sessions.get(session_id)
-                    if not sd or sd.processing:
-                        # Leave the job unclaimed. The active user turn may still
-                        # be finishing; the next watcher pass will deliver it.
+
+                    # ── Terminal job ──────────────────────────────────────────────
+                    if status not in {"starting", "running"}:
+                        if seen.get(job_id) == status or metadata.get("agent_received_at"):
+                            continue
+                        if sd and sd.processing:
+                            # Agent is busy; leave for next watcher pass.
+                            continue
+                        seen[job_id] = status
+                        _emit("background_job_result", {
+                            "job_id": job_id,
+                            "status": status,
+                            "session_id": session_id,
+                            "auto_followup": bool(metadata.get("auto_followup", False)),
+                        }, session_id=session_id)
+                        # Always trigger an autonomous follow-up turn so the model
+                        # can immediately report completion/failure to the user.
+                        _start_background_followup(session_id)
                         continue
-                    seen[job_id] = status
+
+                    # ── Running job — stall detection ─────────────────────────────
+                    # Skip if no session or agent is already busy.
+                    if not sd or sd.processing:
+                        continue
+                    last_activity_raw = metadata.get("last_activity_at", metadata.get("started_at", ""))
+                    if not last_activity_raw:
+                        continue
+                    try:
+                        last_activity_dt = datetime.fromisoformat(last_activity_raw)
+                        idle_seconds = (datetime.now().astimezone() - last_activity_dt).total_seconds()
+                    except (ValueError, TypeError):
+                        continue
+                    if idle_seconds < _JOB_STALL_SECONDS:
+                        continue
+                    last_alert = stall_last_alerted.get(job_id, 0.0)
+                    if now_mono - last_alert < _JOB_STALL_COOLDOWN:
+                        continue
+                    stall_last_alerted[job_id] = now_mono
                     _emit("background_job_result", {
                         "job_id": job_id,
-                        "status": status,
+                        "status": "stalled",
                         "session_id": session_id,
-                        "auto_followup": bool(metadata.get("auto_followup", False)),
+                        "idle_seconds": int(idle_seconds),
                     }, session_id=session_id)
-                    # Every terminal job is first surfaced as a notification. Only
-                    # an explicit auto_followup decision made when the job was
-                    # started may trigger one autonomous result-processing turn.
-                    if metadata.get("auto_followup", False):
-                        _start_background_followup(session_id)
+                    _start_session_worker(session_id, _format_job_stall_alert(metadata, int(idle_seconds)))
+
                 except (OSError, ValueError, json.JSONDecodeError):
                     continue
         except OSError:
