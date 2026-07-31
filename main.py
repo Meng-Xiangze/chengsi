@@ -1507,7 +1507,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         continue
                     return
 
-                # Permanent provider errors close the turn with an explicit
+                # Permanent provider errors (auth, model not found, rate limit, busy)
                 # blocker, while preserving the completed checkpoint.
                 runtime.active = False
                 sd.runtime_snapshot = runtime.snapshot()
