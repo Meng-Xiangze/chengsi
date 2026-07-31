@@ -2,6 +2,7 @@ import os
 import json
 import shutil
 import uuid
+import tempfile
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
@@ -73,8 +74,17 @@ class SessionManager:
                     if m.get("role") == "user":
                         session["title"] = m["content"][:60]
                         break
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(session, f, ensure_ascii=False, indent=2)
+            directory = os.path.dirname(path)
+            fd, temp_path = tempfile.mkstemp(prefix=".session-", suffix=".tmp", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(session, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             return True
         except Exception:
             return False

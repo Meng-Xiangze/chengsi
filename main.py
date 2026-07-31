@@ -1,4 +1,4 @@
-import sys, os, json, time, threading, queue, re, signal, subprocess, base64, shutil
+import sys, os, json, time, threading, queue, re, signal, subprocess, base64, shutil, hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datetime import datetime, timedelta
@@ -13,6 +13,12 @@ if PROJECT_ROOT not in sys.path:
 from core.agent_runtime import AgentRuntime, ToolOutcome, classify_tool_outcome
 from core.tool_manager import ToolManager
 from core.session_manager import SessionManager
+from core.conversation_history import append_event, normalize_persisted, project_for_ui
+from core.context_compactor import (
+    build_compaction_prompt,
+    preserve_plan_markers,
+    split_compaction_messages,
+)
 from core.knowledge_base import KnowledgeBase
 
 # Clean up stderr to prevent warnings from polluting the Agent's view
@@ -84,8 +90,7 @@ class AgentState:
         sd = self.sessions.get(session_id)
         if not sd:
             return
-        if event_type not in ("thinking", "thinking_delta", "agent_delta"):
-            sd.history.append({"type": event_type, "data": data})
+        append_event(sd.history, event_type, data)
         payload = {
             "timestamp": datetime.now().strftime("%H:%M:%S"),
             "type": event_type,
@@ -255,7 +260,7 @@ For scheduled/delayed tasks: When the user mentions a specific time (e.g., "17:3
 
 For long or complex sub-tasks: Use delegate(action='start', prompt='...') to spawn a background sub-agent that has full tool access (bash, read, write, edit, web_searcher, python_executor, etc.). The sub-agent runs autonomously and reports results back. This is ideal for multi-step research, large data processing, code audits, or any task that would take many turns. Check sub-agent status with delegate(action='status', delegate_id='...') or list all with delegate(action='list'). You (the main agent) stay available for the user while the sub-agent works.
 
-For task tracking: Use plan(action='show') to read current progress and plan(action='update', goal='...', next='...', done=[...]) to keep your plan current. This prevents you from losing context across many turns. The plan is compact — just goal, completed items, and next step."""
+For task tracking: Use plan(action='show') to read current progress and plan(action='update', goal='...', next='...', done=[...], notes=[...]) to keep it current. Record concrete findings in notes, including filenames, queries, and important negative results. Keep status active while work remains. Only use plan(action='done') after the user explicitly confirms the overall request is complete; completing one inspection step is not task completion. This prevents you from losing context across many turns. The plan is compact — goal, completed items, findings, and next step."""
     if failure_alert:
         p += f"\nExecution alert: {failure_alert}. Stop retrying and report the blocker or choose a materially different approach."
 
@@ -836,48 +841,6 @@ def _image_prompt_with_history(messages: list[dict]) -> str:
     )
 
 
-def _split_compaction_messages(conversation: list[dict], keep_count: int = 6) -> tuple[list[dict], list[dict]]:
-    """Split history without orphaning tool results from their assistant call."""
-    recent_start = max(0, len(conversation) - keep_count)
-    while recent_start > 0 and conversation[recent_start].get("role") == "tool":
-        recent_start -= 1
-    return conversation[:recent_start], conversation[recent_start:]
-
-
-def _compaction_prompt(older: list[dict], recent: list[dict]) -> str:
-    """Build a task-safe compaction prompt with recent user intent in view.
-
-    The older transcript contains historical facts, while the recent transcript
-    contains the authoritative task state. Keeping these sections separate
-    prevents an old completed task from replacing a newer user correction.
-    """
-    def format_messages(messages: list[dict]) -> str:
-        return "\n\n".join(
-            f"[{message.get('role', 'unknown')}] {json.dumps(message, ensure_ascii=False)}"
-            for message in messages
-        )
-
-    return """Compress this agent conversation into a durable context summary.
-
-This is a state handoff, not a general recap. Follow these rules strictly:
-1. The latest explicit user request in RECENT VERBATIM CONTEXT is CURRENT TASK and overrides older goals.
-2. Later user corrections, including statements that a task is old or wrong, invalidate that older task. Put it under OBSOLETE TASKS.
-3. Separate facts confirmed by tool results from assumptions. Put unverified claims under UNVERIFIED.
-4. Preserve exact paths, filenames, commands, errors, completed changes, and unfinished work when they affect the current task.
-5. Never declare a task complete merely because a related subtask succeeded.
-6. End with concrete NEXT ACTIONS for the current task. Do not ask the next agent to repeat completed or obsolete work.
-
-Return only Chinese or the conversation's main language, using exactly these headings:
-CURRENT TASK:
-COMPLETED:
-OBSOLETE TASKS:
-UNVERIFIED:
-BLOCKERS:
-NEXT ACTIONS:
-
-OLDER TRANSCRIPT (historical evidence):
-""" + format_messages(older) + "\n\nRECENT VERBATIM CONTEXT (authoritative; read this last):\n" + format_messages(recent)
-
 
 _UNUSED_TOKEN_RE = re.compile(r"<unused\d+>", re.IGNORECASE)
 
@@ -936,7 +899,8 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
     previous = messages[len(system):last_user_idx]   # completed turns
     current = messages[last_user_idx:]                # current turn onwards
 
-    # Collect tool traces from completed turns
+    # Collect tool traces from completed turns, retaining compact arguments so
+    # recovery can identify the actual file/query/command instead of only the tool name.
     turn_tools: list[list[str]] = []  # one list per turn
     pending_tools: list[str] = []
     for msg in previous:
@@ -950,9 +914,19 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
                     pending_tools = []
         elif role == "assistant" and msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
-                name = tc.get("function", {}).get("name", "")
-                if name and name not in pending_tools:
-                    pending_tools.append(name)
+                function = tc.get("function", {})
+                name = function.get("name", "")
+                raw_args = function.get("arguments", {})
+                if isinstance(raw_args, str):
+                    try:
+                        raw_args = json.loads(raw_args)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        raw_args = {}
+                if name:
+                    detail = raw_args.get("path") or raw_args.get("command") or raw_args.get("query") or raw_args.get("prompt") or raw_args.get("action") or ""
+                    trace = f"{name}({str(detail).replace(chr(10), ' ')[:100]})"
+                    if trace not in pending_tools:
+                        pending_tools.append(trace)
     if pending_tools:
         turn_tools.append(pending_tools)
 
@@ -1187,27 +1161,61 @@ def _task_requires_plan(messages: list[dict]) -> bool:
     ))
 
 
-def _has_plan_marker(messages: list[dict]) -> bool:
-    return any(str(m.get("content", "")).startswith("[PLAN_MARKER]") for m in messages)
+def _latest_real_user_message(messages: list[dict]) -> str:
+    """Return the latest user request, excluding synthetic state messages."""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content", "")).strip()
+        if content and not content.startswith("["):
+            return content
+    return ""
+
+
+def _read_execution_plan(messages: list[dict]) -> tuple[int, dict] | tuple[None, None]:
+    for index, message in enumerate(messages):
+        content = str(message.get("content", ""))
+        if not content.startswith("[PLAN_MARKER]"):
+            continue
+        start, end = content.find("{"), content.rfind("}")
+        if start < 0 or end <= start:
+            return index, {}
+        try:
+            return index, json.loads(content[start:end + 1])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return index, {}
+    return None, None
+
+
+def _write_execution_plan(sd, plan: dict, index: int | None = None) -> None:
+    marker = "[PLAN_MARKER]\n" + json.dumps(plan, ensure_ascii=False, indent=2) + "\n[/PLAN_MARKER]"
+    if index is None:
+        index = 1 if sd.messages and sd.messages[0].get("role") == "system" else 0
+        sd.messages.insert(index, {"role": "user", "content": marker})
+    else:
+        sd.messages[index]["content"] = marker
 
 
 def _ensure_execution_plan(sd) -> None:
-    """Create durable execution state before complex work reaches the model."""
-    if not _task_requires_plan(sd.messages) or _has_plan_marker(sd.messages):
+    """Bind the checkpoint to the current request, replacing stale task state."""
+    latest = _latest_real_user_message(sd.messages)
+    if not latest:
         return
-    latest = next((str(m.get("content", "")).strip() for m in reversed(sd.messages) if m.get("role") == "user"), "")
+    index, existing = _read_execution_plan(sd.messages)
+    existing_goal = str((existing or {}).get("goal", "")).strip()
+    if index is not None and existing_goal and existing_goal == latest[:500]:
+        return
+    if not _task_requires_plan([{"role": "user", "content": latest}]) and index is None:
+        return
     marker = {
+        "task_id": hashlib.sha256(latest.encode("utf-8")).hexdigest()[:12],
         "goal": latest[:500],
         "status": "active",
         "done": [],
         "next": "Inspect the relevant files or environment before taking action.",
-        "notes": ["Runtime-created checkpoint; update after each meaningful milestone."],
+        "notes": ["Runtime checkpoint for the current user request; status stays active until the request is explicitly concluded."],
     }
-    insert_at = 1 if sd.messages and sd.messages[0].get("role") == "system" else 0
-    sd.messages.insert(insert_at, {
-        "role": "user",
-        "content": "[PLAN_MARKER]\n" + json.dumps(marker, ensure_ascii=False, indent=2) + "\n[/PLAN_MARKER]",
-    })
+    _write_execution_plan(sd, marker, index)
 
 
 def _update_execution_checkpoint(sd, records: list[dict]) -> None:
@@ -1224,14 +1232,24 @@ def _update_execution_checkpoint(sd, records: list[dict]) -> None:
         except (ValueError, json.JSONDecodeError):
             plan = {}
         completed = list(plan.get("done", [])) if isinstance(plan.get("done"), list) else []
+        notes = list(plan.get("notes", [])) if isinstance(plan.get("notes"), list) else []
         for record in records[-3:]:
             tool = str(record.get("tool", "tool"))
             args = record.get("arguments", {}) or {}
-            target = args.get("path") or args.get("command") or args.get("query") or args.get("action") or ""
-            entry = f"{tool}({str(target)[:100]}): {'ok' if record.get('ok') else 'failed'}"
+            target = args.get("path") or args.get("command") or args.get("query") or args.get("prompt") or args.get("action") or ""
+            target_text = str(target).replace("\n", " ")[:140]
+            outcome = "ok" if record.get("ok") else "failed"
+            entry = f"{tool}({target_text}): {outcome}"
             if entry not in completed:
                 completed.append(entry)
+            result = str(record.get("result", "")).replace("\n", " ").strip()
+            if result:
+                finding = f"{tool}({target_text}) -> {result[:240]}"
+                notes = [n for n in notes if not n.startswith(f"{tool}({target_text}) ->")]
+                notes.append(finding)
+        plan["status"] = "active"
         plan["done"] = completed[-20:]
+        plan["notes"] = notes[-20:]
         plan["next"] = "Continue from the latest completed tool result; do not redo completed steps."
         marker = "[PLAN_MARKER]\n" + json.dumps(plan, ensure_ascii=False, indent=2) + "\n[/PLAN_MARKER]"
         message["content"] = marker
@@ -2826,10 +2844,12 @@ class WebAPI:
                 "created_at": "", "updated_at": "",
                 "token_stats": {"prompt": 0, "eval": 0},
             }
+            ui_history, history_omitted = project_for_ui(sd.history)
             return {
                 "status": "ok",
                 "session": disk_session,
-                "history": sd.history,
+                "history": ui_history,
+                "history_omitted": history_omitted,
                 "input_tokens": sd.input_tokens,
                 "output_tokens": sd.output_tokens,
                 "prompt_tokens": sd.prompt_tokens,
@@ -2852,7 +2872,7 @@ class WebAPI:
         # belongs in prepare_messages(), immediately before the API request.
         disk_messages = [m for m in session.get("messages", []) if m.get("role") != "system"]
         sd.messages = [{"role": "system", "content": format_system_prompt(_available_tools, tool_manager=_tool_manager, native_tools=native)}] + disk_messages
-        sd.history = list(session.get("history", []))
+        sd.history = normalize_persisted(session.get("history", []))
         stats = session.get("token_stats", {})
         sd.input_tokens = stats.get("input", stats.get("prompt", 0))
         sd.output_tokens = stats.get("output", stats.get("eval", 0))
@@ -2863,10 +2883,12 @@ class WebAPI:
         sd.runtime_snapshot = stats.get("runtime", {}) if isinstance(stats.get("runtime", {}), dict) else {}
         sd.ctx_tokens = stats.get("ctx", 0) or _estimate_ctx_tokens(sd.messages, _provider_model, _provider)
         state.current_session_id = session_id
+        ui_history, history_omitted = project_for_ui(sd.history)
         return {
             "status": "ok",
             "session": session,
-            "history": sd.history,
+            "history": ui_history,
+            "history_omitted": history_omitted,
             "input_tokens": sd.input_tokens,
             "output_tokens": sd.output_tokens,
             "prompt_tokens": sd.prompt_tokens,
@@ -2914,29 +2936,45 @@ class WebAPI:
 
         system = sd.messages[0] if sd.messages and sd.messages[0].get("role") == "system" else {"role": "system", "content": "You summarize conversation context."}
         conversation = sd.messages[1:] if sd.messages and sd.messages[0].get("role") == "system" else sd.messages[:]
-        # Keep the latest turns verbatim; summarize only when there is enough history.
         keep_count = 6
         if len(conversation) <= keep_count + 2:
             return {"status": "error", "msg": "Context is already short; nothing to compact"}
-        older, recent = _split_compaction_messages(conversation, keep_count)
-        # Snapshot context size BEFORE compaction
+        
+        filtered, plan_messages = preserve_plan_markers(conversation)
+        older, recent = split_compaction_messages(filtered, keep_count)
         pre_compact_ctx = _estimate_ctx_tokens(sd.messages, _provider_model, _provider)
-        summary_prompt = _compaction_prompt(older, recent)
+        summary_prompt = build_compaction_prompt(older, recent)
         summary = ""
         error = None
         try:
-            for kind, chunk in _provider.chat_stream(
+            # Compaction is a bounded maintenance request. Do not enable local
+            # model thinking here: the input is already factual transcript data,
+            # and long hidden reasoning can pin an Ollama runner indefinitely.
+            compaction_stream = _provider.chat_stream(
                 _provider_model,
                 [
                     {"role": "system", "content": "You are a precise conversation compression service. Return only a factual summary."},
                     {"role": "user", "content": summary_prompt},
                 ],
                 tool_defs=None,
+                think=False,
+                max_tokens=1200,
+                idle_timeout=30,
+            )
+            for kind, chunk in _iter_stream_with_cancel(
+                compaction_stream, sd.cancel, idle_timeout=30,
+                on_idle_timeout=getattr(_provider, "cancel", None),
             ):
-                if kind == "content": summary += str(chunk)
-                elif kind == "error": error = str(chunk)
-            if error: return {"status": "error", "msg": error}
-            if not summary.strip(): return {"status": "error", "msg": "Model returned an empty summary"}
+                if kind == "content":
+                    summary += str(chunk)
+                elif kind == "error":
+                    error = str(chunk)
+                elif kind == "cancelled":
+                    return {"status": "error", "msg": "Compaction cancelled"}
+            if error:
+                return {"status": "error", "msg": error}
+            if not summary.strip():
+                return {"status": "error", "msg": "Model returned an empty summary"}
         except Exception as exc:
             return {"status": "error", "msg": f"Compaction failed: {exc}"}
 
@@ -2945,7 +2983,10 @@ class WebAPI:
         compact_marker = {"role": "user", "content": "[COMPACTED CONTEXT]\n" + summary.strip()}
 
         # Use the same estimator as live context statistics for both snapshots.
-        new_messages = [system, compact_marker] + recent
+        new_messages = [system]
+        if plan_messages:
+            new_messages.extend(plan_messages[-1:])
+        new_messages.extend([compact_marker] + recent)
         new_est = _estimate_ctx_tokens(new_messages, _provider_model, _provider)
         saved = max(0, pre_compact_ctx - new_est)
         pct = int(saved / pre_compact_ctx * 100) if pre_compact_ctx else 0
@@ -2964,6 +3005,7 @@ class WebAPI:
                 "ctx": sd.ctx_tokens,
                 "compressed_prompt_base": sd.compressed_prompt_base,
                 "compressed_context_size": sd.compressed_context_size,
+                "runtime": sd.runtime_snapshot,
             },
         )
         _emit("agent_done",

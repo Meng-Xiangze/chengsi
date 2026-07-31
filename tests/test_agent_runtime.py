@@ -6,6 +6,8 @@ from tools.bash import Bash
 from tools.python_executor import PythonExecutor
 from main import (
     _build_request_messages,
+    _ensure_execution_plan,
+    _update_execution_checkpoint,
     _is_unused_token_failure,
     _requires_local_tool_first,
     _summarize_turn_process,
@@ -129,6 +131,40 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error_code"], "python_error")
         self.assertNotEqual(result["exit_code"], 0)
+
+    def test_new_user_request_replaces_stale_done_plan(self):
+        class Session:
+            messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": '[PLAN_MARKER]\n{"goal":"检查目录中的监测位号信息","status":"done","done":["旧任务"]}\n[/PLAN_MARKER]'},
+                {"role": "user", "content": "理解FCC工艺图符号并查找料腿相关监测位号"},
+            ]
+
+        session = Session()
+        _ensure_execution_plan(session)
+        marker = session.messages[1]["content"]
+        self.assertIn("理解FCC工艺图符号", marker)
+        self.assertIn('"status": "active"', marker)
+        self.assertNotIn("旧任务", marker)
+
+    def test_checkpoint_keeps_findings_and_active_status(self):
+        class Session:
+            messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": '[PLAN_MARKER]\n{"goal":"分析多个文件","status":"active","done":[],"notes":[] }\n[/PLAN_MARKER]'},
+            ]
+
+        session = Session()
+        _update_execution_checkpoint(session, [{
+            "tool": "read",
+            "arguments": {"path": "diagram.xlsx"},
+            "ok": True,
+            "result": "发现三旋粉尘监测，未发现料腿流量位号",
+        }])
+        marker = session.messages[1]["content"]
+        self.assertIn("diagram.xlsx", marker)
+        self.assertIn("三旋粉尘监测", marker)
+        self.assertIn('"status": "active"', marker)
 
     def test_provider_retry_counter_is_consecutive(self):
         class Runtime:

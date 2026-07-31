@@ -903,9 +903,16 @@
       scrollToBottom(true);
     }
 
-    function renderHistory(history) {
+    function renderHistory(history, omitted = 0) {
       clearChat();
-      for (const event of history || []) {
+      const events = Array.isArray(history) ? history : [];
+      if (omitted > 0) {
+        const notice = document.createElement("div");
+        notice.className = "tool-event";
+        notice.textContent = `${omitted} older display events omitted. Model context and persisted task state are unaffected.`;
+        $("chat").appendChild(notice);
+      }
+      for (const event of events) {
         const type = event.type;
         const data = event.data;
         if (type === "user") addMessage("user", data);
@@ -1314,7 +1321,7 @@
       app.sessionId = sessionId;
       app.attachments = [];
       renderAttachments();
-      renderHistory(result.history || []);
+      renderHistory(result.history || [], result.history_omitted || 0);
       updateStats({ input: result.input_tokens ?? result.prompt_tokens ?? 0, output: result.output_tokens ?? result.eval_tokens ?? 0, ctx: result.ctx || 0 });
       setProcessing(result.processing);
       renderSessions();
@@ -1528,7 +1535,11 @@
       setOperationBusy("Compacting");
       try {
         const result = await app.api.compact_context(app.sessionId);
-        if (result?.status === "ok") { updateStats({ctx: result.tokens_after}); toast(`Context reduced by ${result.reduction_percent}%`); }
+        if (result?.status === "ok") {
+          updateStats({ctx: result.tokens_after});
+          await openSession(app.sessionId);
+          toast(`Context reduced by ${result.reduction_percent}%`);
+        }
         else toast(result?.msg || "Could not compact context");
       } catch (error) {
         console.error(error);

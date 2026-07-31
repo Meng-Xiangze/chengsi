@@ -144,9 +144,15 @@ class OllamaProvider(BaseProvider):
         payload = {"model": model, "messages": prepared_messages, "stream": True}
         if tool_defs and not fallback_mode:
             payload["tools"] = self._convert_tool_defs(tool_defs)
-        # Explicitly enable thinking — Ollama defaults to true for Qwen but being
-        # explicit avoids any version-specific default changes.
-        payload["think"] = True
+        # Compaction and other maintenance requests can explicitly disable
+        # chain-of-thought. Keep normal agent requests on the configured default.
+        payload["think"] = bool(kwargs.get("think", True))
+        max_tokens = kwargs.get("max_tokens")
+        if max_tokens is not None:
+            try:
+                payload["options"] = {"num_predict": max(64, min(int(max_tokens), 4096))}
+            except (TypeError, ValueError):
+                pass
 
         external_cancel = kwargs.get("cancel_event")
         self._cancel_event.clear()

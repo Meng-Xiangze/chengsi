@@ -21,12 +21,12 @@ class Plan(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Track task progress across turns. Use this to remember what you are doing, "
-            "what you have completed, and what to do next. Actions: show, update, done, clear.\n"
+            "Track the current user request across turns. Use this to remember what you are doing, "
+            "what you have completed, key findings, and what to do next. Keep the plan active until the user confirms the overall request is complete. Actions: show, update, done, clear.\n"
             "- show: read the current plan\n"
             "- update: set the plan content (overwrites). Provide 'goal' and 'next' strings, "
             "plus optional 'done' (list of completed items) and 'notes' (list of constraints/findings).\n"
-            "- done: mark the current goal as complete (optionally with a final note)\n"
+            "- done: mark the overall user request complete only after explicit user confirmation (optionally with a final note)\n"
             "- clear: wipe the plan"
         )
 
@@ -60,6 +60,10 @@ class Plan(BaseTool):
             "final_note": {
                 "type": "string",
                 "description": "Final summary when marking done",
+            },
+            "user_confirmed": {
+                "type": "boolean",
+                "description": "Required true only when the user explicitly confirmed the overall request is complete.",
             },
         }
 
@@ -97,6 +101,9 @@ class Plan(BaseTool):
             plan = self._read_plan(sd) or {}
             if not plan:
                 return "No plan to complete."
+            confirmation = str(arguments.get("user_confirmed", "")).strip().lower()
+            if confirmation not in {"true", "yes", "confirmed", "1"}:
+                return "Plan remains active. Mark done only after explicit user confirmation by passing user_confirmed=true."
             plan["status"] = "done"
             if final_note:
                 plan.setdefault("notes", []).append(f"DONE: {final_note}")
