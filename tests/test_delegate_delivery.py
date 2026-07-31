@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from main import WebAPI, build_model_choices
+
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -40,6 +42,41 @@ def _make_delegate_metadata(root: Path, session_id: str, status: str) -> Path:
 
 
 # ── Tests ────────────────────────────────────────────────────
+
+class TestDelegateProviderSnapshot:
+    def test_select_model_updates_global_provider_snapshot(self):
+        import main
+
+        original = (
+            main._provider,
+            main._provider_model,
+            main._provider_name,
+            main._current_provider_cfg,
+            main._providers_cfg,
+        )
+        try:
+            main._providers_cfg = [{
+                "type": "openai",
+                "name": "Test Cloud",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "test-key",
+                "models": [{"name": "cloud-model"}],
+            }]
+            result = WebAPI().select_model(0)
+            assert result["status"] == "ok"
+            assert main._provider_name == "Test Cloud"
+            assert main._provider_model == "cloud-model"
+            assert main._current_provider_cfg["type"] == "openai"
+            assert main._current_provider_cfg["base_url"] == "https://example.invalid/v1"
+        finally:
+            (
+                main._provider,
+                main._provider_model,
+                main._provider_name,
+                main._current_provider_cfg,
+                main._providers_cfg,
+            ) = original
+
 
 class TestDelegateNotificationDelivery:
     """Simulate watcher-loop logic in isolation."""

@@ -1,5 +1,6 @@
 import json
 import re
+import subprocess
 
 import requests
 
@@ -19,6 +20,23 @@ class OllamaProvider(BaseProvider):
     @property
     def supports_native_tools(self) -> bool:
         return True
+
+    def reset_model(self, model: str) -> tuple[bool, str]:
+        """Unload a poisoned resident runner so Ollama reloads clean weights."""
+        try:
+            completed = subprocess.run(
+                ["ollama", "stop", model],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as error:
+            return False, str(error)
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return completed.returncode == 0, detail
 
     @staticmethod
     def prepare_messages(messages: list[dict]) -> list[dict]:

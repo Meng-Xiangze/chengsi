@@ -53,7 +53,11 @@ class PythonExecutor(BaseTool):
             "code": {
                 "type": "string",
                 "description": "The Python code to be executed."
-            }
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Maximum execution time in seconds. Default 300, maximum 1800.",
+            },
         }
 
     def run(self, arguments: Dict[str, Any]) -> str:
@@ -65,6 +69,11 @@ class PythonExecutor(BaseTool):
         blocked = self._destructive_operation(code)
         if blocked:
             return blocked
+
+        try:
+            timeout = max(5, min(int(arguments.get("timeout", 300)), 1800))
+        except (TypeError, ValueError):
+            return {"ok": False, "content": "timeout must be an integer between 5 and 1800 seconds.", "error_code": "invalid_arguments"}
 
         # Run user code outside the WebView process. This prevents child
         # processes started by the code from inheriting Chengsi's console.
@@ -86,22 +95,28 @@ class PythonExecutor(BaseTool):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=300,
+                timeout=timeout,
                 check=False,
                 env=child_environment(),
             )
         except subprocess.TimeoutExpired as error:
             stdout_res = decode_output(error.stdout)
             stderr_res = decode_output(error.stderr)
-            return self._format_result(stdout_res, stderr_res, "Execution timed out after 300 seconds.")
+            return {"ok": False, "content": self._format_result(stdout_res, stderr_res, f"Execution timed out after {timeout} seconds."), "error_code": "timeout"}
         except OSError as error:
-            return f"Error: could not start isolated Python process: {error}"
+            return {"ok": False, "content": f"Error: could not start isolated Python process: {error}", "error_code": "tool_error"}
 
         stdout_res = decode_output(completed.stdout)
         stderr_res = decode_output(completed.stderr)
         if completed.returncode:
             stderr_res = stderr_res or f"Execution failed with exit code {completed.returncode}."
-        return self._format_result(stdout_res, stderr_res)
+        content = self._format_result(stdout_res, stderr_res)
+        return {
+            "ok": completed.returncode == 0,
+            "content": content,
+            "error_code": "ok" if completed.returncode == 0 else "python_error",
+            "exit_code": completed.returncode,
+        }
 
     @staticmethod
     def _format_result(stdout_res: str, stderr_res: str, extra_error: str = "") -> str:

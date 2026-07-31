@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,23 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 MAX_DELEGATE_TURNS = 30
+MAX_TRANSIENT_RETRIES = 30
+
+
+def _is_transient_provider_error(error_text: str) -> bool:
+    text = str(error_text or "").lower()
+    permanent = (
+        "http 400", "http 401", "http 403", "http 404", "model not found",
+        "invalid api key", "invalid model", "malformed sse json", "invalid request",
+    )
+    if any(marker in text for marker in permanent):
+        return False
+    transient = (
+        "could not connect", "connection", "timed out", "timeout", "network",
+        "protocolerror", "502", "503", "504", "readtimeout", "connecttimeout",
+        "connection reset", "connection aborted",
+    )
+    return any(marker in text for marker in transient)
 
 
 def _now() -> str:
@@ -101,7 +119,9 @@ def run_delegate(metadata_path: str) -> int:
     from core.agent_runtime import AgentRuntime, classify_tool_outcome
 
     provider_cfg = metadata.get("__provider_cfg", {})
-    provider_type = provider_cfg.get("type", "ollama") if provider_cfg else "ollama"
+    provider_type = metadata.get("__provider_type") or provider_cfg.get("type") or "ollama"
+    if not provider_cfg:
+        raise RuntimeError("Delegate has no provider configuration checkpoint; refusing to run with an empty provider config.")
 
     if provider_type == "ollama":
         from core.ollama_provider import OllamaProvider
@@ -111,6 +131,8 @@ def run_delegate(metadata_path: str) -> int:
         provider = OpenAIProvider(provider_cfg)
 
     active_model = metadata.get("__model", "")
+    if not active_model:
+        raise RuntimeError("Delegate has no model checkpoint.")
     if isinstance(active_model, dict):
         active_model = active_model.get("name", str(active_model))
 
@@ -136,6 +158,7 @@ def run_delegate(metadata_path: str) -> int:
     runtime.active = True
     total_input_tokens = 0
     total_output_tokens = 0
+    transient_retries = 0
 
     try:
         for turn in range(MAX_DELEGATE_TURNS):
@@ -150,6 +173,8 @@ def run_delegate(metadata_path: str) -> int:
 
             full_content = ""
             stream_tool_calls: list[dict] = []
+            transient_failure = False
+            stream_error_text = ""
 
             for kind, chunk in stream:
                 if kind == "content" and chunk:
@@ -169,9 +194,27 @@ def run_delegate(metadata_path: str) -> int:
                     total_input_tokens += chunk.get("prompt", chunk.get("input", 0))
                     total_output_tokens += chunk.get("eval", chunk.get("output", 0))
                 elif kind in ("error", "cancelled"):
+                    error_text = f"Provider {kind}: {chunk}"
+                    if kind == "error" and _is_transient_provider_error(error_text) and transient_retries < MAX_TRANSIENT_RETRIES:
+                        transient_retries += 1
+                        delay = min(60, 2 ** min(transient_retries - 1, 5))
+                        transient_failure = True
+                        stream_error_text = error_text
+                        _write_metadata(path, {
+                            "status": "paused",
+                            "error": error_text,
+                            "resume_after": _now(),
+                            "messages": messages,
+                            "tool_call_count": runtime.tool_calls,
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                        })
+                        time.sleep(delay)
+                        _write_metadata(path, {"status": "running", "error": ""})
+                        break
                     _write_metadata(path, {
                         "status": "failed",
-                        "error": f"Provider {kind}: {chunk}",
+                        "error": error_text,
                         "finished_at": _now(),
                         "messages": messages,
                         "tool_call_count": runtime.tool_calls,
@@ -179,6 +222,16 @@ def run_delegate(metadata_path: str) -> int:
                         "output_tokens": total_output_tokens,
                     })
                     return 1
+
+            if transient_failure:
+                # The checkpoint in messages is intact; restart the same model
+                # step after backoff. No assistant message was appended.
+                continue
+
+            # A non-empty model response proves the provider is reachable
+            # again. Keep the retry budget consecutive rather than task-wide.
+            if full_content or stream_tool_calls:
+                transient_retries = 0
 
             if not full_content and not stream_tool_calls:
                 _write_metadata(path, {

@@ -239,6 +239,8 @@ def format_system_prompt(available_tools: dict = None, tool_manager=None,
                          failure_alert: str | None = None, native_tools: bool = False) -> str:
     p = """You are Chengsi (澄思), a pragmatic agent with local tools and a knowledge base.
 Complete the user's task. When asked to act, use an available tool instead of giving instructions.
+You can access local Windows paths through the available tools. If the user gives a local file or directory path and asks you to inspect, understand, analyze, summarize, or modify it, your first response must contain an appropriate tool call. Never claim that you cannot access a local path, and never ask the user to upload or paste local files before trying the tools. For a directory, list it first; then read the relevant files. Do not invent analysis of files you have not inspected.
+Use read, never image_generator, to inspect or understand an existing image. image_generator is only for requests to create or modify image pixels.
 Inspect before editing when needed. Validate results when the user asks for checks or when the task itself requires verification; do not run project_test by default. Never claim success when tool output contains errors.
 For background jobs, always report completion, failure, interruption, or cancellation when notified. Set job.start auto_followup=true only when the user's original request explicitly asks for work to continue automatically after completion (for example, generate a report from the finished scan); otherwise leave it false and only notify the user.
 If an attempt fails, change approach; never repeat the same call more than twice.
@@ -471,6 +473,33 @@ def _is_native(provider, model_config: dict | None = None) -> bool:
     if isinstance(model_config, dict) and "tools" in model_config:
         return bool(model_config.get("tools"))
     return getattr(provider, "supports_native_tools", False)
+
+
+_LOCAL_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/][^\r\n`\"<>|*?]+|(?:Attached path|Attached paths):\s*\n?\s*-?\s*[^\r\n]+)",
+    re.IGNORECASE,
+)
+_LOCAL_INSPECTION_RE = re.compile(
+    r"(?:inspect|understand|analy[sz]e|summari[sz]e|review|read|open|check|modify|edit|"
+    r"查看|读取|分析|理解|检查|打开|修改|全面理解)",
+    re.IGNORECASE,
+)
+
+
+def _requires_local_tool_first(messages: list[dict]) -> bool:
+    """Return whether the latest user request requires local inspection first."""
+    content = next(
+        (message.get("content", "") for message in reversed(messages) if message.get("role") == "user"),
+        "",
+    )
+    if isinstance(content, list):
+        content = "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    text = str(content or "")
+    return bool(_LOCAL_PATH_RE.search(text) and _LOCAL_INSPECTION_RE.search(text))
 
 
 def _verification_tool_outcome(action: str, result: str) -> ToolOutcome | None:
@@ -850,6 +879,34 @@ OLDER TRANSCRIPT (historical evidence):
 """ + format_messages(older) + "\n\nRECENT VERBATIM CONTEXT (authoritative; read this last):\n" + format_messages(recent)
 
 
+_UNUSED_TOKEN_RE = re.compile(r"<unused\d+>", re.IGNORECASE)
+
+
+def _strip_unused_tokens(value):
+    """Remove leaked tokenizer placeholders from persisted/request content."""
+    if isinstance(value, str):
+        return _UNUSED_TOKEN_RE.sub("", value).strip()
+    if isinstance(value, list):
+        cleaned = []
+        for part in value:
+            if not isinstance(part, dict):
+                cleaned.append(part)
+                continue
+            item = dict(part)
+            if isinstance(item.get("text"), str):
+                item["text"] = _UNUSED_TOKEN_RE.sub("", item["text"]).strip()
+            cleaned.append(item)
+        return cleaned
+    return value
+
+
+def _is_unused_token_failure(text: str) -> bool:
+    """Detect responses made entirely of leaked reserved-token placeholders."""
+    if not isinstance(text, str) or not _UNUSED_TOKEN_RE.search(text):
+        return False
+    return not _UNUSED_TOKEN_RE.sub("", text).strip()
+
+
 def _build_request_messages(messages: list[dict]) -> list[dict]:
     """Build model request messages by stripping tool-call intermediates
     from completed turns while keeping the current turn intact.
@@ -913,6 +970,14 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
         # tool messages are skipped
 
     cleaned.extend(current)
+    sanitized = []
+    for msg in cleaned:
+        item = dict(msg)
+        item["content"] = _strip_unused_tokens(item.get("content"))
+        if item.get("role") == "assistant" and not item.get("tool_calls") and not item.get("content"):
+            continue
+        sanitized.append(item)
+    cleaned = sanitized
 
     # Inject compact tool trace into system prompt so the model remembers
     # that calling tools is the expected behavior.
@@ -935,6 +1000,29 @@ _STREAM_POLL_SEC = 0.15
 
 class StreamIdleTimeout(TimeoutError):
     """Raised when a model stream produces no usable event for too long."""
+
+
+def _is_transient_provider_error(error_text: str) -> bool:
+    """Classify failures that should pause and resume from the current checkpoint."""
+    text = str(error_text or "").lower()
+    permanent_markers = (
+        "http 400", "http 401", "http 403", "http 404", "model not found",
+        "invalid api key", "invalid model", "malformed sse json",
+        "unsupported", "invalid request",
+    )
+    if any(marker in text for marker in permanent_markers):
+        return False
+    transient_markers = (
+        "could not connect", "connection", "timed out", "timeout",
+        "temporarily", "network", "protocolerror", "502", "503", "504",
+        "readtimeout", "connecttimeout", "connection reset", "connection aborted",
+    )
+    return any(marker in text for marker in transient_markers)
+
+
+def _wait_retry(cancel_event: threading.Event, seconds: float) -> bool:
+    """Wait interruptibly; return False when the user cancelled the turn."""
+    return not cancel_event.wait(seconds)
 
 
 def _iter_stream_with_cancel(gen, cancel_event, idle_timeout: float | None = None, on_idle_timeout=None):
@@ -1088,6 +1176,68 @@ def _build_plan_summary(records: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _task_requires_plan(messages: list[dict]) -> bool:
+    """Identify work where losing the execution state would be costly."""
+    latest = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+    text = str(latest or "")
+    return len(text) >= 180 or bool(re.search(
+        r"(?:全面|多个|多步|系统性|完整|全部|项目|目录|文件夹|构建|研究|分析|提取|整理|修改|生成|子代理|delegate|plan)",
+        text,
+        re.IGNORECASE,
+    ))
+
+
+def _has_plan_marker(messages: list[dict]) -> bool:
+    return any(str(m.get("content", "")).startswith("[PLAN_MARKER]") for m in messages)
+
+
+def _ensure_execution_plan(sd) -> None:
+    """Create durable execution state before complex work reaches the model."""
+    if not _task_requires_plan(sd.messages) or _has_plan_marker(sd.messages):
+        return
+    latest = next((str(m.get("content", "")).strip() for m in reversed(sd.messages) if m.get("role") == "user"), "")
+    marker = {
+        "goal": latest[:500],
+        "status": "active",
+        "done": [],
+        "next": "Inspect the relevant files or environment before taking action.",
+        "notes": ["Runtime-created checkpoint; update after each meaningful milestone."],
+    }
+    insert_at = 1 if sd.messages and sd.messages[0].get("role") == "system" else 0
+    sd.messages.insert(insert_at, {
+        "role": "user",
+        "content": "[PLAN_MARKER]\n" + json.dumps(marker, ensure_ascii=False, indent=2) + "\n[/PLAN_MARKER]",
+    })
+
+
+def _update_execution_checkpoint(sd, records: list[dict]) -> None:
+    """Persist tool progress into the durable plan without model cooperation."""
+    if not records:
+        return
+    for message in sd.messages:
+        content = str(message.get("content", ""))
+        if not content.startswith("[PLAN_MARKER]"):
+            continue
+        try:
+            start, end = content.find("{"), content.rfind("}")
+            plan = json.loads(content[start:end + 1]) if start >= 0 and end > start else {}
+        except (ValueError, json.JSONDecodeError):
+            plan = {}
+        completed = list(plan.get("done", [])) if isinstance(plan.get("done"), list) else []
+        for record in records[-3:]:
+            tool = str(record.get("tool", "tool"))
+            args = record.get("arguments", {}) or {}
+            target = args.get("path") or args.get("command") or args.get("query") or args.get("action") or ""
+            entry = f"{tool}({str(target)[:100]}): {'ok' if record.get('ok') else 'failed'}"
+            if entry not in completed:
+                completed.append(entry)
+        plan["done"] = completed[-20:]
+        plan["next"] = "Continue from the latest completed tool result; do not redo completed steps."
+        marker = "[PLAN_MARKER]\n" + json.dumps(plan, ensure_ascii=False, indent=2) + "\n[/PLAN_MARKER]"
+        message["content"] = marker
+        return
+
+
 def _sync_plan_marker(sd, records: list[dict]) -> None:
     """Replace any existing TURN_SUMMARY message with an updated one.
 
@@ -1124,6 +1274,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
         return
 
     model_config = model_config or {}
+    _ensure_execution_plan(sd)
     native_tools = _is_native(provider, model_config) and not fallback_mode
     turn_tools = _turn_tools(available_tools, sd.messages) if not fallback_mode else {}
     tool_defs = build_tool_defs(tool_manager, turn_tools) if native_tools else None
@@ -1283,9 +1434,12 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         _emit("thinking_delta", full_thinking, session_id=session_id)
                     elif kind == "content":
                         full_content += chunk
-                        # Forward normal answer text immediately so the UI can show
-                        # progress while the provider is still streaming.
-                        _emit("agent_delta", chunk, session_id=session_id)
+                        # Reserved tokenizer placeholders are a runner failure, not
+                        # user-visible text. Keep them for post-stream detection but
+                        # never leak them into the live UI.
+                        visible_chunk = _UNUSED_TOKEN_RE.sub("", chunk)
+                        if visible_chunk:
+                            _emit("agent_delta", visible_chunk, session_id=session_id)
                     elif kind == "tool_calls":
                         stream_tool_calls = chunk
                     elif kind == "tokens":
@@ -1321,22 +1475,34 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 error_text = str(stream_error).strip() or "Model stream ended without a response."
                 is_timeout = "made no progress" in error_text
                 
-                if not is_timeout:
-                    # Real connection error - close the turn
-                    runtime.active = False
-                    sd.runtime_snapshot = runtime.snapshot()
-                
-                message = f"后台模型请求未能完成：{error_text}"
-                if is_timeout:
-                    # Add timeout as system context, not assistant message,
-                    # so the model can resume when user prompts "continue".
+                if is_timeout or _is_transient_provider_error(error_text):
+                    # The conversation and completed tool results are already the
+                    # checkpoint. Keep the turn open and retry the same model step
+                    # with bounded backoff; never fabricate an assistant answer.
+                    retry_count = getattr(runtime, "_provider_retry_count", 0) + 1
+                    runtime._provider_retry_count = retry_count
+                    persist_runtime_snapshot()
+                    delay = min(30, 2 ** min(retry_count - 1, 4))
+                    message = f"网络暂时不可用，已保留当前进度，{delay} 秒后继续（第 {retry_count} 次）"
                     _emit("thinking", f"⚠️ {message}", session_id=session_id)
-                else:
-                    # Real error - add as assistant message to close the turn
-                    sd.messages.append({"role": "assistant", "content": message})
-                
+                    if _wait_retry(sd.cancel, delay):
+                        continue
+                    return
+
+                # Permanent provider errors close the turn with an explicit
+                # blocker, while preserving the completed checkpoint.
+                runtime.active = False
+                sd.runtime_snapshot = runtime.snapshot()
+                message = f"后台模型请求未能完成：{error_text}"
+                sd.messages.append({"role": "assistant", "content": message})
                 _emit("agent_done", message, session_id=session_id)
                 return
+
+            # A valid provider response proves connectivity recovered. Retry
+            # counts are consecutive-failure counters, so clear them before
+            # processing this response and any subsequent tool calls.
+            if full_content or stream_tool_calls:
+                runtime._provider_retry_count = 0
 
             # Connection may have been closed externally by cancel_stream(); catch that here
             if sd.cancel.is_set():
@@ -1349,6 +1515,27 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
             # in the user-visible answer: it may quote prompts, source code, or examples
             # containing literal <tool_call> tags.
             full_response = full_content
+
+            if _is_unused_token_failure(full_content):
+                if not getattr(runtime, "_unused_token_reset_attempted", False):
+                    runtime._unused_token_reset_attempted = True
+                    reset_model = getattr(provider, "reset_model", None)
+                    if callable(reset_model):
+                        _emit("thinking", "Model emitted reserved placeholder tokens; resetting its resident runner...", session_id=session_id)
+                        reset_ok, reset_detail = reset_model(model)
+                        if reset_ok:
+                            continue
+                        stream_error = f"Model runner reset failed: {reset_detail or 'unknown error'}"
+                    else:
+                        stream_error = "Model emitted reserved placeholder tokens and this provider cannot reset its runner."
+                else:
+                    stream_error = "Model still emitted reserved placeholder tokens after one runner reset."
+                runtime.active = False
+                sd.runtime_snapshot = runtime.snapshot()
+                message = f"后台模型异常：{stream_error}"
+                sd.messages.append({"role": "assistant", "content": message})
+                _emit("agent_done", message, session_id=session_id)
+                return
 
             # ── NATIVE TOOL CALLS (OpenAI-compatible) ──
             if stream_tool_calls:
@@ -1429,6 +1616,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         "ok": outcome.ok,
                         "result": visible_result[:8000],
                     })
+                    _update_execution_checkpoint(sd, turn_tool_records)
                     if (
                         tc["action"] == "job"
                         and tc["arguments"].get("action") == "start"
@@ -1487,6 +1675,25 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     last_summary_source_size = source_size
                 continue
             clean_response = re.sub(r"<tool_call>.*?</tool_call>", "", full_response, flags=re.DOTALL).strip()
+            if (
+                native_tools
+                and tool_defs
+                and not turn_tool_records
+                and _requires_local_tool_first(sd.messages)
+                and not getattr(runtime, "_local_tool_retry_sent", False)
+            ):
+                runtime._local_tool_retry_sent = True
+                sd.messages.append({"role": "assistant", "content": clean_response or None})
+                sd.messages.append({
+                    "role": "user",
+                    "content": (
+                        "[RUNTIME REQUIREMENT] The latest request names a local path and requires inspection. "
+                        "Your preceding answer is invalid because no local tool was called. You do have local "
+                        "filesystem access. Call a tool now: list a directory first, or read the named file. "
+                        "Do not claim lack of access, ask for an upload, or provide speculative analysis."
+                    ),
+                })
+                continue
             if not clean_response:
                 # Model produced nothing (no content, no tool calls). Inject a
                 # one-time nudge so the next iteration tries again instead of
@@ -1666,7 +1873,7 @@ def _delegate_watcher_loop() -> None:
                             except (ValueError, TypeError):
                                 pass
 
-                    if not session_id or status in {"queued", "starting", "running"}:
+                    if not session_id or status in {"queued", "starting", "running", "paused"}:
                         continue
                     if seen.get(delegate_id) == status or metadata.get("agent_received_at"):
                         continue
@@ -2150,7 +2357,7 @@ class WebAPI:
             return {"status": "error", "msg": f"Could not save: {exc}"}
 
     def select_model(self, idx: int):
-        global _provider, _provider_model
+        global _provider, _provider_model, _provider_name, _current_provider_cfg
         # Model switching is global for new requests, but must not be blocked by
         # another session that is currently generating. Each worker captures its
         # provider/model when the request starts, so an idle session can switch

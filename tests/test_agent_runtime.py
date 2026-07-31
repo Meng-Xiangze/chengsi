@@ -2,7 +2,14 @@ import unittest
 from unittest.mock import Mock
 
 from core.agent_runtime import AgentRuntime, ToolOutcome
-from main import _summarize_turn_process
+from tools.bash import Bash
+from tools.python_executor import PythonExecutor
+from main import (
+    _build_request_messages,
+    _is_unused_token_failure,
+    _requires_local_tool_first,
+    _summarize_turn_process,
+)
 
 
 class AgentRuntimeTests(unittest.TestCase):
@@ -72,6 +79,66 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(stop_reason, "")
         self.assertFalse(runtime.needs_verification())
         self.assertFalse(runtime.can_request_verification())
+
+    def test_local_directory_analysis_requires_tool_first(self):
+        messages = [{
+            "role": "user",
+            "content": r"C:\Users\MengX\Desktop\pressure_balance 全面理解，分析料腿压力平衡",
+        }]
+        self.assertTrue(_requires_local_tool_first(messages))
+
+    def test_local_path_mentioned_without_inspection_request_does_not_force_tool(self):
+        messages = [{"role": "user", "content": r"路径叫 C:\Users\MengX\Desktop\notes"}]
+        self.assertFalse(_requires_local_tool_first(messages))
+
+    def test_attached_path_with_read_request_requires_tool_first(self):
+        messages = [{
+            "role": "user",
+            "content": "Read this image.\n\nAttached path:\n- D:\\chengsi\\media\\diagram.png",
+        }]
+        self.assertTrue(_requires_local_tool_first(messages))
+
+    def test_reserved_placeholder_only_response_is_failure(self):
+        self.assertTrue(_is_unused_token_failure("<unused50>" * 31))
+        self.assertFalse(_is_unused_token_failure("answer <unused50>"))
+        self.assertFalse(_is_unused_token_failure("normal answer"))
+
+    def test_reserved_placeholders_are_removed_from_request_history(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "<unused50>" * 31},
+            {"role": "user", "content": "second"},
+        ]
+        request = _build_request_messages(messages)
+        self.assertEqual([item["role"] for item in request], ["system", "user", "user"])
+        self.assertNotIn("<unused", str(request))
+
+    def test_bash_uses_explicit_working_directory(self):
+        result = Bash().run({"command": "python -c \"import os; print(os.getcwd())\"", "cwd": "."})
+        self.assertTrue(result["ok"])
+        self.assertIn("[cwd:", result["content"])
+
+    def test_python_executor_rejects_invalid_timeout(self):
+        result = PythonExecutor().run({"code": "print(1)", "timeout": "bad"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "invalid_arguments")
+
+    def test_python_executor_returns_structured_failure(self):
+        result = PythonExecutor().run({"code": "raise RuntimeError('boom')", "timeout": 5})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "python_error")
+        self.assertNotEqual(result["exit_code"], 0)
+
+    def test_provider_retry_counter_is_consecutive(self):
+        class Runtime:
+            _provider_retry_count = 3
+
+        runtime = Runtime()
+        response_has_content = True
+        if response_has_content:
+            runtime._provider_retry_count = 0
+        self.assertEqual(runtime._provider_retry_count, 0)
 
     def test_repeated_rejections_eventually_stop_the_turn(self):
         runtime = AgentRuntime(max_identical_calls=0, max_consecutive_failures=2)

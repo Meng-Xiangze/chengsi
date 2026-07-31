@@ -53,6 +53,10 @@ class Bash(BaseTool):
                 "type": "integer",
                 "description": "Max seconds to wait for the command. Default 30. Use 5-15 for fast ops (ls, cat, echo), 30-60 for moderate ops (git, find, grep), 120-300 for slow ops (pip install, npm install, large builds).",
             },
+            "cwd": {
+                "type": "string",
+                "description": "Optional working directory. Defaults to the Chengsi project root.",
+            },
         }
 
     def run(self, arguments: dict[str, Any]) -> str | dict[str, Any]:
@@ -86,6 +90,12 @@ class Bash(BaseTool):
                 last_progress_at = now
             progress(text)
 
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        raw_cwd = str(arguments.get("cwd", "")).strip()
+        cwd = os.path.abspath(os.path.expanduser(raw_cwd)) if raw_cwd else project_root
+        if not os.path.isdir(cwd):
+            return {"ok": False, "content": f"Working directory does not exist: {cwd}", "error_code": "invalid_arguments"}
+
         creationflags = 0
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
@@ -108,7 +118,7 @@ class Bash(BaseTool):
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                cwd=None,
+                cwd=cwd,
                 env=child_environment(),
                 creationflags=creationflags,
                 **popen_kwargs,
@@ -148,6 +158,11 @@ class Bash(BaseTool):
 
         t_out.join(timeout=1)
         t_err.join(timeout=1)
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except (AttributeError, OSError):
+                pass
         report_progress("", force=True)
 
         stdout = "".join(stdout_lines)
@@ -179,7 +194,8 @@ class Bash(BaseTool):
         content = "\n".join(parts) if parts else "(no output)"
         return {
             "ok": return_code == 0,
-            "content": content,
+            "content": f"[cwd: {cwd}]\n{content}",
             "error_code": "ok" if return_code == 0 else "nonzero_exit",
             "exit_code": return_code,
+            "cwd": cwd,
         }
