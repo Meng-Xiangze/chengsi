@@ -7,14 +7,15 @@ import threading
 import time
 from typing import Any
 
-from core.process_utils import child_environment, decode_output, prepare_shell_command
+from core.process_utils import child_environment, decode_output, decode_output_lines, prepare_shell_command
 from tools.base import BaseTool
 
 
 def _read_stream(stream, buffer: list[str], lock: threading.Lock, on_output=None):
-    """Read a stream line by line into a shared buffer."""
+    """Read a binary stream line by line, decoding each line tolerantly."""
     try:
-        for line in iter(stream.readline, ""):
+        for raw_line in iter(stream.readline, b""):
+            line = decode_output_lines(raw_line)
             with lock:
                 buffer.append(line)
             if callable(on_output):
@@ -33,12 +34,14 @@ class Bash(BaseTool):
         return (
             "Execute a shell command in the project's configured child environment "
             "(cmd.exe on Windows, bash on Linux/Mac). Python commands use this project's .venv. "
-            "Returns stdout and stderr. PREFERRED for: file ops (ls, cp, mv, rm, mkdir, find), "
-            "git (status, diff, log, commit), package installs (python -m pip), system info. "
-            "Single-line commands are fastest — use bash for 1-shot terminal tasks. "
-            "For multi-step logic, data processing, or complex scripting, use python_executor. "
+            "Returns stdout and stderr. PREFERRED for quick command-line programs: git status/diff/log, rg, fd, "
+            "small tests, version checks, and system utilities. For pip install/download, package or software "
+            "installers, curl/wget/Invoke-WebRequest downloads, git clone, dependency setup, large archive extraction, "
+            "or builds likely to exceed about 30 seconds, use job(action='start') instead. "
+            "Use read, write, and edit for normal file work. Use python_executor for calculations, "
+            "structured data processing, or direct Python library APIs. "
             "For commands that may run longer than 5 minutes, use job so they continue in the background. "
-            "The model should set an appropriate timeout based on the command: fast ops 5-15s, moderate 30-60s, slow (installs/builds) 120-300s. "
+            "The model should set an appropriate timeout based on the command: fast ops 5-15s, moderate 30-60s. "
             "Default timeout: 30s. Max: 600s (10 min). Partial output is returned on timeout."
         )
 
@@ -51,7 +54,7 @@ class Bash(BaseTool):
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to wait for the command. Default 30. Use 5-15 for fast ops (ls, cat, echo), 30-60 for moderate ops (git, find, grep), 120-300 for slow ops (pip install, npm install, large builds).",
+                "description": "Max seconds to wait for a quick foreground command. Default 30. Use 5-15 for fast ops and 30-60 for moderate ops. Route pip install/download, installers, downloads, clones, and long builds to job instead.",
             },
             "cwd": {
                 "type": "string",
@@ -114,10 +117,6 @@ class Bash(BaseTool):
                 executable=shell,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
                 cwd=cwd,
                 env=child_environment(),
                 creationflags=creationflags,
@@ -134,11 +133,7 @@ class Bash(BaseTool):
         t_out.start()
         t_err.start()
 
-        timed_out = False
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        def kill_tree() -> None:
             try:
                 if os.name == "nt":
                     subprocess.run(
@@ -156,6 +151,25 @@ class Bash(BaseTool):
                 except OSError:
                     pass
 
+        timed_out = False
+        cancelled = False
+        cancel_event = arguments.get("_cancel_event")
+        deadline = time.monotonic() + timeout
+        # Poll instead of blocking proc.wait(): Stop must interrupt a stuck
+        # command within ~100ms, not after its (up to 600s) timeout expires.
+        while True:
+            if proc.poll() is not None:
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                kill_tree()
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                kill_tree()
+                break
+            time.sleep(0.1)
+
         t_out.join(timeout=1)
         t_err.join(timeout=1)
         for stream in (proc.stdout, proc.stderr):
@@ -168,6 +182,15 @@ class Bash(BaseTool):
         stdout = "".join(stdout_lines)
         stderr = "".join(stderr_lines)
         return_code = proc.poll()
+
+        if cancelled:
+            parts = []
+            if stdout.strip():
+                parts.append(stdout.rstrip())
+            if stderr.strip():
+                parts.append(f"[stderr]\n{stderr.rstrip()}")
+            parts.append("[CANCELLED by user — partial output above; do not retry this command unchanged]")
+            return {"ok": False, "content": "\n".join(parts), "error_code": "user_cancelled", "exit_code": return_code}
 
         if timed_out:
             if stdout.strip() or stderr.strip():
@@ -182,12 +205,10 @@ class Bash(BaseTool):
             return {"ok": False, "content": f"Command timed out after {timeout}s with no output.", "error_code": "timeout"}
 
         parts = []
-        stdout_decoded = decode_output(stdout) if not isinstance(stdout, str) else stdout
-        stderr_decoded = decode_output(stderr) if not isinstance(stderr, str) else stderr
-        if stdout_decoded:
-            parts.append(stdout_decoded.rstrip())
-        if stderr_decoded:
-            parts.append(f"[stderr]\n{stderr_decoded.rstrip()}")
+        if stdout:
+            parts.append(stdout.rstrip())
+        if stderr:
+            parts.append(f"[stderr]\n{stderr.rstrip()}")
         if return_code != 0:
             parts.append(f"[exit code: {return_code}]")
 

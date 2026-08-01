@@ -1,6 +1,6 @@
 # Chengsi (澄思)
 
-**Version 0.5.1**
+**Version 0.6.0**
 
 Chengsi is a local intelligent assistant with a desktop WebUI, configurable model providers, a persistent local knowledge base, session history, and an extensible Python tool system. It is designed for users who want an assistant they can run and customize on their own computer.
 
@@ -11,14 +11,13 @@ Chengsi is a local intelligent assistant with a desktop WebUI, configurable mode
 - Local desktop chat interface powered by `pywebview`
 - Local Ollama and OpenAI-compatible model providers
 - Native function calling for all models — no text-based tool protocols
-- 14 discoverable tools: read (text, CSV, XLSX, PDF, DOCX, images, code search, Python outlines/symbols), write, edit (symbol, hash-range, and exact-text operations), bash, job, ls, python_executor, web_searcher, web_reader, knowledge_base, chat_exporter, system_cleaner, project_test, and image_generator
+- 19 discoverable tools, including unified file inspection/editing, desktop control, command and Python execution, background work, web access, scheduling, delegation, knowledge management, and image generation
 - SQLite FTS5 local knowledge base with user-managed search, ingest, list, and remove operations
 - Persistent conversations and generated media
 - Image generation through a configured image-capable model
 - PDF and DOCX reading with dual text/visual modes — vision models can see rendered pages
 - DOCX creation with Markdown-like formatting syntax
 - CSV/XLSX reading, creation, and exact-cell editing through the standard file tools
-- One-turn process summaries preserve factual exploration across inner tool loops and expire before the next user turn
 - User-controlled text-only fallback requests and optional automatic pip installation in Settings
 - Per-model Chat Completions or Responses API selection for OpenAI-compatible aggregators
 - Persistent background jobs for commands that run for minutes or hours, with status, log, list, and cancel operations
@@ -297,7 +296,7 @@ WebView API and agent loop (main.py)
 1. The WebUI sends a user message through the `pywebview` bridge in `main.py`.
 2. `main.py` selects the configured provider and builds the system prompt and tool definitions.
 3. OpenAI-compatible models use their configured `request_api`: Chat Completions streams `/chat/completions` events, while Responses streams `/responses` output, reasoning, usage, and function-call events. Ollama continues to use its native chat endpoint.
-4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. After tool batches, a short-lived model summary records concrete exploration for the next inner step and is removed before the next user turn. Summary requests stop after 30 seconds without progress and are skipped on failure.
+4. Tool calls are resolved by `ToolManager`; when `parallel_tools` is enabled, independent calls from one response execute concurrently. Tool results remain directly available throughout the current agent turn without an auxiliary summarization request.
 5. Model streams use a five-minute inactivity timeout, not a five-minute turn limit. Every provider event resets the timer, so active multi-step turns may continue as long as needed.
 6. Commands expected to run for minutes or hours use the detached `job` tool. Jobs continue outside the conversation worker, persist metadata and logs across Chengsi restarts, and stop only when they finish, fail, or are explicitly cancelled.
 7. Final responses and UI events are saved by `SessionManager`.
@@ -323,15 +322,16 @@ WebView API and agent loop (main.py)
 
 Chengsi automatically discovers tools from Python files in the `tools/` directory. Each tool inherits from `tools.base.BaseTool` and implements `tool_name`, `description`, `parameters`, and `run(arguments)`.
 
-### Available Tools (14)
+### Available Tools (19)
 
 | Category | Tools |
 | --- | --- |
 | File I/O | `read` — text, CSV, XLSX, PDF, DOCX, images, code search. `write` — create/overwrite text, CSV, XLSX, and formatted DOCX. `edit` — precise text/DOCX edits and exact-cell spreadsheet replacement. `ls` — directory listing. |
-| Execution | `bash` — bounded foreground shell commands (file ops, git, pip). `python_executor` — bounded foreground Python for multi-step logic and data processing. `job` — persistent background commands with status, logs, list, and explicit cancellation. |
+| Desktop | `computer` — screenshots, visible-window listing and activation, mouse, keyboard, and visual verification on Windows. |
+| Execution | `bash` — bounded command-line programs such as git, rg/fd, tests, builds, installers, and system utilities. `python_executor` — bounded Python for calculations, structured data processing, and direct library APIs. `job` — persistent background commands with status, logs, list, and explicit cancellation. |
 | Web | `web_searcher` — DuckDuckGo search. `web_reader` — fetch and extract web page content. |
 | Project | `project_test` — syntax, import, and unittest checks. `system_cleaner` — preview/clean temp files and caches. |
-| Meta | `knowledge_base` — local document search and management. `chat_exporter` — export sessions as Markdown. `image_generator` — generate images via cloud API. |
+| Meta | `plan` — persistent task state. `delegate` — background sub-agent work. `schedule` — timed agent turns. `get_current_time` — reliable local date/time. `knowledge_base` — local document search and management. `chat_exporter` — export sessions as Markdown. `image_generator` — generate images via cloud API. |
 
 Models receive tool descriptions through native function calling — the system prompt stays lean (~260 tokens) and only tools relevant to the task are described. Each tool's `.md` front-matter provides the canonical description sent to models.
 
@@ -388,10 +388,10 @@ Chengsi/
 |-- tools/
 |   |-- base.py           tool base class
 |   |-- TOC.md            tool reference
-|   `-- 13 tool modules: read, write, edit, bash, job, ls, python_executor,
-|                        web_searcher, web_reader, knowledge_base,
-|                        chat_exporter, system_cleaner, project_test,
-|                        image_generator (provided by tool_manager)
+|   `-- 18 tool modules, including read, write, edit, computer, bash,
+|                        python_executor, job, web tools, scheduling, delegation,
+|                        knowledge tools, and project utilities
+|       + image_generator (provided by tool_manager)
 |-- tests/                unit tests
 |-- knowledge/            SQLite database at runtime (private)
 |-- sessions/             conversation history at runtime (private)

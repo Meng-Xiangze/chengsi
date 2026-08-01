@@ -83,7 +83,8 @@ class Job(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Manage detached shell jobs for commands that may run for minutes or hours. "
+            "Manage detached shell jobs for commands that may run for minutes or hours. Prefer this for pip install/download, "
+            "package or software installers, downloads, git clone, dependency setup, large extraction, and long builds. "
             "Start returns immediately with a job_id; use status, logs, list, or cancel later."
         )
 
@@ -251,7 +252,8 @@ class Job(BaseTool):
         if not log_path.is_file():
             content = "(no log output yet)"
         else:
-            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            from core.process_utils import decode_output_lines
+            lines = decode_output_lines(log_path.read_bytes()).splitlines()
             content = "\n".join(lines[-tail_lines:]) or "(no log output yet)"
         return {"ok": True, "content": f"job_id: {job_id}\nstatus: {metadata['status']}\n--- log tail ---\n{content}", "error_code": "ok"}
 

@@ -6,9 +6,12 @@
 - `edit`: Precise text/DOCX edits plus exact-cell CSV/XLSX replacement.
 - `ls`: List directory contents with file sizes and types.
 
+## Desktop
+- `computer`: Observe and operate the Windows desktop with screenshots, window activation, mouse, and keyboard controls.
+
 ## Execution
-- `bash`: Run a bounded foreground command in the project child environment (cmd.exe on Windows, bash elsewhere); output is normalized to UTF-8. Required: `command`. 60s timeout.
-- `python_executor`: Run bounded foreground Python in the project's active virtual environment with UTF-8 output. Required: `code`.
+- `bash`: Run bounded command-line programs in the project child environment (cmd.exe on Windows, bash elsewhere); use for git, rg/fd, tests, builds, installers, and system utilities.
+- `python_executor`: Run bounded Python for calculations, structured data processing, and direct library APIs.
 - `job`: Start and manage persistent background shell jobs in the same child environment. `start` means accepted/running, not completed. Actions: start, status, logs, list, cancel.
 - `schedule`: Create persistent one-time or repeating scheduled agent turns. Scheduled turns can call normal tools such as `web_searcher`. Actions: create, list, cancel.
 

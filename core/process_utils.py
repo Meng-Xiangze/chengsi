@@ -56,3 +56,18 @@ def decode_output(value: bytes | str | None) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return value.decode("utf-8", errors="replace")
+
+
+def decode_output_lines(value: bytes | str | None) -> str:
+    """Decode possibly mixed-encoding output one line at a time.
+
+    Windows children may emit UTF-8 (chcp 65001) for most lines while legacy
+    cmd/PowerShell errors stay in GBK. Splitting on b'\n' is safe: neither
+    UTF-8 nor GBK trail bytes contain 0x0A.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    parts = value.split(b"\n")
+    return "\n".join(decode_output(part) for part in parts)

@@ -137,7 +137,16 @@ class AgentRuntime:
     def _signature(action: str, arguments: dict) -> str:
         return f"{action}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)}"
 
+    @staticmethod
+    def _repeatable_observation(action: str, arguments: dict) -> bool:
+        return action == "computer" and str(arguments.get("action", "")).lower() in {
+            "screenshot", "windows", "position", "screen_size",
+        }
+
     def allow(self, action: str, arguments: dict) -> tuple[bool, str]:
+        if self._repeatable_observation(action, arguments):
+            self.tool_calls += 1
+            return True, ""
         signature = self._signature(action, arguments)
         seen = self._signatures.get(signature, 0)
         if seen >= self.max_identical_calls:
@@ -150,6 +159,8 @@ class AgentRuntime:
         """Atomically admit or reject a model-emitted tool-call batch."""
         pending = dict(self._signatures)
         for action, arguments in calls:
+            if self._repeatable_observation(action, arguments):
+                continue
             signature = self._signature(action, arguments)
             seen = pending.get(signature, 0)
             if seen >= self.max_identical_calls:
@@ -171,6 +182,10 @@ class AgentRuntime:
 
     def observe(self, action: str, arguments: dict, outcome: ToolOutcome, tool=None) -> tuple[bool, str]:
         if outcome.ok:
+            self.consecutive_failures = 0
+        elif outcome.code == "user_cancelled":
+            # User-initiated stop is not an execution failure; never let it
+            # trip the consecutive-failure guard or trigger auto-retry logic.
             self.consecutive_failures = 0
         else:
             self.consecutive_failures += 1

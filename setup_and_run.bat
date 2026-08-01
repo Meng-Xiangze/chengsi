@@ -16,7 +16,7 @@ if /i "%~1"=="--setup" (
 if not exist "%VENV_PYTHON%" set "NEEDS_SETUP=1"
 if exist "%VENV_PYTHON%" "%VENV_PYTHON%" -m pip --version >nul 2>nul
 if errorlevel 1 set "NEEDS_SETUP=1"
-if "%NEEDS_SETUP%"=="0" "%VENV_PYTHON%" -c "import requests, yaml, webview, PIL, ddgs, bs4, win32clipboard, win32con" >nul 2>nul
+if "%NEEDS_SETUP%"=="0" "%VENV_PYTHON%" -c "import requests, openpyxl, yaml, webview, PIL, ddgs, bs4, win32clipboard, win32con, pyautogui, pywinauto" >nul 2>nul
 if errorlevel 1 set "NEEDS_SETUP=1"
 if exist "%ROOT%\.venv\pyvenv.cfg" (
     for /f "usebackq tokens=1,* delims==" %%A in ("%ROOT%\.venv\pyvenv.cfg") do (
@@ -121,7 +121,7 @@ if errorlevel 1 (
     if errorlevel 1 exit /b 1
 )
 
-"%VENV_PYTHON%" -c "import requests, yaml, webview, PIL, ddgs, bs4, win32clipboard, win32con"
+"%VENV_PYTHON%" -c "import requests, openpyxl, yaml, webview, PIL, ddgs, bs4, win32clipboard, win32con, pyautogui, pywinauto"
 if errorlevel 1 (
     echo Dependency verification failed. Some required packages are still unavailable.
     exit /b 1

@@ -3,6 +3,7 @@ import json
 import shutil
 import uuid
 import tempfile
+import threading
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
@@ -13,6 +14,7 @@ class SessionManager:
     def __init__(self, sessions_dir: str = "sessions", media_dir: Optional[str] = None):
         self.sessions_dir = os.path.abspath(sessions_dir)
         self.media_dir = os.path.abspath(media_dir) if media_dir else None
+        self._lock = threading.RLock()
         os.makedirs(self.sessions_dir, exist_ok=True)
         if self.media_dir:
             os.makedirs(self.media_dir, exist_ok=True)
@@ -45,6 +47,12 @@ class SessionManager:
             "messages": [],
             "history": [],
             "token_stats": {"input": 0, "output": 0, "prompt": 0, "eval": 0, "ctx": 0},
+            "parent_session_id": "",
+            "root_session_id": sid,
+            "fork_message_index": None,
+            "branch_kind": "root",
+            "branches": [],
+            "active_branch_id": "root",
         }
         with open(self._path(sid), "w", encoding="utf-8") as f:
             json.dump(session, f, ensure_ascii=False, indent=2)
@@ -53,20 +61,42 @@ class SessionManager:
     def save(self, session_id: str, messages: List[Dict[str, Any]],
              history: Optional[List[Dict]] = None,
              token_stats: Optional[Dict] = None,
-             title: Optional[str] = None) -> bool:
+             title: Optional[str] = None,
+             metadata: Optional[Dict[str, Any]] = None) -> bool:
+        with self._lock:
+            return self._save_unlocked(session_id, messages, history, token_stats, title, metadata)
+
+    def _save_unlocked(self, session_id: str, messages: List[Dict[str, Any]],
+             history: Optional[List[Dict]] = None,
+             token_stats: Optional[Dict] = None,
+             title: Optional[str] = None,
+             metadata: Optional[Dict[str, Any]] = None) -> bool:
         path = self._safe_path(session_id)
         if not path:
             return False
         try:
             with open(path, "r", encoding="utf-8") as f:
                 session = json.load(f)
-            # Strip system messages before saving — they are rebuilt on load
-            session["messages"] = [m for m in messages if m.get("role") != "system"]
+            persisted_messages = [m for m in messages if m.get("role") != "system"]
+            session["messages"] = persisted_messages
             if history is not None:
                 session["history"] = history
             if token_stats is not None:
                 session["token_stats"] = token_stats
+            active_branch_id = str(session.get("active_branch_id") or "root")
+            for branch in session.get("branches", []):
+                if str(branch.get("id")) != active_branch_id:
+                    continue
+                branch["messages"] = [dict(item) for item in persisted_messages]
+                if history is not None:
+                    branch["history"] = [dict(item) for item in history]
+                if token_stats is not None:
+                    branch["token_stats"] = dict(token_stats)
+                branch["updated_at"] = datetime.now().isoformat()
+                break
             session["updated_at"] = datetime.now().isoformat()
+            if metadata:
+                session.update(metadata)
             if title:
                 session["title"] = title
             elif not session.get("title") or session["title"] == "New Chat":
@@ -119,6 +149,152 @@ class SessionManager:
                 continue
         sessions.sort(key=lambda x: x["updated_at"], reverse=True)
         return sessions
+
+    def fork(
+        self,
+        source_session_id: str,
+        title: str = "Branch",
+        fork_message_index: Optional[int] = None,
+        branch_kind: str = "branch",
+        include_history: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        source = self.load(source_session_id)
+        if not source:
+            return None
+        branch = self.create(title)
+        branch["parent_session_id"] = source_session_id
+        branch["root_session_id"] = source.get("root_session_id") or source_session_id
+        branch["fork_message_index"] = fork_message_index
+        branch["branch_kind"] = branch_kind
+        branch["messages"] = list(source.get("messages", []))
+        branch["history"] = list(source.get("history", [])) if include_history else []
+        branch["token_stats"] = dict(source.get("token_stats", {}))
+        self.save(
+            branch["id"],
+            branch["messages"],
+            history=branch["history"],
+            token_stats=branch["token_stats"],
+            title=title,
+            metadata={
+                "parent_session_id": source_session_id,
+                "root_session_id": source.get("root_session_id") or source_session_id,
+                "fork_message_index": fork_message_index,
+                "branch_kind": branch_kind,
+            },
+        )
+        return self.load(branch["id"])
+
+    def create_in_session_branch(self, session_id: str, messages: list[dict], history: list[dict], fork_message_index: int, title: str = "Branch") -> Optional[Dict[str, Any]]:
+        session = self.load(session_id)
+        if not session:
+            return None
+        branch_id = uuid.uuid4().hex[:10]
+        branches = list(session.get("branches", []))
+        if not any(item.get("id") == "root" for item in branches):
+            branches.insert(0, {
+                "id": "root",
+                "title": session.get("title", "Chat"),
+                "fork_message_index": fork_message_index,
+                "messages": list(session.get("messages", [])),
+                "history": list(session.get("history", [])),
+                "created_at": session.get("created_at", datetime.now().isoformat()),
+            })
+        branches.append({
+            "id": branch_id,
+            "title": title,
+            "fork_message_index": fork_message_index,
+            "messages": [dict(item) for item in messages],
+            "history": [dict(item) for item in history],
+            "created_at": datetime.now().isoformat(),
+        })
+        session["branches"] = branches
+        session["active_branch_id"] = branch_id
+        session["messages"] = [dict(item) for item in messages]
+        session["history"] = [dict(item) for item in history]
+        path = self._safe_path(session_id)
+        if not path:
+            return None
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(session, handle, ensure_ascii=False, indent=2)
+        return {"id": branch_id, "title": title, "fork_message_index": fork_message_index}
+
+    def switch_in_session_branch(self, session_id: str, branch_id: str) -> Optional[Dict[str, Any]]:
+        session = self.load(session_id)
+        if not session:
+            return None
+        branch = next((item for item in session.get("branches", []) if item.get("id") == branch_id), None)
+        if not branch:
+            return None
+        session["active_branch_id"] = branch_id
+        session["messages"] = list(branch.get("messages", []))
+        session["history"] = list(branch.get("history", []))
+        path = self._safe_path(session_id)
+        if not path:
+            return None
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(session, handle, ensure_ascii=False, indent=2)
+        return branch
+
+    def branch_points(self, session_id: str) -> list[Dict[str, Any]]:
+        current = self.load(session_id)
+        if not current:
+            return []
+        embedded = current.get("branches", [])
+        if embedded:
+            groups: dict[int, list[dict]] = {}
+            for branch in embedded:
+                if isinstance(branch.get("fork_message_index"), int):
+                    groups.setdefault(branch["fork_message_index"], []).append(branch)
+            points = []
+            for fork, items in sorted(groups.items()):
+                siblings = [{"id": item["id"], "title": item.get("title", "Branch")} for item in items]
+                if not any(item.get("id") == "root" for item in siblings):
+                    siblings.insert(0, {"id": "root", "title": current.get("title", "Chat")})
+                points.append({"fork_message_index": fork, "siblings": siblings})
+            return points
+        root = current.get("root_session_id") or session_id
+        groups: dict[int, list[dict]] = {}
+        for item in self.list_all():
+            candidate = self.load(item["id"])
+            if not candidate or (candidate.get("root_session_id") or candidate.get("id")) != root:
+                continue
+            fork = candidate.get("fork_message_index")
+            if isinstance(fork, int):
+                groups.setdefault(fork, []).append(candidate)
+        points = []
+        for fork, candidates in groups.items():
+            if not any(item.get("id") == root for item in candidates):
+                root_session = self.load(root)
+                if root_session:
+                    candidates.append(root_session)
+            candidates.sort(key=lambda item: (item.get("created_at", ""), item.get("id", "")))
+            points.append({
+                "fork_message_index": fork,
+                "siblings": [{"id": item["id"], "title": item.get("title", "Branch")} for item in candidates],
+            })
+        return sorted(points, key=lambda item: item["fork_message_index"])
+
+    def branch_siblings(self, session_id: str) -> list[Dict[str, Any]]:
+        current = self.load(session_id)
+        if not current or current.get("fork_message_index") is None:
+            return []
+        root = current.get("root_session_id") or current.get("parent_session_id") or session_id
+        fork_index = current.get("fork_message_index")
+        result = []
+        for item in self.list_all():
+            candidate = self.load(item["id"])
+            if not candidate:
+                continue
+            candidate_root = candidate.get("root_session_id") or candidate.get("id")
+            candidate_fork = candidate.get("fork_message_index")
+            if candidate_root != root:
+                continue
+            if candidate_fork == fork_index or (candidate.get("id") == root and candidate_fork is None):
+                result.append(candidate)
+        if not any(item.get("id") == current.get("id") for item in result):
+            result.append(current)
+        result.sort(key=lambda item: (item.get("created_at", ""), item.get("id", "")))
+        return [{"id": item["id"], "title": item.get("title", "Branch")} for item in result]
 
     def delete(self, session_id: str) -> bool:
         path = self._safe_path(session_id)

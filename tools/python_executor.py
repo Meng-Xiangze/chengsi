@@ -44,8 +44,8 @@ class PythonExecutor(BaseTool):
         return ("Run Python code in an isolated child process. PREFERRED for: multi-step logic, "
                 "data processing (JSON, CSV, text), calculations, API calls, string/encoding work, "
                 "or anything needing loops, conditionals, or libraries. "
-                "Stdout/stderr returned; stdin closed. Deletion blocked (use bash rm). "
-                "For one-shot file ops, git, or shell commands, use bash instead.")
+                "Stdout/stderr returned; stdin closed. Deletion blocked (use system_cleaner). "
+                "Use bash for command-line programs; use read, write, and edit for files.")
 
     @property
     def parameters(self) -> Dict[str, Any]:

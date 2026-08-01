@@ -1,0 +1,26 @@
+[
+  {
+    "source": "builtin://desktop-control",
+    "title": "Windows desktop observation and control",
+    "content": "Chengsi can observe and operate the Windows desktop with the computer tool. For GUI work, first call action=windows exactly once, then call action=activate_window with a distinctive title fragment before coordinate-based input. Do not use exploratory screenshots to hunt for a target window. Use action=screenshot only to verify the current state after activation or an action, with region=[left, top, width, height] only when the target area is already known. Repeated screenshot and windows calls are valid because they observe changing external state and are exempt from duplicate-call blocking, but repeated cropped screenshots are not an acceptable control strategy. Vision-capable models receive screenshots through the existing image-input chain. Mouse actions include move, click, double_click, right_click, drag, and scroll. Use action=sequence with 1-20 deterministic steps to combine click, type, key, hotkey, move, drag, scroll, activate_window, screen_size, position, and wait operations into one tool call; keep screenshot as a verification call after the sequence. Unicode text is pasted through the Windows clipboard and the prior text clipboard is restored afterward. During active control, Chengsi displays narrow blue screen-edge indicators and a small status bar without creating a full-screen overlay. Pressing Esc globally cancels computer control. After Esc cancellation, all remaining computer actions must stop and the model must ask the user what they want to do next. PyAutoGUI fail-safe remains enabled: moving the pointer to the upper-left corner aborts input automation. Prefer one bounded sequence followed by one screenshot when visual confirmation matters. Desktop input affects the real user session, so destructive or irreversible actions require explicit user approval.",
+    "metadata": {"scope": "builtin", "topic": "computer", "publishable": true}
+  },
+  {
+    "source": "builtin://execution-routing",
+    "title": "Command and Python execution routing",
+    "content": "Use bash for quick command-line programs such as git status/diff/log, rg, fd, small tests, version checks, and system utilities. On Windows, the bash tool intentionally runs through cmd.exe in Chengsi's normalized child environment; its name describes the agent-facing terminal capability, not a guarantee that GNU Bash is the backend. Use python_executor for calculations, structured data processing, loops and conditionals, and direct Python library APIs. Route pip install, python -m pip install, pip download, curl/wget/Invoke-WebRequest downloads, package or software installers, git clone, dependency setup, large archive extraction, and builds likely to exceed about 30 seconds through job(action='start'). A job start means accepted/running, not completed; inspect status/logs or wait for the terminal notification before claiming success. Use read for file inspection and code search, write for new files or complete replacements, and edit for precise changes. Use system_cleaner for controlled deletion. Use the computer tool for GUI interaction when a command-line or direct file/API path is not reliable.",
+    "metadata": {"scope": "builtin", "topic": "tool-routing", "publishable": true}
+  },
+  {
+    "source": "builtin://context-policy",
+    "title": "Tool results and context policy",
+    "content": "Chengsi keeps current-turn tool results directly available to the model. It does not make an auxiliary model request to summarize tool progress after tool batches. This avoids confusing local models, extra latency, and accidental distortion of recent results. The user-invoked context compaction feature remains separate and may still be used when the overall conversation becomes too large. Persistent plan and compact tool-trace mechanisms are also separate from the removed auxiliary summarizer.",
+    "metadata": {"scope": "builtin", "topic": "context", "publishable": true}
+  },
+  {
+    "source": "builtin://office-status",
+    "title": "DOCX and XLSX capability status",
+    "content": "DOCX and XLSX continue to use Chengsi's existing unified file tools. The read tool reads XLSX rows and DOCX text or visual rendering; write creates XLSX and formatted DOCX; edit performs exact spreadsheet-cell replacement and precise DOCX edits. No new Office COM automation workflow has been adopted yet. Do not claim enhanced Word or Excel COM support until a later implementation explicitly adds and verifies it.",
+    "metadata": {"scope": "builtin", "topic": "office", "publishable": true}
+  }
+]

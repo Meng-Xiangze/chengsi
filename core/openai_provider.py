@@ -42,6 +42,17 @@ class OpenAIProvider(BaseProvider):
         """
         prepared = []
         pending_tool_call_ids: set[str] = set()
+        deferred_image_messages: list[dict] = []
+
+        def flush_deferred() -> None:
+            # Image messages extracted from tool results must wait until the
+            # whole tool_call chain closes. Inserting a user message between
+            # tool responses orphans the remaining tool_call_ids and strict
+            # providers reject the request with HTTP 400.
+            if deferred_image_messages:
+                prepared.extend(deferred_image_messages)
+                deferred_image_messages.clear()
+
         for message in messages:
             item = dict(message)
             role = item.get("role")
@@ -56,6 +67,7 @@ class OpenAIProvider(BaseProvider):
                 pending_tool_call_ids.discard(tool_call_id)
             else:
                 pending_tool_call_ids.clear()
+                flush_deferred()
 
             content = item.get("content")
             if not isinstance(content, list):
@@ -81,19 +93,25 @@ class OpenAIProvider(BaseProvider):
                 text = "\n".join(text_parts)
                 if item.get("role") == "tool":
                     # Keep the OpenAI tool result textual and place the image in
-                    # a separate user turn. Many compatible gateways ignore
-                    # image parts when they occur inside role=tool content.
+                    # a separate user turn AFTER the tool-call chain closes.
                     item["content"] = text
                     prepared.append(item)
-                    prepared.append({
+                    image_message = {
                         "role": "user",
-                        "content": ([{"type": "text", "text": "Image returned by read:"}] if not text else [{"type": "text", "text": "Image returned by read.\n" + text}]) + image_parts,
-                    })
+                        "content": ([{"type": "text", "text": "Image from tool result:"}] if not text else [{"type": "text", "text": "Image from tool result.\n" + text}]) + image_parts,
+                    }
+                    if pending_tool_call_ids:
+                        deferred_image_messages.append(image_message)
+                    else:
+                        prepared.append(image_message)
                     continue
                 item["content"] = ([{"type": "text", "text": text}] if text else []) + image_parts
             else:
                 item["content"] = "\n".join(text_parts)
             prepared.append(item)
+            if role == "tool" and not pending_tool_call_ids:
+                flush_deferred()
+        flush_deferred()
         return prepared
 
     @staticmethod
@@ -237,6 +255,12 @@ class OpenAIProvider(BaseProvider):
         request_api = kwargs.get("request_api", "chat_completions")
         if request_api not in ("chat_completions", "responses"):
             request_api = "chat_completions"
+        max_tokens = kwargs.get("max_tokens")
+        think = kwargs.get("think")
+        # OpenAI reasoning families require max_completion_tokens and accept
+        # reasoning_effort; other compatible gateways use classic max_tokens.
+        model_lower = model.lower()
+        openai_reasoning = model_lower.startswith(("o1", "o3", "o4", "gpt-5"))
         prepared_messages = self.prepare_messages(messages, kwargs.get("supports_vision", True))
         if fallback_mode:
             bundle = json.dumps({"messages": prepared_messages}, ensure_ascii=False, default=str)
@@ -252,6 +276,10 @@ class OpenAIProvider(BaseProvider):
             if response_tools:
                 payload["tools"] = response_tools
                 payload["tool_choice"] = "auto"
+            if max_tokens is not None:
+                payload["max_output_tokens"] = max(16, int(max_tokens))
+            if think is False and openai_reasoning:
+                payload["reasoning"] = {"effort": "low"}
             endpoint = "/responses"
         else:
             payload = {
@@ -263,6 +291,11 @@ class OpenAIProvider(BaseProvider):
             if tool_defs and not fallback_mode:
                 payload["tools"] = tool_defs
                 payload["tool_choice"] = "auto"
+            if max_tokens is not None:
+                key = "max_completion_tokens" if openai_reasoning else "max_tokens"
+                payload[key] = max(16, int(max_tokens))
+            if think is False and openai_reasoning:
+                payload["reasoning_effort"] = "low"
             endpoint = "/chat/completions"
 
         external_cancel = kwargs.get("cancel_event")

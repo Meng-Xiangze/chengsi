@@ -14,6 +14,8 @@ config.json
 sessions/
 knowledge/*
 !knowledge/.gitkeep
+!knowledge/knowledge.db
+!knowledge/starter_knowledge.json
 media/
 
 # IDE

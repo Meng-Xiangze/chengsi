@@ -256,6 +256,8 @@ When multiple independent operations can proceed simultaneously (e.g., reading s
 
 Important: To get the current date/time, use get_current_time() instead of 'bash date' (which hangs on Windows). Use bash only for actual shell operations.
 
+Execution routing for potentially slow work: use job(action='start', command='...') by default for `pip install`, `python -m pip install`, `pip download`, `curl`/`wget`/`Invoke-WebRequest` downloads, package or software installers, `git clone`, large archive extraction, dependency setup, and builds likely to exceed about 30 seconds. Use bash for quick inspection, version checks, small git commands, and other commands that should finish promptly. A job start means accepted/running, not completed; report the job_id and wait for its terminal notification before claiming success.
+
 For scheduled/delayed tasks: When the user mentions a specific time (e.g., "17:30打开记事本", "明天9点提醒我", "10分钟后..."), use schedule() to create a timed task. Do NOT execute immediately unless the user explicitly says "现在" or "立即".
 
 For long or complex sub-tasks: Use delegate(action='start', prompt='...') to spawn a background sub-agent that has full tool access (bash, read, write, edit, web_searcher, python_executor, etc.). The sub-agent runs autonomously and reports results back. This is ideal for multi-step research, large data processing, code audits, or any task that would take many turns. Check sub-agent status with delegate(action='status', delegate_id='...') or list all with delegate(action='list'). You (the main agent) stay available for the user while the sub-agent works.
@@ -524,6 +526,34 @@ def _verification_tool_outcome(action: str, result: str) -> ToolOutcome | None:
 
 
 def _execute_tool(action: str, args: dict, available_tools: dict, session_id: str, tool_call_id: str | None = None):
+    computer_overlay_active = False
+    if action == "computer":
+        args = dict(args)
+        args["_session_id"] = session_id
+        computer_operation = str(args.get("action", "")).strip().lower()
+        observation_operations = {
+            "screenshot", "screen_size", "position", "windows", "controls",
+            "inspect_control", "read_control",
+        }
+        needs_computer_overlay = computer_operation not in observation_operations
+        try:
+            from core.computer_overlay import is_cancelled, show as show_computer_overlay
+            cancellation_message = (
+                "The user pressed Esc and cancelled computer control. Stop all computer actions now. "
+                "Ask the user what they want to do next before using the computer tool again."
+            )
+            if is_cancelled(session_id):
+                return ToolOutcome(False, cancellation_message, "user_cancelled")
+            operation = str(args.get("action", "computer operation")).replace("_", " ")
+            if needs_computer_overlay:
+                if not show_computer_overlay(operation, session_id):
+                    return ToolOutcome(False, cancellation_message, "user_cancelled")
+                computer_overlay_active = True
+        except Exception as error:
+            # Only interactive input is unsafe without the cancellation indicator.
+            message = f"Computer control unavailable: {error}"
+            _emit("thinking", message, session_id=session_id)
+            return ToolOutcome(False, message, "computer_overlay_unavailable")
     if action in {"system_cleaner", "job", "schedule", "delegate", "plan"} and isinstance(args, dict):
         args = dict(args)
         args["_session_id"] = session_id
@@ -543,12 +573,18 @@ def _execute_tool(action: str, args: dict, available_tools: dict, session_id: st
             "duration_ms": outcome.duration_ms,
             "content": err,
         }, session_id=session_id)
+        if computer_overlay_active:
+            from core.computer_overlay import hide as hide_computer_overlay
+            hide_computer_overlay()
         return outcome
     _emit("thinking", f"Executing {action}...", session_id=session_id)
     try:
         execution_args = args
         if action == "bash":
             execution_args = dict(args)
+            sd = state.get(session_id)
+            if sd is not None:
+                execution_args["_cancel_event"] = sd.cancel
             execution_args["_progress"] = lambda chunk: _emit(
                 "tool_progress",
                 {"tool_call_id": call_id, "tool_name": action, "content": chunk},
@@ -586,6 +622,9 @@ def _execute_tool(action: str, args: dict, available_tools: dict, session_id: st
         "duration_ms": outcome.duration_ms,
         "content": outcome.content,
     }, session_id=session_id)
+    if computer_overlay_active:
+        from core.computer_overlay import hide as hide_computer_overlay
+        hide_computer_overlay()
     return outcome
 
 
@@ -1071,43 +1110,6 @@ def _append_knowledge_context(messages: list[dict], context: str) -> list[dict]:
     return updated
 
 
-def _summarize_turn_process(provider, model: str, tool_records: list[dict], cancel_event, supports_vision: bool, request_api: str = "chat_completions") -> str:
-    """Compress current-turn exploration for the next inner model step only."""
-    if not tool_records or cancel_event.is_set():
-        return ""
-    source = json.dumps(tool_records, ensure_ascii=False, default=str)
-    # Small tool batches are already visible in the current request. Avoid an
-    # extra model round-trip until the handoff would materially reduce context.
-    if len(tool_records) < 3 and len(source) < 12000:
-        return ""
-    prompt = (
-        "Summarize this current-turn tool exploration for the next agent step. "
-        "Record only concrete findings, changed files, failures, unresolved questions, and the next useful action. "
-        "Do not expose hidden reasoning and do not add facts. Return concise plain text.\n\n" + source[-30000:]
-    )
-    summary = ""
-    try:
-        stream = provider.chat_stream(
-            model,
-            [{"role": "system", "content": "You create short-lived factual agent handoff notes."},
-             {"role": "user", "content": prompt}],
-            tool_defs=None,
-            supports_vision=supports_vision,
-            cancel_event=cancel_event,
-            request_api=request_api,
-        )
-        for kind, chunk in _iter_stream_with_cancel(
-            stream, cancel_event, idle_timeout=30, on_idle_timeout=provider.cancel
-        ):
-            if kind == "content":
-                summary += str(chunk)
-            elif kind in ("error", "cancelled"):
-                return ""
-    except Exception:
-        return ""
-    return summary.strip()[:6000]
-
-
 def _build_plan_summary(records: list[dict]) -> str:
     """Build a compact plan entry from the current turn's tool calls, suitable for
     the PLAN_MARKER block that persists across turns."""
@@ -1292,6 +1294,11 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
         return
 
     model_config = model_config or {}
+    try:
+        from core.computer_overlay import clear_cancelled
+        clear_cancelled(session_id)
+    except Exception:
+        pass
     _ensure_execution_plan(sd)
     native_tools = _is_native(provider, model_config) and not fallback_mode
     turn_tools = _turn_tools(available_tools, sd.messages) if not fallback_mode else {}
@@ -1316,9 +1323,6 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
     )
     runtime.active = True
     turn_tool_records: list[dict] = []
-    turn_process_summary = ""
-    last_summary_record_count = 0
-    last_summary_source_size = 0
     terminal_tool_blocker = ""
 
     def persist_runtime_snapshot() -> None:
@@ -1401,6 +1405,20 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
         while True:
             if sd.cancel.is_set():
                 return
+            if any(record.get("tool") == "computer" for record in turn_tool_records):
+                try:
+                    from core.computer_overlay import is_cancelled
+                    if is_cancelled(session_id):
+                        terminal_tool_blocker = (
+                            "The user pressed Esc and cancelled computer control. Do not perform more computer "
+                            "actions. Ask the user what they want to do next."
+                        )
+                        sd.messages.append({
+                            "role": "user",
+                            "content": "[COMPUTER CONTROL CANCELLED] " + terminal_tool_blocker,
+                        })
+                except Exception:
+                    pass
 
             _emit("thinking", "Analyzing...", session_id=session_id)
 
@@ -1415,11 +1433,6 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 request_messages.append({
                     "role": "user",
                     "content": transient_context + "\nThis is transient background status. Decide how to communicate with the user; do not treat it as a new user request.",
-                })
-            if turn_process_summary:
-                request_messages.append({
-                    "role": "user",
-                    "content": "[TURN_PROCESS_SUMMARY]\n" + turn_process_summary + "\nThis note expires when the current user turn ends.",
                 })
             if kb_context:
                 request_messages = _append_knowledge_context(request_messages, kb_context)
@@ -1515,6 +1528,24 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 sd.messages.append({"role": "assistant", "content": message})
                 _emit("agent_done", message, session_id=session_id)
                 return
+
+            # Esc may be pressed while the model is deciding its next GUI step.
+            # Discard that stale response and ask the model to acknowledge the cancellation.
+            if any(record.get("tool") == "computer" for record in turn_tool_records):
+                try:
+                    from core.computer_overlay import is_cancelled
+                    if is_cancelled(session_id) and not terminal_tool_blocker:
+                        terminal_tool_blocker = (
+                            "The user pressed Esc and cancelled computer control. Do not perform more computer "
+                            "actions. Ask the user what they want to do next."
+                        )
+                        sd.messages.append({
+                            "role": "user",
+                            "content": "[COMPUTER CONTROL CANCELLED] " + terminal_tool_blocker,
+                        })
+                        continue
+                except Exception:
+                    pass
 
             # A valid provider response proves connectivity recovered. Retry
             # counts are consecutive-failure counters, so clear them before
@@ -1617,6 +1648,18 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                     should_continue, obs_reason = runtime.observe(
                         tc["action"], tc["arguments"], outcome, turn_tools.get(tc["action"])
                     )
+                    if outcome.code == "user_cancelled":
+                        should_continue = False
+                        if tc["action"] == "computer":
+                            obs_reason = (
+                                "The user cancelled computer control with Esc. Do not call computer again in this turn. "
+                                "Ask the user what they want to do next."
+                            )
+                        else:
+                            obs_reason = (
+                                f"The user stopped this turn while {tc['action']} was running. "
+                                "Do not retry the cancelled command; ask the user what they want to do next."
+                            )
                     persist_runtime_snapshot()
                     if not should_continue:
                         stop_reason = obs_reason
@@ -1671,26 +1714,6 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         ),
                     })
                     continue
-                source_size = len(json.dumps(turn_tool_records, ensure_ascii=False, default=str))
-                new_record_count = len(turn_tool_records) - last_summary_record_count
-                new_source_size = source_size - last_summary_source_size
-                should_summarize = (
-                    len(turn_tool_records) >= 3
-                    and (
-                        last_summary_record_count == 0
-                        or new_record_count >= 4
-                        or new_source_size >= 16000
-                    )
-                )
-                if should_summarize:
-                    _emit("thinking", "Summarizing tool progress...", session_id=session_id)
-                    candidate_summary = _summarize_turn_process(
-                        provider, model, turn_tool_records, sd.cancel, supports_vision, request_api
-                    )
-                    if candidate_summary:
-                        turn_process_summary = candidate_summary
-                    last_summary_record_count = len(turn_tool_records)
-                    last_summary_source_size = source_size
                 continue
             clean_response = re.sub(r"<tool_call>.*?</tool_call>", "", full_response, flags=re.DOTALL).strip()
             if (
@@ -1739,6 +1762,12 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
         if sd:
             sd.messages.append({"role": "user", "content": err})
         raise
+    finally:
+        try:
+            from core.computer_overlay import hide as hide_computer_overlay
+            hide_computer_overlay()
+        except Exception:
+            pass
 
 # ══════════════════════════════════════════════════════════════════════
 #  6. WEB UI — pywebview standalone window
@@ -1957,7 +1986,8 @@ def _job_log_tail(log_path_str: str, max_chars: int = 2000) -> str:
             if size > max_chars:
                 f.seek(-max_chars, 2)
             raw = f.read(max_chars)
-        return raw.decode("utf-8", errors="replace")
+        from core.process_utils import decode_output_lines
+        return decode_output_lines(raw)
     except OSError:
         return ""
 
@@ -2541,16 +2571,25 @@ class WebAPI:
             except Exception as e:
                 import traceback
                 err = f"Agent Error: {e}\n{traceback.format_exc()}"
+                sd.messages.append({"role": "assistant", "content": err})
                 _emit("agent_done", err, session_id=sid)
             finally:
                 sd._active_provider = None
                 sd.processing = False
                 if completed:
                     sd.runtime_snapshot = {}
+                elif sd.cancel.is_set() and not any(
+                    m.get("role") == "assistant" and str(m.get("content", "")).startswith("Agent stopped")
+                    for m in sd.messages[-2:]
+                ):
+                    stop_message = "Agent stopped before a final answer was produced. Retry this turn or continue with a new message."
+                    sd.messages.append({"role": "assistant", "content": stop_message})
+                    _emit("agent_done", stop_message, session_id=sid)
                 _emit("processing_done", {"cancelled": sd.cancel.is_set()}, session_id=sid)
+                was_cancelled = sd.cancel.is_set()
                 sd.cancel.clear()
                 # Auto-save after turn (skip if session was deleted)
-                if _session_manager and sid in state.sessions and not sd.cancel.is_set():
+                if _session_manager and sid in state.sessions:
                     _session_manager.save(
                         sid, sd.messages,
                         history=list(sd.history),
@@ -2859,6 +2898,8 @@ class WebAPI:
                 "compressed_context_size": sd.compressed_context_size,
                 "runtime": sd.runtime_snapshot,
                 "processing": sd.processing,
+                "branch_points": _session_manager.branch_points(session_id),
+                "active_branch_id": disk_session.get("active_branch_id", "root"),
             }
 
         # ── Case B: no in-memory state → load from disk (fresh start) ──
@@ -2899,7 +2940,102 @@ class WebAPI:
             "compressed_context_size": stats.get("compressed_context_size", 0),
             "runtime": sd.runtime_snapshot,
             "processing": sd.processing,
+            "branch_points": _session_manager.branch_points(session_id),
+            "active_branch_id": session.get("active_branch_id", "root"),
         }
+
+    def branch_session(self, session_id: str, user_message_index: int, anchor: str = ""):
+        """Create a branch variant inside the current session.
+
+        The fork point is anchored by message content, with the UI ordinal used
+        only to disambiguate duplicate texts. After compaction, UI ordinals and
+        transcript positions diverge, so index-only lookup cannot be trusted.
+        """
+        if not _session_manager:
+            return {"status": "error", "msg": "Session manager not initialized"}
+        source = _session_manager.load(session_id)
+        sd_source = state.sessions.get(session_id)
+        if sd_source and sd_source.processing:
+            return {"status": "error", "msg": "Wait until the current response finishes"}
+        if sd_source and sd_source.messages:
+            source = dict(source or {})
+            source["messages"] = [m for m in sd_source.messages if m.get("role") != "system"]
+            source["history"] = list(sd_source.history)
+        if not source:
+            return {"status": "error", "msg": "Session not found"}
+        try:
+            user_message_index = int(user_message_index)
+        except (TypeError, ValueError):
+            user_message_index = -1
+        messages = [m for m in source.get("messages", []) if m.get("role") != "system"]
+        user_positions = [
+            index for index, message in enumerate(messages)
+            if message.get("role") == "user"
+            and not str(message.get("content", "")).startswith((
+                "[PLAN_MARKER]", "[TURN_SUMMARY]", "[TURN_TOOL_SUMMARY]",
+                "[COMPACTED CONTEXT]", "[BACKGROUND JOB HANDOFF]", "[COMPUTER CONTROL CANCELLED]",
+            ))
+        ]
+        anchor_text = str(anchor or "").strip()
+        transcript_index = None
+        if 0 <= user_message_index < len(user_positions):
+            candidate = user_positions[user_message_index]
+            if not anchor_text or str(messages[candidate].get("content", "")).strip() == anchor_text:
+                transcript_index = candidate
+        if transcript_index is None and anchor_text:
+            matches = [
+                pos for pos in user_positions
+                if str(messages[pos].get("content", "")).strip() == anchor_text
+            ]
+            if matches:
+                ordinals = {pos: i for i, pos in enumerate(user_positions)}
+                target = max(user_message_index, 0)
+                transcript_index = min(matches, key=lambda pos: abs(ordinals[pos] - target))
+        if transcript_index is None:
+            return {
+                "status": "error",
+                "msg": "That message is no longer in the active context (it may have been compacted). Retry or branch from a more recent message.",
+            }
+        # fork_message_index for sibling grouping: ordinal of the fork in the CURRENT transcript.
+        fork_ordinal = next(i for i, pos in enumerate(user_positions) if pos == transcript_index)
+        # The selected user turn is the fork slot, not part of the shared prefix.
+        # The next message the user sends replaces it as a sibling at the same level.
+        branch_messages = messages[:transcript_index]
+        branch_history = []
+        for message in branch_messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role == "user" and isinstance(content, str) and not content.startswith(("[PLAN_MARKER]", "[TURN_SUMMARY]", "[TURN_TOOL_SUMMARY]", "[COMPACTED CONTEXT]")):
+                branch_history.append({"type": "user", "data": content})
+            elif role == "assistant" and isinstance(content, str) and content.strip() and not message.get("tool_calls"):
+                branch_history.append({"type": "agent_done", "data": content})
+        branch = _session_manager.create_in_session_branch(
+            session_id, branch_messages, branch_history, fork_ordinal, "Branch"
+        )
+        if not branch:
+            return {"status": "error", "msg": "Could not create conversation branch"}
+        sd = state.ensure(session_id)
+        model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+        sd.messages = [{"role": "system", "content": format_system_prompt(_available_tools, tool_manager=_tool_manager, native_tools=_is_native(_provider, model_config))}] + branch_messages
+        sd.history = branch_history
+        state.current_session_id = session_id
+        return {"status": "ok", "session_id": session_id, "branch_id": branch["id"], "active_branch_id": branch["id"]}
+
+    def switch_branch(self, session_id: str, branch_id: str):
+        if not _session_manager:
+            return {"status": "error", "msg": "Session manager not initialized"}
+        sd = state.sessions.get(session_id)
+        if sd and sd.processing:
+            return {"status": "error", "msg": "Wait until the current response finishes"}
+        branch = _session_manager.switch_in_session_branch(session_id, str(branch_id))
+        if not branch:
+            return {"status": "error", "msg": "Branch not found"}
+        sd = state.ensure(session_id)
+        model_config = _get_provider_model_capabilities(_providers_cfg, _provider, _provider_model)
+        sd.messages = [{"role": "system", "content": format_system_prompt(_available_tools, tool_manager=_tool_manager, native_tools=_is_native(_provider, model_config))}] + list(branch.get("messages", []))
+        sd.history = list(branch.get("history", []))
+        state.current_session_id = session_id
+        return {"status": "ok", "session_id": session_id, "active_branch_id": branch.get("id", "root")}
 
     def delete_session(self, session_id: str):
         """Cancel processing, delete session file, clean up."""
@@ -2950,27 +3086,33 @@ class WebAPI:
             # Compaction is a bounded maintenance request. Do not enable local
             # model thinking here: the input is already factual transcript data,
             # and long hidden reasoning can pin an Ollama runner indefinitely.
-            compaction_stream = _provider.chat_stream(
-                _provider_model,
-                [
-                    {"role": "system", "content": "You are a precise conversation compression service. Return only a factual summary."},
-                    {"role": "user", "content": summary_prompt},
-                ],
-                tool_defs=None,
-                think=False,
-                max_tokens=1200,
-                idle_timeout=30,
-            )
-            for kind, chunk in _iter_stream_with_cancel(
-                compaction_stream, sd.cancel, idle_timeout=30,
-                on_idle_timeout=getattr(_provider, "cancel", None),
-            ):
-                if kind == "content":
-                    summary += str(chunk)
-                elif kind == "error":
-                    error = str(chunk)
-                elif kind == "cancelled":
-                    return {"status": "error", "msg": "Compaction cancelled"}
+            # On reasoning models (e.g. deepseek-reasoner) max_tokens also caps
+            # the reasoning budget, so give enough headroom to avoid an empty
+            # summary; retry once with a larger budget if it was still consumed.
+            for token_budget in (1800, 4096):
+                compaction_stream = _provider.chat_stream(
+                    _provider_model,
+                    [
+                        {"role": "system", "content": "You are a precise conversation compression service. Return only a factual summary."},
+                        {"role": "user", "content": summary_prompt},
+                    ],
+                    tool_defs=None,
+                    think=False,
+                    max_tokens=token_budget,
+                    idle_timeout=30,
+                )
+                for kind, chunk in _iter_stream_with_cancel(
+                    compaction_stream, sd.cancel, idle_timeout=30,
+                    on_idle_timeout=getattr(_provider, "cancel", None),
+                ):
+                    if kind == "content":
+                        summary += str(chunk)
+                    elif kind == "error":
+                        error = str(chunk)
+                    elif kind == "cancelled":
+                        return {"status": "error", "msg": "Compaction cancelled"}
+                if error or summary.strip():
+                    break
             if error:
                 return {"status": "error", "msg": error}
             if not summary.strip():

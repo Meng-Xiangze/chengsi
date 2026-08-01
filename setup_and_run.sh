@@ -13,7 +13,19 @@ if [ ! -x ".venv/bin/python" ]; then
 fi
 
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements.txt
+
+# pywin32 and pywinauto are Windows-only; filter them out on other platforms
+# so the desktop-control dependencies never break Unix installs.
+REQ_FILE="requirements.txt"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;  # Windows shells keep the full dependency set
+  *)
+    REQ_FILE=".requirements-unix.txt"
+    grep -v -i -E '^(pywin32|pywinauto)[><=]' requirements.txt > "$REQ_FILE"
+    ;;
+esac
+.venv/bin/python -m pip install -r "$REQ_FILE"
+[ "$REQ_FILE" = ".requirements-unix.txt" ] && rm -f "$REQ_FILE"
 
 if [ ! -f "config.json" ]; then
   cp config.example.json config.json
