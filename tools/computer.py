@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool
+from core.process_utils import optional_import
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCREENSHOT_DIR = PROJECT_ROOT / "media" / "computer"
@@ -83,7 +84,7 @@ class Computer(BaseTool):
         if os.name != "nt":
             raise RuntimeError("computer is available on Windows only")
         try:
-            import pyautogui
+            pyautogui = optional_import("pyautogui")
         except ImportError as error:
             raise RuntimeError(
                 "computer requires PyAutoGUI. Install it with: python -m pip install pyautogui"

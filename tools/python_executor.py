@@ -1,6 +1,7 @@
 import ast
 import base64
 import os
+import re
 import subprocess
 import sys
 import warnings
@@ -11,28 +12,59 @@ from tools.base import BaseTool
 # Suppress all warnings to prevent polluting Agent output with non-critical logs
 warnings.filterwarnings("ignore")
 
+# Only block the famous "删库跑路" meme patterns where the *target* is
+# root, home, or a system drive.  Regular batch deletion (rm *.tmp,
+# rm -rf ./build, del *.pyc, etc.) is always allowed.
+_DANGEROUS_SHELL_PATTERNS = [
+    # rm -rf /   rm -rf /*   rm -rf ~   rm -rf $HOME
+    r"rm\s+-[rRf]+\s+(?:/|/\*|~|\$HOME)\b",
+    # sudo rm (any sudo rm is suspicious in scripts)
+    r"\bsudo\s+rm\s+",
+    # rm -rf C:\  (MSYS / Cygwin / Git Bash on Windows)
+    r"rm\s+-[rRf]+\s+[A-Za-z]:[\\/]",
+    # del /F /S /Q C:\*  (recursive force from drive root)
+    r"\bdel\s+/[Ff]\s+/[Ss]\s+(?:/[Qq]\s+)?[A-Za-z]:[\\/]\*",
+    # format C: / format D: (not rm but same energy)
+    r"\bformat\s+[A-Za-z]:",
+]
+_DANGEROUS_SHELL_RE = re.compile("|".join(_DANGEROUS_SHELL_PATTERNS), re.IGNORECASE)
+
+
 class PythonExecutor(BaseTool):
-    _BLOCKED_CALLS = {
-        "remove", "unlink", "rmtree", "rmdir", "removedirs",
-    }
+    # shutil.rmtree is allowed but checked for dangerous target paths below.
+    # os.remove / os.unlink / os.rmdir / os.removedirs are always allowed.
 
     @classmethod
     def _destructive_operation(cls, code: str) -> str | None:
-        """Reject deletion; project protection is enforced by dedicated file tools."""
+        """Block only famous meme-level dangerous deletions (root/home/system)."""
         try:
             tree = ast.parse(code)
         except SyntaxError as error:
             return f"Error: invalid Python code: {error}"
+
+        # Paths that are never OK to pass to a deletion function.
+        DANGEROUS_PATHS = re.compile(
+            r"['\"]\s*(?:/|/\*|~|\$HOME|[A-Za-z]:[\\/])\s*['\"]",
+            re.IGNORECASE,
+        )
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 function = node.func
                 name = function.attr if isinstance(function, ast.Attribute) else function.id if isinstance(function, ast.Name) else ""
-                if name in cls._BLOCKED_CALLS:
-                    return f"Error: deletion operation '{name}' is blocked in python_executor. Use system_cleaner for controlled deletion."
+
+                # Check subprocess calls for meme shell patterns
                 if name in {"system", "popen", "run", "call", "check_call", "check_output"}:
                     source = ast.get_source_segment(code, node) or ""
-                    if any(token in source.lower() for token in (" os.remove", " del ", "rm -", "rmdir", "unlink")):
-                        return "Error: destructive shell/file operation is blocked in python_executor."
+                    if _DANGEROUS_SHELL_RE.search(source):
+                        return "Error: dangerous deletion targeting root/home/system blocked. Use targeted paths."
+
+                # shutil.rmtree('/') / rmtree('C:\\') etc. — only block when the
+                # literal argument is root/home/system.  rmtree('./build') is fine.
+                if name == "rmtree" and node.args:
+                    source = ast.get_source_segment(code, node.args[0]) or ""
+                    if DANGEROUS_PATHS.search(source):
+                        return "Error: shutil.rmtree targeting root/home/system blocked."
         return None
 
     @property
@@ -44,7 +76,8 @@ class PythonExecutor(BaseTool):
         return ("Run Python code in an isolated child process. PREFERRED for: multi-step logic, "
                 "data processing (JSON, CSV, text), calculations, API calls, string/encoding work, "
                 "or anything needing loops, conditionals, or libraries. "
-                "Stdout/stderr returned; stdin closed. Deletion blocked (use system_cleaner). "
+                "Stdout/stderr returned; stdin closed. "
+                "Batch deletion is allowed; only meme-level dangers (rm -rf /, format C:) are blocked. "
                 "Use bash for command-line programs; use read, write, and edit for files.")
 
     @property

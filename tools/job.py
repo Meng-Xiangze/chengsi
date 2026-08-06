@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.process_utils import child_environment
+from core.process_utils import child_environment, pythonw_executable
 from tools.base import BaseTool
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -203,7 +203,7 @@ class Job(BaseTool):
             kwargs["start_new_session"] = True
         try:
             subprocess.Popen(
-                [sys.executable, str(runner), str(metadata_path)],
+                [pythonw_executable(), str(runner), str(metadata_path)],
                 cwd=str(cwd), stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 close_fds=True, creationflags=creationflags,

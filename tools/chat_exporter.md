@@ -1,18 +1,23 @@
 ---
 name: chat_exporter
-description: Export a chat session as Markdown. Provide session_id (or leave empty to export the current session).
+description: "Export or list chat sessions. action='export' saves HTML to Desktop; action='list' shows all sessions with titles."
 parameters:
+  action:
+    type: string
+    enum: [export, list]
+    description: "'export' (default) or 'list' to browse."
   session_id:
     type: string
-    description: "Session ID to export (e.g. '20260721_213533_9933c4'). Leave empty for current session."
+    description: "Optional — defaults to active session for export."
 examples:
   - action: chat_exporter
-    arguments:
-      session_id: "20260721_213533_9933c4"
+    arguments: {}
+    note: "Exports current session to Desktop"
+  - action: chat_exporter
+    arguments: {action: list}
+    note: "Lists all saved sessions with titles"
 usage_notes:
-  - Reads the session JSON file from sessions/ directory.
-  - Only session_id parameter is needed.
-  - The returned Markdown includes user messages, tool calls/results, and agent responses.
-  - Tool results are truncated to 2000 characters.
-  - Useful for sharing conversation logs or feeding context to other LLMs.
+  - action='list' shows session IDs with titles, dates, and message counts.
+  - action='export' saves self-contained HTML with embedded images to Desktop.
+  - session_id is optional — omit to export the current conversation.
 ---

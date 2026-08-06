@@ -58,8 +58,8 @@
       ]
     }
   ],
-  "default_vision_model": "",
-  "default_image_model": "",
+  "default_vision_model": "Online GPT Example/gpt-5.6-sol",
+  "default_image_model": "Image Generation Example/gpt-image-2",
   "parallel_tools": false,
   "fallback_mode": false,
   "auto_install_dependencies": false,

@@ -251,6 +251,8 @@ For background jobs, always report completion, failure, interruption, or cancell
 If an attempt fails, change approach; never repeat the same call more than twice.
 Keep a concise task state and emit brief progress checkpoints when useful: what you found, what you are doing next, or what is blocked. Do not write a long preamble; act as soon as the next action is clear. Return only a tool call, a necessary clarification, or the final answer.
 Do not create a new tool unless the user explicitly asks for a reusable tool. Do not modify Chengsi's own core/ directory or main.py; other projects may be modified when requested.
+
+Scratch work directory: ALL temporary scripts, test files, one-off experiments, and generated output that the user did NOT explicitly place MUST go under {PROJECT_ROOT}/temp/. Never write scratch files to Desktop, the project root, or random system temp directories. Only write outside temp/ when the user gives an explicit path.
 Use the knowledge base or web only when the answer needs external facts, freshness, or citations; do not browse for routine local work.
 When multiple independent operations can proceed simultaneously (e.g., reading several files, searching several paths), issue them as a batch of tool calls in a single response.
 
@@ -909,6 +911,81 @@ def _is_unused_token_failure(text: str) -> bool:
     return not _UNUSED_TOKEN_RE.sub("", text).strip()
 
 
+def _compress_tool_results(messages: list[dict], keep_last: int = 3) -> list[dict]:
+    """Compress old tool results within the current turn into one-line summaries.
+
+    Keeps the last *keep_last* assistant+tool exchange-pairs in full.
+    Older tool results are replaced with a ``[TOOL_SUMMARY]`` line that
+    lists what happened so the model knows the history without the bloat.
+    """
+    if not messages:
+        return messages
+
+    # Find where the current turn starts (last real user message)
+    turn_start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            content = str(messages[i].get("content", ""))
+            if content.strip() and not content.startswith("["):
+                turn_start = i
+                break
+
+    turn_msgs = messages[turn_start:]
+    if len(turn_msgs) <= keep_last * 3:
+        return messages
+
+    # Walk backwards counting assistant(tool_calls)→tool pairs
+    pair_count = 0
+    cutoff = len(turn_msgs)
+    in_tool = False
+    for i in range(len(turn_msgs) - 1, -1, -1):
+        role = turn_msgs[i].get("role")
+        if role == "tool":
+            in_tool = True
+        elif role == "assistant" and turn_msgs[i].get("tool_calls"):
+            if in_tool:
+                pair_count += 1
+                in_tool = False
+            if pair_count >= keep_last:
+                cutoff = i
+                break
+
+    if cutoff <= 0:
+        return messages
+
+    # Build compressed summary of old exchanges (skip the user message at [0])
+    parts = []
+    for i in range(1, cutoff):  # start at 1 to preserve the user's original request
+        msg = turn_msgs[i]
+        role = msg.get("role")
+        if role == "tool":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(
+                    p.get("text", "") for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            preview = str(content)[:60].replace("\n", " ")
+            parts.append(preview)
+        elif role == "assistant" and msg.get("tool_calls"):
+            names = [
+                tc.get("function", {}).get("name", "?")
+                for tc in msg["tool_calls"]
+            ]
+            parts.append("→" + ",".join(names))
+
+    if parts:
+        summary = "[TOOL_SUMMARY: " + " ".join(parts) + "]"
+        result = list(messages[:turn_start])
+        # Keep the original user message + summary + recent exchanges
+        result.append(turn_msgs[0])  # original user request
+        result.append({"role": "user", "content": summary})
+        result.extend(turn_msgs[cutoff:])
+        return result
+
+    return messages
+
+
 def _build_request_messages(messages: list[dict]) -> list[dict]:
     """Build model request messages by stripping tool-call intermediates
     from completed turns while keeping the current turn intact.
@@ -983,6 +1060,13 @@ def _build_request_messages(messages: list[dict]) -> list[dict]:
         # tool messages are skipped
 
     cleaned.extend(current)
+
+    # ── Compress old tool results within the current turn ─────────
+    # After K tool exchanges, earlier results are stale — the model
+    # already consumed them.  Keep the last 3 exchanges in full;
+    # replace older tool results with one-line summaries.
+    cleaned = _compress_tool_results(cleaned, keep_last=3)
+
     sanitized = []
     for msg in cleaned:
         item = dict(msg)
@@ -1454,11 +1538,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                         stream_error = chunk
                         break
                     elif kind == "cancelled":
-                        _emit("thinking", "Cancelled by user.", session_id=session_id)
-                        stop_msg = "\n\n*[stopped]*"
-                        # Save stop marker to messages so conversation is properly closed on reload
-                        sd.messages.append({"role": "assistant", "content": stop_msg})
-                        _emit("agent_done", stop_msg, session_id=session_id)
+                        _emit("agent_done", "*[stopped]*", session_id=session_id)
                         return
                     elif kind == "thinking":
                         full_thinking += chunk
@@ -1555,9 +1635,7 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
 
             # Connection may have been closed externally by cancel_stream(); catch that here
             if sd.cancel.is_set():
-                stop_msg = "\n\n*[stopped]*"
-                sd.messages.append({"role": "assistant", "content": stop_msg})
-                _emit("agent_done", stop_msg, session_id=session_id)
+                _emit("agent_done", "*[stopped]*", session_id=session_id)
                 return
 
             # Thinking is diagnostic-only. Never parse it as a tool call or include it
@@ -1736,16 +1814,18 @@ def process_agent_turn(provider, model: str, available_tools: dict, tool_manager
                 })
                 continue
             if not clean_response:
-                # Model produced nothing (no content, no tool calls). Inject a
-                # one-time nudge so the next iteration tries again instead of
-                # silently exiting — prevents "no response" dead-ends mid-task.
-                if not getattr(runtime, "_no_response_retried", False):
-                    runtime._no_response_retried = True
-                    # Do NOT append assistant message with content=None - violates OpenAI API spec
+                # Model produced nothing (no content, no tool calls).
+                # Ollama models occasionally emit empty first responses — retry
+                # a few times with a nudge instead of dead-ending the turn.
+                empty_retries = getattr(runtime, "_empty_response_retries", 0)
+                max_empty_retries = 4 if getattr(provider, "__class__", None) and "Ollama" in provider.__class__.__name__ else 1
+                if empty_retries < max_empty_retries:
+                    runtime._empty_response_retries = empty_retries + 1
                     sd.messages.append({
                         "role": "user",
-                        "content": "[RUNTIME] No response was produced. Please continue with the current task — use a tool call or provide an answer.",
+                        "content": "[RUNTIME] No response was produced. Please continue — use a tool call or provide an answer.",
                     })
+                    _emit("thinking", f"Empty response — retry {empty_retries + 1}/{max_empty_retries}", session_id=session_id)
                     continue
                 clean_response = full_response.strip() or "(empty response)"
             # Strip thinking/reasoning that leaked into content
@@ -1780,6 +1860,7 @@ _provider_name = ""
 _current_provider_cfg: dict = {}
 _providers_cfg: list[dict] = []
 _default_vision_model = ""
+_default_image_model = ""
 _available_tools: dict = {}
 _tool_manager: ToolManager | None = None
 _session_manager: SessionManager | None = None
@@ -1875,9 +1956,10 @@ def _run_queued_delegates() -> None:
                     if not metadata.get(key):
                         metadata[key] = val
                 path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                from core.process_utils import pythonw_executable
                 runner = os.path.join(PROJECT_ROOT, "tools", "_delegate_runner.py")
                 sp.Popen(
-                    [sys.executable, runner, str(path)],
+                    [pythonw_executable(), runner, str(path)],
                     creationflags=sp.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
     except OSError:
@@ -2121,6 +2203,7 @@ def _start_session_worker(session_id: str, transient_context: str = ""):
                     token_stats={"input": sd.input_tokens, "output": sd.output_tokens,
                                  "prompt": sd.prompt_tokens, "eval": sd.eval_tokens,
                                  "ctx": sd.ctx_tokens, "runtime": sd.runtime_snapshot},
+                    metadata={"model": turn_model, "provider": getattr(turn_provider, "name", "")},
                 )
 
     threading.Thread(target=worker, daemon=True).start()
@@ -3279,6 +3362,9 @@ def main():
     available_tools = tool_manager.load_tools()
     state.knowledge_base = KnowledgeBase(os.path.join(PROJECT_ROOT, "knowledge", "knowledge.db"))
 
+    # Ensure scratch directory exists for temp scripts and experiments
+    (Path(PROJECT_ROOT) / "temp").mkdir(exist_ok=True)
+
     print("=== Agent System Initialized ===")
     print(f"Available Tools: {list(available_tools.keys())}")
     print(f"Interface Mode: {state.interface_mode}")
@@ -3303,11 +3389,12 @@ def main():
         import webview
 
         # Store globals for WebAPI
-        global _provider, _provider_model, _providers_cfg, _available_tools, _tool_manager, _session_manager, _default_vision_model
+        global _provider, _provider_model, _providers_cfg, _available_tools, _tool_manager, _session_manager, _default_vision_model, _default_image_model
         _provider = selected_provider
         _provider_model = selected_model
         _providers_cfg = providers_cfg
         _default_vision_model = config.get("default_vision_model", "")
+        _default_image_model = config.get("default_image_model", "")
         _available_tools = available_tools
         _tool_manager = tool_manager
         _session_manager = SessionManager(

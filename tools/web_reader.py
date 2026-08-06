@@ -38,6 +38,14 @@ class WebReader(BaseTool):
             "timeout": {
                 "type": "integer",
                 "description": "Request timeout in seconds. Default: 10"
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Character offset for read action pagination (1-indexed). When content is longer than the cap, use offset to continue reading the rest."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max characters for read action. Default: 50000 (soft cap)."
             }
         }
 
@@ -50,6 +58,14 @@ class WebReader(BaseTool):
         element_type = arguments.get("element_type")
         selector = arguments.get("selector")
         timeout = arguments.get("timeout", 10)
+        try:
+            offset = max(1, int(arguments.get("offset", 1) or 1))
+        except (TypeError, ValueError):
+            offset = 1
+        try:
+            limit = max(1000, int(arguments.get("limit", 50000) or 50000))
+        except (TypeError, ValueError):
+            limit = 50000
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -63,7 +79,7 @@ class WebReader(BaseTool):
             soup = BeautifulSoup(response.text, 'html.parser')
 
             if action == "read":
-                result = self._read_content(soup, url)
+                result = self._read_content(soup, url, offset, limit)
             elif action == "analyze":
                 result = self._analyze_page(soup, url, response)
             elif action == "extract":
@@ -78,8 +94,13 @@ class WebReader(BaseTool):
         except Exception as e:
             return json.dumps({"error": f"Processing failed: {str(e)}"}, ensure_ascii=False, indent=2)
 
-    def _read_content(self, soup, url):
-        """Extract main text content."""
+    def _read_content(self, soup, url, offset=1, limit=50000):
+        """Extract main text content. Paginated via offset/limit (character-based).
+
+        Ecosystem standard: the leading hint tells the model UP FRONT how long
+        the page is and how to continue, so it pages through the whole
+        conversation instead of assuming the first chunk is everything.
+        """
         for element in soup(['script', 'style', 'nav', 'footer', 'header', 'aside']):
             element.decompose()
 
@@ -93,12 +114,34 @@ class WebReader(BaseTool):
         else:
             text = soup.get_text(separator='\n', strip=True)
 
+        total = len(text)
+        start = offset - 1
+        chunk = text[start:start + limit]
+        remaining = total - (start + len(chunk))
+
+        hint_lines = [f"📄 {url}", f"Title: {title}"]
+        if total > limit or offset > 1:
+            hint_lines.append(
+                f"⚠️  Page content is {total:,} chars; showing chars {offset:,}-{start + len(chunk):,}."
+            )
+            if remaining > 0:
+                hint_lines.append(
+                    f"⏩  Content continues! Read the rest with offset={start + len(chunk) + 1} "
+                    f"({remaining:,} chars remaining) before judging the task."
+                )
+            else:
+                hint_lines.append("✅ End of content reached.")
+        hint_lines.append(f"Full page length: {total:,} chars.")
+
         return {
             "url": url,
             "title": title,
-            "content": text[:50000],
-            "content_length": len(text),
-            "truncated": len(text) > 50000
+            "content": "\n".join(hint_lines) + "\n\n" + chunk,
+            "content_length": total,
+            "chars_shown": len(chunk),
+            "offset": offset,
+            "truncated": remaining > 0,
+            "next_offset": (start + len(chunk) + 1) if remaining > 0 else None
         }
 
     def _analyze_page(self, soup, url, response):

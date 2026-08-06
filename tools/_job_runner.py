@@ -42,7 +42,9 @@ def main() -> int:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     log_path = Path(metadata["log_path"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     try:
         with log_path.open("a", encoding="utf-8", errors="replace", buffering=1) as log:

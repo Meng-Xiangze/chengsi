@@ -90,7 +90,12 @@ class _ToolRegistry:
 
 
 class ImageGenerationTool(BaseTool):
-    """Generate or edit an image through the configured image model."""
+    """Generate or edit an image through the configured image model.
+
+    Routing logic:
+    1. If the currently-active model has ``image_generation: true`` → use it.
+    2. Otherwise → fall back to the configured ``default_image_model``.
+    """
 
     def __init__(self, project_root: Path):
         self.project_root = project_root
@@ -111,27 +116,70 @@ class ImageGenerationTool(BaseTool):
             "image_path": {"type": "string", "description": "Optional absolute path of an existing image to edit."},
         }
 
-    def _config(self) -> tuple[dict, str]:
-        config = json.loads(self.config_path.read_text(encoding="utf-8"))
+    def _load_config(self) -> dict:
+        try:
+            return json.loads(self.config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _current_model_info(self) -> tuple[Any | None, str, dict]:
+        """Return (provider, model_name, model_config) for the active model,
+        or (None, '', {}) when unavailable."""
+        import main as _main
+        provider = getattr(_main, "_provider", None)
+        model = getattr(_main, "_provider_model", "")
+        providers_cfg = getattr(_main, "_providers_cfg", [])
+        model_config: dict = {}
+        for pcfg in providers_cfg:
+            for entry in pcfg.get("models", []):
+                name = entry if isinstance(entry, str) else entry.get("name", "")
+                if name == model:
+                    model_config = entry if isinstance(entry, dict) else {}
+                    break
+        return provider, model, model_config
+
+    def _resolve_provider_and_model(
+        self, config: dict
+    ) -> tuple[Any, str]:
+        """Pick the right provider+model for image generation.
+
+        1. Current model has ``image_generation: true`` → use it.
+        2. Otherwise → use ``default_image_model`` from config.
+        """
+        provider, current_model, model_config = self._current_model_info()
+
+        # Route 1: current model can generate images
+        if (provider is not None and current_model
+                and model_config.get("image_generation", False)):
+            return provider, current_model
+
+        # Route 2: fall back to default_image_model
         default_spec = config.get("default_image_model", "")
         if default_spec:
             target_prov, target_model = self._parse_default_spec(default_spec)
-            for provider in config.get("providers", []):
-                if target_prov and provider.get("name", "") != target_prov:
+            from core.ollama_provider import OllamaProvider
+            from core.openai_provider import OpenAIProvider
+            for pcfg in config.get("providers", []):
+                if target_prov and pcfg.get("name", "") != target_prov:
                     continue
-                for model in provider.get("models", []):
-                    if isinstance(model, dict) and model.get("name", "") == target_model:
-                        return provider, target_model
-        # Fallback: first model with image_generation=true
-        for provider in config.get("providers", []):
-            for model in provider.get("models", []):
-                if isinstance(model, dict) and model.get("image_generation"):
-                    return provider, str(model.get("name", ""))
+                for entry in pcfg.get("models", []):
+                    name = entry if isinstance(entry, str) else entry.get("name", "")
+                    if name == target_model:
+                        if pcfg.get("type", "openai") == "ollama":
+                            return OllamaProvider.from_config(pcfg), target_model
+                        return OpenAIProvider.from_config(pcfg), target_model
+
+        # Route 3: any model with image_generation=true
+        for pcfg in config.get("providers", []):
+            for entry in pcfg.get("models", []):
+                if isinstance(entry, dict) and entry.get("image_generation"):
+                    from core.openai_provider import OpenAIProvider
+                    return OpenAIProvider.from_config(pcfg), str(entry.get("name", ""))
+
         raise RuntimeError("No model with image_generation=true is configured")
 
     @staticmethod
     def _parse_default_spec(spec: str) -> tuple[str | None, str]:
-        """Parse 'provider/model' or 'model' into (provider_name_or_None, model_name)."""
         if "/" in spec:
             p, m = spec.split("/", 1)
             return p.strip(), m.strip()
@@ -147,10 +195,13 @@ class ImageGenerationTool(BaseTool):
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
             return "Image generation error: prompt is required."
-        provider, model = self._config()
-        base_url = str(provider.get("base_url", "")).rstrip("/")
-        http = HttpClient(provider.get("network_mode", "auto"))
-        headers = {"Authorization": f"Bearer {provider.get('api_key', '')}"}
+
+        config = self._load_config()
+        provider, model = self._resolve_provider_and_model(config)
+
+        base_url = str(provider.config.get("base_url", "")).rstrip("/")
+        http = HttpClient(provider.config.get("network_mode", "auto"))
+        headers = {"Authorization": f"Bearer {provider.config.get('api_key', '')}"}
         image_path = str(arguments.get("image_path", "")).strip()
         source = Path(image_path).expanduser().resolve() if image_path else None
         if source and not source.is_file():

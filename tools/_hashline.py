@@ -32,14 +32,11 @@ def anchor(line_number: int, content: str) -> str:
 
 
 def unique_line_hashes(lines: list[str]) -> list[str]:
-    """Return the shortest unambiguous hex prefix for every line hash.
-    
-    Minimum prefix length scales with file size:
-    - 1-16 lines: 1 hex char
-    - 17-256 lines: 2 hex chars
-    - 257-4096 lines: 3 hex chars
-    - 4097-65536 lines: 4 hex chars
-    - >65536 lines: full 16 hex chars
+    """Return uniform-length unambiguous hex prefixes for every line hash.
+
+    All returned prefixes share the same length — the shortest length that
+    makes every line's prefix unique in the file. This keeps the display
+    tidy instead of mixing 2-char and 16-char hashes on the same screen.
     """
     import math
     total = len(lines)
@@ -48,18 +45,23 @@ def unique_line_hashes(lines: list[str]) -> list[str]:
     # Minimum hex digits needed to address all lines: ceil(log16(total))
     min_length = max(1, math.ceil(math.log(total, 16))) if total > 1 else 1
     min_length = min(min_length, LINE_HASH_HEX_LENGTH)
-    
+
     hashes = [line_hash(line) for line in lines]
-    result = []
-    for index, value in enumerate(hashes):
-        for length in range(min_length, LINE_HASH_HEX_LENGTH + 1, 1):
+
+    # First pass: find the longest prefix any line needs to be unique.
+    uniform_length = min_length
+    for value in hashes:
+        for length in range(uniform_length, LINE_HASH_HEX_LENGTH + 1):
             prefix = value[:length]
             if sum(other.startswith(prefix) for other in hashes) == 1:
-                result.append(prefix)
+                if length > uniform_length:
+                    uniform_length = length
                 break
         else:
-            result.append(value)
-    return result
+            uniform_length = LINE_HASH_HEX_LENGTH
+
+    # Second pass: every line gets the same uniform-length prefix.
+    return [h[:uniform_length] for h in hashes]
 
 
 def parse_anchor(value: object) -> tuple[int | None, str]:
@@ -157,5 +159,10 @@ def format_lines(text: str, path: str, offset: int = 1, limit: int = 400) -> str
         for index in range(start, end + 1)
     )
     if end < total:
-        output.append(f"[truncated: read again with offset={end + 1}]")
+        output.append(
+            f"⏩ {total - end} more lines — read the rest with offset={end + 1} "
+            f"(e.g. offset={end + 1}, limit={min(limit, total - end)}) before judging the task."
+        )
+    else:
+        output.append("✅ End of file reached.")
     return "\n".join(output)

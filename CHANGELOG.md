@@ -33,6 +33,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - System prompt: explicit instructions for `get_current_time()`, scheduled tasks, sub-agents, and plan tracking.
 - Improved scheduled task detection: When users mention specific times (e.g., "17:30打开记事本", "明天9点提醒我"), the agent now uses `schedule()` unless explicitly told to act immediately with keywords like "现在" or "立即".
 
+---
+
+## [Unreleased] — 工具生态稳定化（2026-08-06）
+
+### Added
+
+- **web_reader pagination**: `read` action now accepts `offset` (character offset, 1-indexed) and `limit` (chars, default 50000). Long pages return a leading hint (`⚠️ Page content is N chars; showing chars X-Y`) plus `next_offset` / `truncated` fields, so the model can continue reading the whole page instead of assuming the first chunk is everything.
+- **web_searcher CN fallback**: DuckDuckGo now uses a short 8s timeout (unreachable from CN networks). On failure the tool returns reachable Bing/Baidu search URLs and instructs the model to open them with `web_reader`, instead of failing with a bare error.
+- **Auto pip install**: Missing tool dependencies are now auto-installed on first use (python_executor / ddgs / PyMuPDF etc.).
+- **`bash` CLI additions**: `head`, `rg`, `wmic`, `grep` and similar commands now supported in the bounded shell.
+- **HTML chat export adapted to the current UI loading mechanism**: The exporter keeps working with the latest page interaction flow.
+- **Proxy troubleshooting knowledge-base entry**: Added guidance for proxy/network issue diagnosis.
+
+### Fixed
+
+- **Chat export parity**: `chat_exporter` now saves HTML to Desktop (previously documented as Markdown); `list` action shows sessions with titles, dates and message counts. `TOC.md` updated to match.
+- **Read truncation hints moved to the FRONT**: PDF/DOCX/text outputs that exceed 50KB now prepend `⚠️ Output exceeds 50KB; showing X of Y — read the rest with offset=N before judging the task` instead of appending the hint at the very end where the model may never see it.
+- **Line/table pagination hints**: `_hashline.py` and `_spreadsheet.py` now end with `⏩ N more lines/rows — read the rest with offset=X` and `✅ End of ... reached.`, making continuation explicit for long files and sheets.
+- **read DOC compatibility**: `.doc` files are converted via LibreOffice (headless) to DOCX/PDF for text/visual reading.
+- **Line-hash width unification**: `unique_line_hashes` now emits uniform-length unambiguous prefixes instead of mixing short and full hashes on the same screen.
+- **Path separator normalization**: Single/double backslash and forward-slash paths are all accepted (`process_utils.normalize_path`).
+- **`read` image routing with default split**: Image reads go through the multimodal default model by default (including `computer` screenshots); `ext=info` returns metadata only.
+- **XLSX multi-sheet reading**: `sheet_name` selects a single sheet; otherwise all sheets/rows are returned.
+- **Background jobs default to `pythonw`**: No console window pops up for long-running background tasks.
+- **`history` panel removed** from the WebUI.
+- **Temp file directory management**: Scoped temp outputs are created under a managed directory and cleaned up after use.
+- **bash escaping optimization**: Complex quoting (quotes, spaces, special chars in paths/args) now round-trips correctly.
+- **Tool-call summary uploaded from the main loop**: `[TURN_SUMMARY]` is now injected during the main loop so the model sees it even when tool exchanges are stripped from history.
+- **Force-stop semantics**: Stopping the agent now interrupts the current operation immediately instead of performing a graceful stop; no new tool calls run after a stop.
+- **Single-stream conversation model**: Strictly one stream per conversation — concurrent streams are forbidden (including during stop / model switch).
+- **Per-session model display fixed**: Each session keeps the model id it last used; switching Session1↔Session2 shows each session's own model without interference.
+- **Empty response guard (Ollama)**: A fallback validation prevents empty responses from the local Ollama models, eliminating the blank-reply defect.
+- **`nul` artifact removed**: A stray 61-byte `nul` file accidentally created via Windows redirection was deleted from the repo.
+
+### Changed
+
+- **Ecosystem-standard long-content protocol**: Every read-style tool (`read`, `web_reader`, `_hashline`, `_spreadsheet`) now tells the model UP FRONT how long the content is and exactly how to continue (`offset`), and instructs it to read the ENTIRE page/file/conversation before judging a task — the same pagination convention used by pi/Claude-style agents.
+
 ## [0.6.0] - 2026-08-01
 
 ### Added

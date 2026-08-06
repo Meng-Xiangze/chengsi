@@ -8,6 +8,7 @@ from typing import Any
 
 from tools.base import BaseTool
 from tools._spreadsheet import write_csv, write_xlsx
+from core.process_utils import normalize_path, optional_import
 
 
 class Write(BaseTool):
@@ -51,13 +52,13 @@ class Write(BaseTool):
 
     def run(self, arguments: dict[str, Any]) -> str:
         args = arguments or {}
-        raw_path = str(args.get("path", "")).strip()
+        raw_path = normalize_path(str(args.get("path", "")))
         content = str(args.get("content", ""))
 
         if not raw_path:
             return "Error: path is required."
 
-        path = Path(raw_path)
+        path = Path(raw_path).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
 
         ext = path.suffix.lower()
@@ -90,6 +91,7 @@ class Write(BaseTool):
     @staticmethod
     def _write_docx(path: Path, content: str) -> str:
         try:
+            docx = optional_import("docx", "python-docx")
             from docx import Document
             from docx.shared import Inches, Pt, RGBColor
             from docx.enum.text import WD_ALIGN_PARAGRAPH

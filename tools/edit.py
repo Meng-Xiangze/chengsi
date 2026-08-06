@@ -13,6 +13,7 @@ from typing import Any
 from tools.base import BaseTool
 from tools._hashline import revision, split_text, validate_anchor
 from tools._spreadsheet import edit_csv, edit_xlsx
+from core.process_utils import normalize_path, optional_import
 
 _VALID_OPS = {
     "replace", "delete", "insert_before", "insert_after", "prepend", "append",
@@ -93,7 +94,7 @@ class Edit(BaseTool):
 
     def run(self, arguments: dict[str, Any]) -> str:
         args = arguments or {}
-        raw_path = str(args.get("path", "")).strip()
+        raw_path = normalize_path(str(args.get("path", "")))
         raw_edits = args.get("edits", [])
         rev = str(args.get("revision", "")).strip() or None
 
@@ -102,7 +103,7 @@ class Edit(BaseTool):
         if not raw_edits or not isinstance(raw_edits, list):
             return "Error: edits must be a list of edit objects."
 
-        path = Path(raw_path)
+        path = Path(raw_path).resolve()
         if not path.exists():
             return f"Error: file not found: {path}"
 
@@ -322,13 +323,13 @@ class Edit(BaseTool):
     @staticmethod
     def _edit_docx(path: Path, edits: list[dict]) -> str:
         try:
+            docx = optional_import("docx", "python-docx")
             from docx import Document
+            from tools.write import Write
+            from tools.read import Read
+            from docx.oxml.ns import qn
         except ImportError:
             return "DOCX editing requires python-docx. Install with:\n  pip install python-docx"
-
-        from tools.write import Write
-        from tools.read import Read
-        from docx.oxml.ns import qn
 
         doc = Document(str(path))
 

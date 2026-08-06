@@ -21,8 +21,16 @@ parameters:
   timeout:
     type: integer
     description: Request timeout seconds (default 10)
+  offset:
+    type: integer
+    description: Character offset for read pagination (1-indexed). Continue with this when content shows ⏩ remaining.
+  limit:
+    type: integer
+    description: Max chars for read (default 50000, min 1000)
 examples: []
-usage_notes: []
+usage_notes:
+  - "Long pages: when content begins with ⏩ Content continues!, keep calling read with offset=next_offset until you see ✅ End of content reached. — never judge a task from only the first chunk."
+  - "SPA/JS-heavy sites may return little text; consider web_searcher or a mobile/AMP URL instead."
 ---
 
 # web_reader

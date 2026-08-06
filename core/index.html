@@ -160,20 +160,11 @@
     .job-panel-header { height: 42px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto; }
     .job-panel-title { font-weight: 650; }
     .job-count { color: var(--muted); font-size: 11px; margin-left: auto; }
-    .job-panel-toggle, .job-history-toggle { border: 0; background: transparent; color: var(--muted); cursor: pointer; }
-    .job-panel-toggle { width: 24px; height: 24px; padding: 0; font-size: 16px; line-height: 1; }
+    .job-panel-toggle { border: 0; background: transparent; color: var(--muted); cursor: pointer; width: 24px; height: 24px; padding: 0; font-size: 16px; line-height: 1; }
     body:not(.job-panel-collapsed) .job-panel-toggle { transform: none; }
     body.job-panel-collapsed .job-panel-toggle { transform: none; }
-    .job-panel-toggle:hover, .job-history-toggle:hover { color: var(--text); }
-    .job-history { border-top: 1px solid var(--line); margin-top: 2px; padding-top: 8px; }
-    .job-history-toggle { display: flex; align-items: center; width: 100%; padding: 4px 6px 8px; text-align: left; font-size: 12px; }
-    .job-history-toggle::before { content: "›"; margin-right: 5px; font-size: 16px; transition: transform .15s ease; }
-    .job-history-toggle[aria-expanded="true"]::before { transform: rotate(90deg); }
-    .job-history-list[hidden] { display: none; }
-    .job-list, .job-history-list { min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 9px 12px; }
-    .job-list { flex: 1 1 auto; }
-    .job-history { flex: 0 1 45%; min-height: 0; overflow: hidden; }
-    .job-history-list { height: 100%; }
+    .job-panel-toggle:hover { color: var(--text); }
+    .job-list { min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 0 9px 12px; flex: 1 1 auto; }
     .job-empty { padding: 12px 5px; color: var(--muted); font-size: 12px; }
     .job-item { padding: 9px 6px; border-top: 1px solid var(--line); }
     .job-item:first-child { border-top: 0; }
@@ -613,10 +604,6 @@
     <aside class="job-panel" aria-label="Background jobs">
       <div class="job-panel-header"><span class="job-panel-title">Background jobs</span><span class="job-count" id="jobCount">0</span><button class="job-panel-toggle" id="jobPanelToggle" type="button" title="Collapse jobs" aria-label="Collapse jobs">&gt;</button></div>
       <div class="job-list" id="jobList"><div class="job-empty">No active background jobs.</div></div>
-      <div class="job-history">
-        <button class="job-history-toggle" id="jobHistoryToggle" type="button" aria-expanded="false">History</button>
-        <div class="job-history-list" id="jobHistoryList" hidden><div class="job-empty">Expand to load history.</div></div>
-      </div>
     </aside>
   </div>
   <div class="toast" id="toast" role="status"></div>
@@ -665,8 +652,6 @@
       lastUserMessageText: "",
       stats: { input: 0, output: 0, prompt: 0, eval: 0, ctx: 0 },
       jobs: [],
-      jobHistory: [],
-      showJobHistory: false,
       expandedJobLogs: new Map(),
       activeToolEvents: new Map(),
       schedules: [],
@@ -1274,7 +1259,7 @@
           // ── Regular background job ──
           const label = job.command;
           const meta = `${escapeHtml(job.status)} · ${formatJobElapsed(job.elapsed_seconds)}${job.command_alive ? " · process alive" : ""}`;
-          const actions = `<button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}${attention ? '<button type="button" data-action="archive">Archive</button>' : ""}`;
+          const actions = `<button type="button" data-action="logs">Logs</button>${active ? '<button type="button" data-action="cancel">Stop</button>' : ""}${attention ? '<button type="button" data-action="archive">Close</button>' : ""}`;
           item.innerHTML = `<div class="job-row"><span class="job-status ${escapeHtml(job.status)}"></span><span class="job-command" title="${escapeHtml(label)}">${escapeHtml(label)}</span></div><div class="job-meta">${meta}</div><div class="job-actions">${actions}</div>`;
           item.querySelector('[data-action="logs"]').onclick = async () => {
             openModal("Job Logs", '<div style="padding:24px;text-align:center;color:var(--muted)">Loading...</div>');
@@ -1317,31 +1302,7 @@
         const activeDelegates = delegateJobs.filter((d) => ["queued", "starting", "running"].includes(d.status));
         $("jobCount").textContent = String(activeJobs.length + activeSchedules.length + activeDelegates.length);
         renderJobs([...activeJobs, ...activeSchedules, ...activeDelegates, ...attention], "jobList", "No active background jobs.");
-        if (app.showJobHistory) await refreshJobHistory();
       } catch (error) { console.error(error); }
-    }
-
-    async function refreshJobHistory() {
-      try {
-        const result = await app.api.get_jobs(true);
-        const resultSchedules = app.api.get_schedules ? await app.api.get_schedules() : { schedules: [] };
-        const resultDelegates = app.api.get_delegates ? await app.api.get_delegates(app.sessionId) : { delegates: [] };
-        const scheduleHistory = (resultSchedules?.schedules || []).filter((schedule) => schedule.status !== "scheduled").map((schedule) => ({ ...schedule, kind: "schedule" }));
-        const delegateHistory = (resultDelegates?.delegates || []).filter((d) => !["queued", "starting", "running"].includes(d.status)).map((d) => ({ ...d, kind: "delegate" }));
-        app.jobHistory = [
-          ...(result?.jobs || []).filter((job) => !["starting", "running"].includes(job.status)),
-          ...scheduleHistory,
-          ...delegateHistory,
-        ];
-        renderJobs(app.jobHistory, "jobHistoryList", "No completed background jobs.");
-      } catch (error) { console.error(error); }
-    }
-
-    function setJobHistoryExpanded(value) {
-      app.showJobHistory = value;
-      $("jobHistoryToggle").setAttribute("aria-expanded", String(value));
-      $("jobHistoryList").hidden = !value;
-      if (value) refreshJobHistory();
     }
 
     function sessionDate(value) {
@@ -1676,7 +1637,6 @@
     document.addEventListener("click", (event) => { if (!event.target.closest(".menu-popover") && !event.target.closest(".session-menu")) closeMenu(); });
     window.addEventListener("resize", updateNavigationLabel);
     updateNavigationLabel();
-    $("jobHistoryToggle").onclick = () => setJobHistoryExpanded(!app.showJobHistory);
     $("jobPanelToggle").onclick = () => {
       const collapsed = document.body.classList.toggle("job-panel-collapsed");
       const button = $("jobPanelToggle");

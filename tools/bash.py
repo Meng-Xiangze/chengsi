@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Any
 
-from core.process_utils import child_environment, decode_output, decode_output_lines, prepare_shell_command
+from core.process_utils import child_environment, decode_output, decode_output_lines, normalize_path, prepare_shell_command
 from tools.base import BaseTool
 
 
@@ -94,7 +94,7 @@ class Bash(BaseTool):
             progress(text)
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        raw_cwd = str(arguments.get("cwd", "")).strip()
+        raw_cwd = normalize_path(str(arguments.get("cwd", "")))
         cwd = os.path.abspath(os.path.expanduser(raw_cwd)) if raw_cwd else project_root
         if not os.path.isdir(cwd):
             return {"ok": False, "content": f"Working directory does not exist: {cwd}", "error_code": "invalid_arguments"}

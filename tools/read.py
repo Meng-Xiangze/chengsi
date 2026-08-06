@@ -12,6 +12,7 @@ from typing import Any
 from tools._hashline import anchor, format_lines, revision
 from tools._spreadsheet import read_csv, read_xlsx
 from tools.base import BaseTool
+from core.process_utils import normalize_path, optional_import
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SKIP_DIRS = {
@@ -36,7 +37,7 @@ class Read(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Read file contents — text, CSV, XLSX, PDF, DOCX, images, or search code. "
+            "Read file contents — text, CSV, XLSX, PDF, DOCX, DOC, images, or search code. "
             "For Python code, mode=outline lists symbols and mode=symbol returns one complete symbol. "
             "Text output includes a revision and stable LINE:HASH anchors for edit operations. "
             "For text/PDF, use offset/limit to paginate. "
@@ -50,7 +51,7 @@ class Read(BaseTool):
         return {
             "path": {
                 "type": "string",
-                "description": "File path to read (text, CSV, XLSX, PDF, DOCX, or image). Required for file mode.",
+                "description": "File path to read (text, CSV, XLSX, PDF, DOCX, DOC, or image). Required for file mode.",
             },
             "query": {
                 "type": "string",
@@ -79,11 +80,15 @@ class Read(BaseTool):
             "mode": {
                 "type": "string",
                 "enum": ["text", "visual", "outline", "symbol"],
-                "description": "text (default); visual for PDF/DOCX; outline or symbol for Python source.",
+                "description": "text (default); visual for PDF/DOCX/DOC; outline or symbol for Python source.",
             },
             "symbol": {
                 "type": "string",
                 "description": "Qualified Python symbol for mode=symbol, e.g. AgentRuntime.observe.",
+            },
+            "sheet_name": {
+                "type": "string",
+                "description": "Sheet name to read from CSV/XLSX files. When specified, only that sheet is returned instead of all sheets/rows. For xlsx files with multiple sheets, this filters to the named sheet.",
             },
         }
 
@@ -110,13 +115,19 @@ class Read(BaseTool):
         if ext == ".csv":
             return read_csv(resolved, args.get("offset", 1), args.get("limit", 200))
         if ext == ".xlsx":
-            return read_xlsx(resolved, args.get("offset", 1), args.get("limit", 200))
+            sheet_name = args.get("sheet_name")
+            if sheet_name:
+                return read_xlsx(resolved, offset=args.get("offset", 1), limit=args.get("limit", 200), sheet_name=sheet_name)
+            else:
+                return read_xlsx(resolved, args.get("offset", 1), args.get("limit", 200))
         if ext in _IMAGE_EXTS:
             return self._read_image(resolved, args)
         if ext == ".pdf":
             return self._read_pdf(resolved, args)
         if ext == ".docx":
             return self._read_docx(resolved, args)
+        if ext == ".doc":
+            return self._read_doc(resolved, args)
         mode = str(args.get("mode", "text")).strip().lower()
         if mode in ("outline", "symbol"):
             if ext != ".py":
@@ -143,7 +154,7 @@ class Read(BaseTool):
 
         # Try PyMuPDF first (better text extraction, Chinese support)
         try:
-            import fitz
+            fitz = optional_import("fitz", "PyMuPDF")
             doc = fitz.open(str(filepath))
             total_pages = len(doc)
             for i in range(total_pages):
@@ -161,6 +172,7 @@ class Read(BaseTool):
         # Fallback to pypdf
         if not all_text_parts:
             try:
+                pypdf = optional_import("pypdf")
                 from pypdf import PdfReader
                 reader = PdfReader(str(filepath))
                 total_pages = len(reader.pages)
@@ -239,24 +251,26 @@ class Read(BaseTool):
             )
             result += hint
 
-        # 50KB cap
+        # 50KB cap — ecosystem standard: say it UP FRONT so the model pages through
         if len(result.encode("utf-8")) > 50_000:
-            result = result[:50000]
             remaining = total_pages - page_end
             hint = (
-                f"\n⚠️  Output truncated at 50KB. "
-                f"Use offset={page_end + 1} to continue reading"
+                f"⚠️  Output exceeds 50KB; showing pages {page_start}–{page_end} of {total_pages} "
+                f"(~{total_chars:,} chars total)."
             )
             if remaining > 0:
-                hint += f" ({remaining} page{'s' if remaining > 1 else ''} remaining)."
+                hint += (
+                    f"⏩  {remaining} page{'s' if remaining > 1 else ''} remaining — "
+                    f"read the rest with offset={page_end + 1} before judging the task."
+                )
             else:
-                hint += "."
+                hint += " ✅ End of document reached."
             if total_chars > 15000:
                 hint += (
                     f"\n💡 Document is ~{total_chars:,} chars — "
                     "consider a cloud model for full-document analysis."
                 )
-            result += hint
+            result = f"{hint}\n\n" + result[:50000]
         elif page_end < total_pages:
             remaining = total_pages - page_end
             result += (
@@ -270,7 +284,7 @@ class Read(BaseTool):
     def _read_pdf_visual(filepath: Path, args: dict[str, Any]) -> str:
         """Render PDF page(s) as PNG images for vision models."""
         try:
-            import fitz
+            fitz = optional_import("fitz", "PyMuPDF")
         except ImportError:
             return (
                 "PDF visual mode requires PyMuPDF. Install with:\n"
@@ -580,6 +594,7 @@ class Read(BaseTool):
     def _read_docx_text(filepath: Path, args: dict[str, Any]) -> str:
         """Extract paragraphs and tables from a .docx file."""
         try:
+            docx = optional_import("docx", "python-docx")
             from docx import Document
         except ImportError:
             return (
@@ -685,24 +700,26 @@ class Read(BaseTool):
 
         result = "\n".join(out)
 
-        # 50KB cap
+        # 50KB cap — ecosystem standard: say it UP FRONT so the model pages through
         if len(result.encode("utf-8")) > 50_000:
-            result = result[:50000]
             remaining = total_items - item_end
             hint = (
-                f"\n⚠️  Output truncated at 50KB. "
-                f"Use offset={item_end + 1} to continue reading"
+                f"⚠️  Output exceeds 50KB; showing paragraphs {item_start}–{item_end} of {total_items} "
+                f"(~{total_chars:,} chars total)."
             )
             if remaining > 0:
-                hint += f" ({remaining} paragraphs remaining)."
+                hint += (
+                    f"⏩  {remaining} paragraph{'s' if remaining > 1 else ''} remaining — "
+                    f"read the rest with offset={item_end + 1} before judging the task."
+                )
             else:
-                hint += "."
+                hint += " ✅ End of document reached."
             if total_chars > 15000:
                 hint += (
                     f"\n💡 Document is ~{total_chars:,} chars — "
                     "consider a cloud model for full-document analysis."
                 )
-            result += hint
+            result = f"{hint}\n\n" + result[:50000]
         elif item_end < total_items:
             remaining = total_items - item_end
             result += (
@@ -725,7 +742,54 @@ class Read(BaseTool):
             "Use mode=visual with a vision model to see exact page appearance."
         )
 
+        # ── Extract embedded images for vision ───────────────────
+        if image_count > 0:
+            image_refs = Read._extract_docx_images(filepath, max_images=3)
+            if image_refs:
+                result += "\n\n🖼️ Embedded images:\n"
+                for idx, img_path in image_refs:
+                    result += f"  [{idx}] __IMAGE_PATH__:{img_path}\n"
+
         return result
+
+    @staticmethod
+    def _extract_docx_images(filepath: Path, max_images: int = 3) -> list[tuple[int, Path]]:
+        """Extract up to *max_images* embedded images from a DOCX zip.
+
+        Returns a list of (index, temp_file_path) tuples.  The caller is
+        responsible for including ``__IMAGE_PATH__:`` markers so the
+        vision pipeline picks them up.
+        """
+        import zipfile, tempfile
+        try:
+            zf = zipfile.ZipFile(str(filepath))
+        except Exception:
+            return []
+
+        image_names = [
+            n for n in zf.namelist()
+            if Path(n).suffix.lower()
+            in ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.emf', '.wmf')
+        ]
+        if not image_names:
+            zf.close()
+            return []
+
+        tmpdir = Path(tempfile.gettempdir()) / "chengsi_docx_images"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        stem = filepath.stem
+        extracted: list[tuple[int, Path]] = []
+        for i in range(min(max_images, len(image_names))):
+            entry = image_names[i]
+            ext = Path(entry).suffix.lower()
+            out = tmpdir / f"{stem}_img{i + 1}{ext}"
+            try:
+                out.write_bytes(zf.read(entry))
+                extracted.append((i + 1, out))
+            except Exception:
+                pass
+        zf.close()
+        return extracted
 
     @staticmethod
     def _read_docx_visual(filepath: Path, args: dict[str, Any]) -> str:
@@ -733,17 +797,7 @@ class Read(BaseTool):
         import zipfile, io, tempfile
 
         # ── Path A: LibreOffice (best — renders entire page layout) ──
-        lo_paths = [
-            r"C:\Program Files\LibreOffice\program\soffice.exe",
-            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
-        ]
-        soffice = None
-        for p in lo_paths:
-            if os.path.isfile(p):
-                soffice = p
-                break
-        if not soffice:
-            soffice = shutil.which("soffice")
+        soffice = Read._find_libreoffice()
 
         if soffice:
             import subprocess as sp
@@ -853,6 +907,96 @@ class Read(BaseTool):
         return result
 
     # ------------------------------------------------------------------ #
+    #  Read: DOC  (LibreOffice → docx/text or PDF)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _read_doc(filepath: Path, args: dict[str, Any]) -> str:
+        """Read .doc files by converting via LibreOffice to docx (text) or PDF (visual)."""
+        mode = str(args.get("mode", "text")).strip().lower()
+        if mode == "visual":
+            return Read._read_doc_visual(filepath, args)
+        return Read._read_doc_text(filepath, args)
+
+    @staticmethod
+    def _find_libreoffice() -> str | None:
+        """Locate soffice.exe for headless conversions."""
+        lo_paths = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ]
+        for p in lo_paths:
+            if os.path.isfile(p):
+                return p
+        return shutil.which("soffice")
+
+    @staticmethod
+    def _read_doc_text(filepath: Path, args: dict[str, Any]) -> str:
+        """Convert .doc → .docx via LibreOffice, then parse with python-docx."""
+        import subprocess as sp, tempfile
+
+        soffice = Read._find_libreoffice()
+        if not soffice:
+            return (
+                "DOC support requires LibreOffice. Install from https://www.libreoffice.org/\n"
+                "After installation, this tool will automatically detect soffice.exe."
+            )
+
+        tmpdir = Path(tempfile.gettempdir()) / "chengsi_doc"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        docx_out = tmpdir / f"{filepath.stem}.docx"
+
+        rel = Read._relpath(filepath)
+
+        try:
+            sp.run(
+                [soffice, "--headless", "--convert-to", "docx",
+                 "--outdir", str(tmpdir), str(filepath)],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception as e:
+            return f"Error converting DOC to DOCX via LibreOffice: {e}"
+
+        if not docx_out.exists():
+            return "Error: LibreOffice conversion produced no output. The .doc file may be corrupted."
+
+        # Delegate to the existing DOCX text reader
+        docx_result = Read._read_docx_text(docx_out, args)
+        return f"📄 {rel}  (DOC → DOCX via LibreOffice)\n{docx_result}"
+
+    @staticmethod
+    def _read_doc_visual(filepath: Path, args: dict[str, Any]) -> str:
+        """Convert .doc → PDF via LibreOffice, then render with PDF visual."""
+        import subprocess as sp, tempfile
+
+        soffice = Read._find_libreoffice()
+        if not soffice:
+            return (
+                "DOC visual mode requires LibreOffice. Install from https://www.libreoffice.org/\n"
+                "After installation, this tool will automatically detect soffice.exe."
+            )
+
+        tmpdir = Path(tempfile.gettempdir()) / "chengsi_doc"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        pdf_out = tmpdir / f"{filepath.stem}.pdf"
+
+        rel = Read._relpath(filepath)
+
+        try:
+            sp.run(
+                [soffice, "--headless", "--convert-to", "pdf",
+                 "--outdir", str(tmpdir), str(filepath)],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception as e:
+            return f"Error converting DOC to PDF via LibreOffice: {e}"
+
+        if not pdf_out.exists():
+            return "Error: LibreOffice conversion produced no output. The .doc file may be corrupted."
+
+        pdf_result = Read._read_pdf_visual(pdf_out, args)
+        return f"📄 {rel}  (DOC → PDF via LibreOffice → visual)\n{pdf_result}"
+    # ------------------------------------------------------------------ #
     #  Read: Python structure
     # ------------------------------------------------------------------ #
 
@@ -951,11 +1095,20 @@ class Read(BaseTool):
         rel = Read._relpath(filepath)
         result = format_lines(text, rel, start + 1, end - start)
 
-        # Truncate if too large (pi-style: 50KB cap)
+        # Ecosystem standard: if the file is larger than the cap, say so UP FRONT
+        # (before the content) so the model pages through the whole file instead
+        # of assuming the first chunk is everything.
         if len(result.encode("utf-8")) > 50_000:
+            truncated_at = end
+            hint = (
+                f"⚠️  File is {total:,} lines, {len(text):,} chars total; showing lines "
+                f"{offset:,}-{truncated_at:,} (first ~50KB).\n"
+                f"⏩  Content continues! Read the rest with offset={truncated_at + 1} "
+                f"until you have seen the ENTIRE file before judging the task."
+            )
             result = (
-                f"{result[:50000]}\n\n"
-                f"⚠️  Output truncated at 50KB. Use offset={end + 1} to continue reading."
+                f"{hint}\n\n"
+                f"{result[:50000]}"
             )
 
         return result
@@ -1096,7 +1249,7 @@ class Read(BaseTool):
 
     @staticmethod
     def _resolve_path(raw: str) -> Path | None:
-        p = Path(raw)
+        p = Path(normalize_path(raw))
         if not p.is_absolute():
             p = (PROJECT_ROOT / p).resolve()
         else:

@@ -1,6 +1,6 @@
 ---
 name: system_cleaner
-description: "Preview and clean system temp files, Python caches, recycle bin"
+description: "SYSTEM JUNK ONLY: temp files, Python caches, recycle bin. NOT for general file deletion."
 parameters:
   target_type: {type: string, enum: [temp, python_cache, recycle_bin, all], description: "Target type (default all)"}
   dry_run: {type: boolean, description: "Preview (true, default) or delete (false)"}

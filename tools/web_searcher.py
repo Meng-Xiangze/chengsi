@@ -1,16 +1,24 @@
 from tools.base import BaseTool
+from core.process_utils import optional_import
 import time
+import urllib.parse
 
-try:
-    from ddgs import DDGS
-    _PACKAGE_NAME = "ddgs"
-except ImportError:
-    try:
-        from duckduckgo_search import DDGS
-        _PACKAGE_NAME = "duckduckgo_search"
-    except ImportError:
-        DDGS = None
-        _PACKAGE_NAME = None
+
+# CN network: DuckDuckGo is unreachable (21s timeouts). Give DDG a short
+# budget, then fall back to a Bing/360 search URL the model can open with
+# web_reader, or a clear hint to use another search route.
+_DDG_TIMEOUT_S = 8
+
+
+def _get_ddgs():
+    """Lazy-import DDGS with optional auto-install."""
+    for module_name in ("ddgs", "duckduckgo_search"):
+        try:
+            mod = optional_import(module_name)
+            return getattr(mod, "DDGS")
+        except ImportError:
+            continue
+    return None
 
 
 class WebSearcher(BaseTool):
@@ -27,17 +35,19 @@ class WebSearcher(BaseTool):
         return {"query": {"type": "string", "description": "The query to search for on the internet."}}
 
     def run(self, arguments: dict) -> str:
-        if DDGS is None:
-            return "Error: web search dependency is not installed. Install it with: pip install ddgs"
-
         query = str(arguments.get("query", "")).strip()
         if not query:
             return "Error: No query provided."
 
+        # Quick reachability probe: if DDG isn't importable, skip straight to fallback.
+        DDGS = _get_ddgs()
+        if DDGS is None:
+            return self._fallback(query, "web search dependency is not installed (pip install ddgs)")
+
         last_error = None
         for attempt in range(2):
             try:
-                with DDGS() as ddgs:
+                with DDGS(timeout=_DDG_TIMEOUT_S) as ddgs:
                     results = list(ddgs.text(query, max_results=5) or [])
 
                 valid = []
@@ -58,4 +68,17 @@ class WebSearcher(BaseTool):
                 if attempt == 0:
                     time.sleep(0.5)
 
-        return f"Error during web search execution: {last_error}"
+        return self._fallback(query, last_error)
+
+    @staticmethod
+    def _fallback(query: str, reason) -> str:
+        """DDG unreachable (CN network) — hand the model a reachable search URL."""
+        bing = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
+        baidu = "https://www.baidu.com/s?wd=" + urllib.parse.quote(query)
+        return (
+            f"⚠️  DuckDuckGo search failed in this network ({reason}).\n"
+            f"Bing/Baidu are reachable — open one with web_reader:\n"
+            f"  bing:  {bing}\n"
+            f"  baidu: {baidu}\n"
+            f"Or retry the query with different wording."
+        )

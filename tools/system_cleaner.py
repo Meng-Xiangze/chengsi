@@ -17,7 +17,8 @@ class SystemCleanerTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "Clean system junk: temp files, Python __pycache__, Windows recycle bin. "
+            "Clean SYSTEM JUNK ONLY: temp files, Python __pycache__, Windows recycle bin. "
+            "NOT for general file/project deletion — use bash 'rm' or 'del' for targeted file removal. "
             "Default is dry_run=true (preview only). Set dry_run=false to actually delete."
         )
 

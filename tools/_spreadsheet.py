@@ -4,38 +4,10 @@ from __future__ import annotations
 
 import csv
 import io
-import json
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
-
-def _project_config() -> dict[str, Any]:
-    path = Path(__file__).resolve().parent.parent / "config.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def optional_import(module: str, package: str):
-    """Import an optional module, optionally installing it per user setting."""
-    try:
-        return __import__(module)
-    except ImportError as original:
-        if not _project_config().get("auto_install_dependencies", False):
-            raise original
-        completed = subprocess.run(
-            [sys.executable, "-m", "pip", "install", package],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()[-1000:]
-            raise ImportError(f"Automatic installation of {package} failed: {detail}") from original
-        return __import__(module)
+from core.process_utils import optional_import
 
 
 def read_csv(path: Path, offset: int = 1, limit: int = 200) -> str:
@@ -44,18 +16,44 @@ def read_csv(path: Path, offset: int = 1, limit: int = 200) -> str:
     return render_rows(path.name, rows, offset, limit)
 
 
-def read_xlsx(path: Path, offset: int = 1, limit: int = 200) -> str:
+def read_xlsx(path: Path, offset: int = 1, limit: int = 200, sheet_name: str | None = None) -> str:
     try:
         openpyxl = optional_import("openpyxl", "openpyxl")
     except ImportError as error:
         return f"XLSX support requires openpyxl. Enable automatic dependency installation in Settings or run: pip install openpyxl\n{error}"
     workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
     try:
-        sections = []
-        for sheet in workbook.worksheets:
-            rows = [["" if value is None else str(value) for value in row] for row in sheet.iter_rows(values_only=True)]
-            sections.append(render_rows(f"{path.name} :: {sheet.title}", rows, offset, limit))
-        return "\n\n".join(sections)
+        all_sheets = [(ws.title, ws.max_row) for ws in workbook.worksheets]
+
+        if sheet_name:
+            # ── Specific sheet requested ──────────────────────────
+            for ws in workbook.worksheets:
+                if ws.title == sheet_name:
+                    rows = [["" if value is None else str(value) for value in row]
+                            for row in ws.iter_rows(values_only=True)]
+                    return render_rows(f"{path.name} :: {sheet_name}", rows, offset, limit)
+            return f"Error: sheet '{sheet_name}' not found in {path.name}. Available sheets: {', '.join(s[0] for s in all_sheets)}"
+
+        # ── No sheet specified: show index + first sheet data ─────
+        lines = [f"📊 {path.name} — {len(all_sheets)} sheet(s):"]
+        for name, rows in all_sheets:
+            lines.append(f"  • {name}  ({rows} rows)")
+        lines.append("")
+
+        if all_sheets:
+            first_name = all_sheets[0][0]
+            lines.append(f"Showing first sheet: {first_name}")
+            for ws in workbook.worksheets:
+                if ws.title == first_name:
+                    rows = [["" if value is None else str(value) for value in row]
+                            for row in ws.iter_rows(values_only=True)]
+                    lines.append(render_rows(f"{path.name} :: {first_name}", rows, offset, limit))
+                    break
+            if len(all_sheets) > 1:
+                other_names = [s[0] for s in all_sheets[1:]]
+                lines.append(f"\n💡 Other sheets: {', '.join(other_names)}. Use sheet_name= to select.")
+
+        return "\n".join(lines)
     finally:
         workbook.close()
 
@@ -72,7 +70,12 @@ def render_rows(label: str, rows: list[list[str]], offset: int, limit: int) -> s
         csv.writer(stream, lineterminator="").writerow(row)
         output.append(f"{number} | {stream.getvalue()}")
     if start - 1 + count < len(rows):
-        output.append(f"[truncated: read again with offset={start + count}]")
+        output.append(
+            f"⏩ {len(rows) - (start - 1 + count)} more rows — "
+            f"read the rest with offset={start + count} before judging the task."
+        )
+    else:
+        output.append("✅ End of table reached.")
     return "\n".join(output)
 
 

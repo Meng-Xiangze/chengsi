@@ -22,6 +22,7 @@ usage_notes:
   - "Use mode=outline before mode=symbol when the exact qualified name is unknown"
   - "Copy revision and anchors exactly into edit; stale content is rejected"
   - "PDF/DOCX visual mode renders pages for vision models"
+  - "LONG FILES: when output ends with ⏩ more lines/paragraphs/pages remaining, ALWAYS continue reading with the given offset until ✅ End reached — never judge a task from only the first chunk"
 ---
 
 # read
@@ -39,3 +40,8 @@ Text output follows this protocol:
 
 The revision guards the complete file. Each line anchor guards the exact line content. Prefer these
 values for multiline edits instead of reproducing a large `oldText` string.
+
+**Long files**: if the output ends with `⏩ N more lines — read the rest with offset=X`, you have NOT
+seen the whole file. Keep calling `read` with `offset=X` (and a `limit`) until you see `✅ End of file
+reached.` before deciding what the task is. Never judge a task from only the first chunk of a long
+file or conversation.

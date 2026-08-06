@@ -18,16 +18,27 @@ class ChatExporter(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Export a chat session as a standalone HTML file with embedded images. Provide the session_id."
+        return "Export or list chat sessions. action='export' (default) saves HTML to Desktop; action='list' shows all saved sessions with titles and dates."
 
     @property
     def parameters(self) -> dict:
         return {
+            "action": {
+                "type": "string",
+                "description": "'export' (default) or 'list' to browse saved sessions.",
+                "enum": ["export", "list"],
+            },
             "session_id": {
                 "type": "string",
-                "description": "Session ID to export (e.g. '20260721_213533_9933c4').",
-            }
+                "description": "Session ID for export (optional — defaults to current session).",
+            },
         }
+
+    @staticmethod
+    def _current_session_id() -> str:
+        """Return the active session ID without requiring the model to know it."""
+        import main as _main
+        return str(getattr(_main.state, "current_session_id", "") or "")
 
     @staticmethod
     def _image_data_url(source: str) -> str:
@@ -153,10 +164,44 @@ footer {{ border-top:1px solid var(--border); color:var(--dim); font-size:12px; 
 </body>
 </html>"""
 
+    @staticmethod
+    def _list_sessions() -> str:
+        """Return a readable listing of all saved sessions."""
+        sessions_dir = PROJECT_ROOT / "sessions"
+        if not sessions_dir.is_dir():
+            return "No saved sessions found."
+
+        entries = []
+        for sp in sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            sid = sp.stem
+            title = sid
+            msg_count = "?"
+            try:
+                data = json.loads(sp.read_text(encoding="utf-8"))
+                title = str(data.get("title", sid))
+                history = data.get("history", [])
+                msg_count = str(len(history))
+            except (OSError, json.JSONDecodeError):
+                pass
+            mtime = datetime.fromtimestamp(sp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            entries.append(f"  {sid}  |  {mtime}  |  {msg_count} msgs  |  {title}")
+
+        if not entries:
+            return "No saved sessions found."
+        return "Saved sessions:\n" + "\n".join(entries)
+
     def run(self, arguments: dict) -> str:
-        session_id = arguments.get("session_id", "").strip()
+        action = str(arguments.get("action", "export")).strip().lower()
+
+        if action == "list":
+            return self._list_sessions()
+
+        # ── export ──────────────────────────────────────────────
+        session_id = str(arguments.get("session_id", "")).strip()
         if not session_id:
-            return "Error: session_id is required."
+            session_id = self._current_session_id()
+        if not session_id:
+            return "Error: no active session — provide a session_id or start a conversation first."
 
         session_path = PROJECT_ROOT / "sessions" / f"{session_id}.json"
         if not session_path.is_file():
@@ -167,4 +212,12 @@ footer {{ border-top:1px solid var(--border); color:var(--dim); font-size:12px; 
         except (OSError, json.JSONDecodeError) as exc:
             return f"Error reading session: {exc}"
 
-        return self._format_html(session.get("history", []), session.get("title", session_id), session_id)
+        html = self._format_html(session.get("history", []), session.get("title", session_id), session_id)
+
+        # Save to desktop so it's easy to find
+        export_dir = Path.home() / "Desktop"
+        safe_id = session_id.replace("/", "_").replace("\\", "_")
+        export_path = export_dir / f"chengsi_chat_{safe_id}.html"
+        export_path.write_text(html, encoding="utf-8")
+
+        return f"Chat exported to {export_path} ({len(html):,} bytes)"

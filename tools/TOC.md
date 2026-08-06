@@ -25,5 +25,5 @@
 
 ## Meta
 - `knowledge_base`: Search and manage local knowledge-base documents.
-- `chat_exporter`: Export a session as Markdown. Empty `session_id` = current session.
+- `chat_exporter`: Export a session to Desktop as HTML, or list saved sessions. Empty `session_id` = current session.
 - `image_generator`: Generate images via cloud API. Required: `prompt`.

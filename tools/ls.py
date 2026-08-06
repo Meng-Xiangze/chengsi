@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.base import BaseTool
+from core.process_utils import normalize_path
 
 
 class Ls(BaseTool):
@@ -33,8 +34,8 @@ class Ls(BaseTool):
 
     def run(self, arguments: dict[str, Any]) -> str:
         args = arguments or {}
-        raw = str(args.get("path", "")).strip()
-        target = Path(raw) if raw else Path.cwd()
+        raw = normalize_path(str(args.get("path", "")))
+        target = Path(raw).resolve() if raw else Path.cwd()
 
         if not target.exists():
             return f"Error: path not found: {target}"

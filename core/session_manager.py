@@ -144,6 +144,8 @@ class SessionManager:
                     "created_at": s.get("created_at", ""),
                     "updated_at": s.get("updated_at", ""),
                     "message_count": len(s.get("messages", [])),
+                    "model": s.get("model", ""),
+                    "provider": s.get("provider", ""),
                 })
             except Exception:
                 continue
